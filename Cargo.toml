@@ -1,0 +1,36 @@
+[package]
+name = "gol_engines"
+version = "0.1.0"
+edition = "2021"
+description = "Game of Life engines (simd, hashlife, streamlife)"
+repository = "https://github.com/das67333/conway"
+readme = "README.md"
+license = "GPL-3.0"
+keywords = ["game-of-life", "simd", "hashlife", "streamlife"]
+categories = ["algorithms", "concurrency", "simulation"]
+
+[[bin]]
+name = "bench_otca"
+
+[[bin]]
+name = "bench_0e0p"
+
+[[bin]]
+name = "bench_dev"
+
+[dependencies]
+ahash = "0.8"
+anyhow = "1.0"
+flate2 = "1.1"
+num-bigint = "0.4"
+rand = "0.9"
+rand_chacha = "0.9"
+dashmap = "6.1"
+
+tokio = { version = "1.44", features = ["rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+serial_test = "3.2"
+
+[profile.release]
+debug = true
