@@ -4,7 +4,7 @@ mod tests {
     use serial_test::serial;
 
     fn build_engines() -> Vec<Box<dyn GoLEngine>> {
-        let data = std::fs::read("../res/otca_0.mc.gz").unwrap();
+        let data = std::fs::read("res/otca_0.mc.gz").unwrap();
         let pattern = Pattern::from_format(PatternFormat::CompressedMacrocell, &data).unwrap();
         let mem_limit_mib = 16;
         let mut engines: Vec<Box<dyn GoLEngine>> = vec![

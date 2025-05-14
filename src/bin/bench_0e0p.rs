@@ -10,7 +10,7 @@ fn main() {
         //     MIN_TASK_SPAWN_SIZE_LOG2.load(Ordering::Relaxed)
         // );
         // let timer = std::time::Instant::now();
-        let data = std::fs::read("../res/very_large_patterns/0e0p-metaglider.mc.gz").unwrap();
+        let data = std::fs::read("res/very_large_patterns/0e0p-metaglider.mc.gz").unwrap();
         WORKER_THREADS.store(16, Ordering::Relaxed);
 
         let pattern = Pattern::from_format(PatternFormat::CompressedMacrocell, &data).unwrap();

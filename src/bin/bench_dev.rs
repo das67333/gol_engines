@@ -13,7 +13,7 @@ fn detect_format(filename: &str) -> Option<PatternFormat> {
 }
 
 fn main() {
-    let paths = std::fs::read_dir("../res/very_large_patterns").unwrap();
+    let paths = std::fs::read_dir("res/very_large_patterns").unwrap();
     let mut engine = HashLifeEngineSync::new(16 << 10);
     for (i, path) in paths.enumerate() {
         let path = path.unwrap().path();
