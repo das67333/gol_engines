@@ -80,191 +80,186 @@ impl StreamLifeEngineAsync {
             return 0xffff;
         }
 
-        let lock = &self.base.mem.get(idx).lock_extra;
-        while lock
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+        let status = &self.base.mem.get(idx).status_extra;
+        let status_value = status.load(Ordering::Acquire);
+        if status_value == status::CACHED {
+            return self.base.mem.get(idx).extra;
+        }
+
+        if !(status_value == status::NOT_CACHED
+            && status
+                .compare_exchange(
+                    status::NOT_CACHED,
+                    status::PROCESSING,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok())
         {
-            while lock.load(Ordering::Relaxed) {
+            while status.load(Ordering::Acquire) != status::CACHED {
+                if ExecutionStatistics::is_poisoned() {
+                    return 0;
+                }
+                // tokio::task::yield_now().await;
                 spin_loop();
             }
+            return self.base.mem.get(idx).extra;
         }
 
         if size_log2 == LEAF_SIZE_LOG2 + 1 {
             let n = self.base.mem.get_mut(idx);
-            let mut extra = n.extra;
-            if extra & 0xffff0000 != 1 << 16 {
-                extra = self.determine_direction(n.nw, n.ne, n.sw, n.se) | (1 << 16);
-                n.extra = extra;
-            }
-            lock.store(false, Ordering::Release);
-            return extra & 0xffffffff0000ffff;
+            let extra = self.determine_direction(n.nw, n.ne, n.sw, n.se);
+            n.extra = extra;
+            status.store(status::CACHED, Ordering::Release);
+            return extra;
         }
 
-        let (nw, ne, sw, se, mut extra) = {
+        let (nw, ne, sw, se) = {
             let n = self.base.mem.get(idx);
-            (n.nw, n.ne, n.sw, n.se, n.extra)
+            (n.nw, n.ne, n.sw, n.se)
         };
-        if (extra & 0xffff0000) != (1 << 16) {
-            let mut childlanes = [0u64; 9];
-            let mut adml: u64 = 0xff;
-            /*
-             * Short-circuit evaluation using the corner children
-             * This will handle the vast majority of random tiles.
-             */
-            if adml != 0 {
-                childlanes[0] = self.node2lanes(nw, size_log2 - 1);
-                adml &= childlanes[0];
-            }
-            if adml != 0 {
-                childlanes[2] = self.node2lanes(ne, size_log2 - 1);
-                adml &= childlanes[2];
-            }
-            if adml != 0 {
-                childlanes[6] = self.node2lanes(sw, size_log2 - 1);
-                adml &= childlanes[6];
-            }
-            if adml != 0 {
-                childlanes[8] = self.node2lanes(se, size_log2 - 1);
-                adml &= childlanes[8];
-            }
-            if adml == 0 {
-                self.base.mem.get_mut(idx).extra = 1 << 16;
-                lock.store(false, Ordering::Release);
-                return 0;
-            }
 
-            if size_log2 == LEAF_SIZE_LOG2 + 2 {
-                let tlx = {
-                    let nw = self.base.mem.get(nw);
-                    [nw.nw, nw.ne, nw.sw, nw.se]
-                        .map(|x| u64::from_le_bytes(self.base.mem.get(x).leaf_cells()))
-                };
-                let trx = {
-                    let ne = self.base.mem.get(ne);
-                    [ne.nw, ne.ne, ne.sw, ne.se]
-                        .map(|x| u64::from_le_bytes(self.base.mem.get(x).leaf_cells()))
-                };
-                let blx = {
-                    let sw = self.base.mem.get(sw);
-                    [sw.nw, sw.ne, sw.sw, sw.se]
-                        .map(|x| u64::from_le_bytes(self.base.mem.get(x).leaf_cells()))
-                };
-                let brx = {
-                    let se = self.base.mem.get(se);
-                    [se.nw, se.ne, se.sw, se.se]
-                        .map(|x| u64::from_le_bytes(self.base.mem.get(x).leaf_cells()))
-                };
-
-                let cc = [tlx[3], trx[2], blx[1], brx[0]];
-                let tc = [tlx[1], trx[0], tlx[3], trx[2]];
-                let bc = [blx[1], brx[0], blx[3], brx[2]];
-                let cl = [tlx[2], tlx[3], blx[0], blx[1]];
-                let cr = [trx[2], trx[3], brx[0], brx[1]];
-
-                let prepared = |mem: &MemoryManager, x: &[u64; 4]| {
-                    let nw = mem.find_or_create_leaf_from_u64(x[0]);
-                    let ne = mem.find_or_create_leaf_from_u64(x[1]);
-                    let sw = mem.find_or_create_leaf_from_u64(x[2]);
-                    let se = mem.find_or_create_leaf_from_u64(x[3]);
-                    mem.find_or_create_node(nw, ne, sw, se)
-                };
-
-                let x = prepared(&self.base.mem, &tc);
-                childlanes[1] = self.node2lanes(x, LEAF_SIZE_LOG2 + 1);
-                let x = prepared(&self.base.mem, &cl);
-                childlanes[3] = self.node2lanes(x, LEAF_SIZE_LOG2 + 1);
-                let x = prepared(&self.base.mem, &cc);
-                childlanes[4] = self.node2lanes(x, LEAF_SIZE_LOG2 + 1);
-                let x = prepared(&self.base.mem, &cr);
-                childlanes[5] = self.node2lanes(x, LEAF_SIZE_LOG2 + 1);
-                let x = prepared(&self.base.mem, &bc);
-                childlanes[7] = self.node2lanes(x, LEAF_SIZE_LOG2 + 1);
-                adml &=
-                    childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
-            } else {
-                let pptr_tl = self.base.mem.get(nw);
-                let pptr_tr = self.base.mem.get(ne);
-                let pptr_bl = self.base.mem.get(sw);
-                let pptr_br = self.base.mem.get(se);
-                let cc = [pptr_tl.se, pptr_tr.sw, pptr_bl.ne, pptr_br.nw];
-                let tc = [pptr_tl.ne, pptr_tr.nw, pptr_tl.se, pptr_tr.sw];
-                let bc = [pptr_bl.ne, pptr_br.nw, pptr_bl.se, pptr_br.sw];
-                let cl = [pptr_tl.sw, pptr_tl.se, pptr_bl.nw, pptr_bl.ne];
-                let cr = [pptr_tr.sw, pptr_tr.se, pptr_br.nw, pptr_br.ne];
-
-                let prepared = |mem: &MemoryManager, x: &[NodeIdx; 4]| {
-                    mem.find_or_create_node(x[0], x[1], x[2], x[3])
-                };
-
-                let x = prepared(&self.base.mem, &tc);
-                childlanes[1] = self.node2lanes(x, size_log2 - 1);
-                let x = prepared(&self.base.mem, &cl);
-                childlanes[3] = self.node2lanes(x, size_log2 - 1);
-                let x = prepared(&self.base.mem, &cc);
-                childlanes[4] = self.node2lanes(x, size_log2 - 1);
-                let x = prepared(&self.base.mem, &cr);
-                childlanes[5] = self.node2lanes(x, size_log2 - 1);
-                let x = prepared(&self.base.mem, &bc);
-                childlanes[7] = self.node2lanes(x, size_log2 - 1);
-                adml &=
-                    childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
-            }
-            for x in &mut childlanes {
-                *x >>= 32;
-            }
-            let mut lanes = 0;
-
-            let rotr32 = |x, y| (x >> y) | (x << (32 - y));
-            let rotl32 = |x, y| (x << y) | (x >> (32 - y));
-
-            /*
-             * Lane numbers are modulo 32, with each lane being either
-             * 8 rows, 8 columns, or 8hd (in either diagonal direction)
-             */
-            let a: u64 = if size_log2 - LEAF_SIZE_LOG2 - 2 <= 4 {
-                1 << (size_log2 - LEAF_SIZE_LOG2 - 2)
-            } else {
-                0
-            };
-            let a2 = (2 * a) & 31;
-
-            if adml & 0x88 != 0 {
-                // Horizontal lanes
-                lanes |= rotl32(childlanes[0] | childlanes[1] | childlanes[2], a);
-                lanes |= childlanes[3] | childlanes[4] | childlanes[5];
-                lanes |= rotr32(childlanes[6] | childlanes[7] | childlanes[8], a);
-            }
-
-            if adml & 0x44 != 0 {
-                lanes |= rotl32(childlanes[0], a2);
-                lanes |= rotl32(childlanes[3] | childlanes[1], a);
-                lanes |= childlanes[6] | childlanes[4] | childlanes[2];
-                lanes |= rotr32(childlanes[7] | childlanes[5], a);
-                lanes |= rotr32(childlanes[8], a2);
-            }
-
-            if adml & 0x22 != 0 {
-                // Vertical lanes
-                lanes |= rotl32(childlanes[0] | childlanes[3] | childlanes[6], a);
-                lanes |= childlanes[1] | childlanes[4] | childlanes[7];
-                lanes |= rotr32(childlanes[2] | childlanes[5] | childlanes[8], a);
-            }
-
-            if adml & 0x11 != 0 {
-                lanes |= rotl32(childlanes[2], a2);
-                lanes |= rotl32(childlanes[1] | childlanes[5], a);
-                lanes |= childlanes[0] | childlanes[4] | childlanes[8];
-                lanes |= rotr32(childlanes[3] | childlanes[7], a);
-                lanes |= rotr32(childlanes[6], a2);
-            }
-
-            extra = adml | (1 << 16) | (lanes << 32);
-            self.base.mem.get_mut(idx).extra = extra;
+        let mut childlanes = [0u64; 9];
+        let mut adml: u64 = 0xff;
+        /*
+         * Short-circuit evaluation using the corner children
+         * This will handle the vast majority of random tiles.
+         */
+        if adml != 0 {
+            childlanes[0] = self.node2lanes(nw, size_log2 - 1);
+            adml &= childlanes[0];
+        }
+        if adml != 0 {
+            childlanes[2] = self.node2lanes(ne, size_log2 - 1);
+            adml &= childlanes[2];
+        }
+        if adml != 0 {
+            childlanes[6] = self.node2lanes(sw, size_log2 - 1);
+            adml &= childlanes[6];
+        }
+        if adml != 0 {
+            childlanes[8] = self.node2lanes(se, size_log2 - 1);
+            adml &= childlanes[8];
+        }
+        if adml == 0 {
+            self.base.mem.get_mut(idx).extra = 0;
+            status.store(status::CACHED, Ordering::Release);
+            return 0;
         }
 
-        lock.store(false, Ordering::Release);
-        extra & 0xffffffff0000ffff
+        if size_log2 == LEAF_SIZE_LOG2 + 2 {
+            let tlx = {
+                let nw = self.base.mem.get(nw);
+                [nw.nw, nw.ne, nw.sw, nw.se]
+                    .map(|x| u64::from_le_bytes(self.base.mem.get(x).leaf_cells()))
+            };
+            let trx = {
+                let ne = self.base.mem.get(ne);
+                [ne.nw, ne.ne, ne.sw, ne.se]
+                    .map(|x| u64::from_le_bytes(self.base.mem.get(x).leaf_cells()))
+            };
+            let blx = {
+                let sw = self.base.mem.get(sw);
+                [sw.nw, sw.ne, sw.sw, sw.se]
+                    .map(|x| u64::from_le_bytes(self.base.mem.get(x).leaf_cells()))
+            };
+            let brx = {
+                let se = self.base.mem.get(se);
+                [se.nw, se.ne, se.sw, se.se]
+                    .map(|x| u64::from_le_bytes(self.base.mem.get(x).leaf_cells()))
+            };
+
+            let cc = [tlx[3], trx[2], blx[1], brx[0]];
+            let tc = [tlx[1], trx[0], tlx[3], trx[2]];
+            let bc = [blx[1], brx[0], blx[3], brx[2]];
+            let cl = [tlx[2], tlx[3], blx[0], blx[1]];
+            let cr = [trx[2], trx[3], brx[0], brx[1]];
+
+            let prepared = |mem: &MemoryManager, x: &[u64; 4]| {
+                let nw = mem.find_or_create_leaf_from_u64(x[0]);
+                let ne = mem.find_or_create_leaf_from_u64(x[1]);
+                let sw = mem.find_or_create_leaf_from_u64(x[2]);
+                let se = mem.find_or_create_leaf_from_u64(x[3]);
+                mem.find_or_create_node(nw, ne, sw, se)
+            };
+
+            for (i, x) in [(1, &tc), (3, &cl), (4, &cc), (5, &cr), (7, &bc)] {
+                childlanes[i] = self.node2lanes(prepared(&self.base.mem, x), size_log2 - 1);
+            }
+            adml &= childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
+        } else {
+            let pptr_tl = self.base.mem.get(nw);
+            let pptr_tr = self.base.mem.get(ne);
+            let pptr_bl = self.base.mem.get(sw);
+            let pptr_br = self.base.mem.get(se);
+            let cc = [pptr_tl.se, pptr_tr.sw, pptr_bl.ne, pptr_br.nw];
+            let tc = [pptr_tl.ne, pptr_tr.nw, pptr_tl.se, pptr_tr.sw];
+            let bc = [pptr_bl.ne, pptr_br.nw, pptr_bl.se, pptr_br.sw];
+            let cl = [pptr_tl.sw, pptr_tl.se, pptr_bl.nw, pptr_bl.ne];
+            let cr = [pptr_tr.sw, pptr_tr.se, pptr_br.nw, pptr_br.ne];
+
+            let prepared = |mem: &MemoryManager, x: &[NodeIdx; 4]| {
+                mem.find_or_create_node(x[0], x[1], x[2], x[3])
+            };
+
+            for (i, x) in [(1, &tc), (3, &cl), (4, &cc), (5, &cr), (7, &bc)] {
+                childlanes[i] = self.node2lanes(prepared(&self.base.mem, x), size_log2 - 1);
+            }
+            adml &= childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
+        }
+        for x in &mut childlanes {
+            *x >>= 32;
+        }
+        let mut lanes = 0;
+
+        let rotr32 = |x, y| (x >> y) | (x << (32 - y));
+        let rotl32 = |x, y| (x << y) | (x >> (32 - y));
+
+        /*
+         * Lane numbers are modulo 32, with each lane being either
+         * 8 rows, 8 columns, or 8hd (in either diagonal direction)
+         */
+        let a: u64 = if size_log2 - LEAF_SIZE_LOG2 - 2 <= 4 {
+            1 << (size_log2 - LEAF_SIZE_LOG2 - 2)
+        } else {
+            0
+        };
+        let a2 = (2 * a) & 31;
+
+        if adml & 0x88 != 0 {
+            // Horizontal lanes
+            lanes |= rotl32(childlanes[0] | childlanes[1] | childlanes[2], a);
+            lanes |= childlanes[3] | childlanes[4] | childlanes[5];
+            lanes |= rotr32(childlanes[6] | childlanes[7] | childlanes[8], a);
+        }
+
+        if adml & 0x44 != 0 {
+            lanes |= rotl32(childlanes[0], a2);
+            lanes |= rotl32(childlanes[3] | childlanes[1], a);
+            lanes |= childlanes[6] | childlanes[4] | childlanes[2];
+            lanes |= rotr32(childlanes[7] | childlanes[5], a);
+            lanes |= rotr32(childlanes[8], a2);
+        }
+
+        if adml & 0x22 != 0 {
+            // Vertical lanes
+            lanes |= rotl32(childlanes[0] | childlanes[3] | childlanes[6], a);
+            lanes |= childlanes[1] | childlanes[4] | childlanes[7];
+            lanes |= rotr32(childlanes[2] | childlanes[5] | childlanes[8], a);
+        }
+
+        if adml & 0x11 != 0 {
+            lanes |= rotl32(childlanes[2], a2);
+            lanes |= rotl32(childlanes[1] | childlanes[5], a);
+            lanes |= childlanes[0] | childlanes[4] | childlanes[8];
+            lanes |= rotr32(childlanes[3] | childlanes[7], a);
+            lanes |= rotr32(childlanes[6], a2);
+        }
+
+        let extra = adml | (lanes << 32);
+        self.base.mem.get_mut(idx).extra = extra;
+        status.store(status::CACHED, Ordering::Release);
+        extra
     }
 
     fn is_solitonic(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> bool {

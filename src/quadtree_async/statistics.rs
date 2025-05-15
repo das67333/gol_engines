@@ -1,5 +1,7 @@
 //! A thread-local statistics collector for quadtree operations.
-use crate::{MAX_TASKS_COUNT, MIN_TASK_SPAWN_SIZE_LOG2, TASKS_SPAWN_COUNT};
+use crate::{
+    MAX_TASKS_COUNT, MIN_TASK_SPAWN_SIZE_LOG2, MIN_TASK_SPAWN_SIZE_LOG2_ANOTHER, TASKS_SPAWN_COUNT,
+};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
@@ -19,7 +21,7 @@ static LENGTH_GLOBAL_COUNT: [AtomicUsize; MAX_TRACKED_CONTAINERS] =
     [AtomicUsize::new(0), AtomicUsize::new(0)];
 
 thread_local! {
-    static LENGTH_LOCAL_COUNT: Cell<[u8; MAX_TRACKED_CONTAINERS]> = Cell::new([0; MAX_TRACKED_CONTAINERS]);
+    static LENGTH_LOCAL_COUNT: Cell<[u8; MAX_TRACKED_CONTAINERS]> = const { Cell::new([0; MAX_TRACKED_CONTAINERS]) };
 }
 
 static LENGTH_LIMIT: AtomicUsize = AtomicUsize::new(0);
@@ -60,6 +62,11 @@ impl ExecutionStatistics {
     /// `true` if the system should spawn a new task, `false` otherwise.
     pub(super) fn should_spawn(size_log2: u32) -> bool {
         size_log2 >= MIN_TASK_SPAWN_SIZE_LOG2.load(Ordering::Relaxed)
+            && ACTIVE_TASKS_COUNT.load(Ordering::Relaxed) < MAX_TASKS_COUNT
+    }
+
+    pub(super) fn should_spawn2(size_log2: u32) -> bool {
+        size_log2 >= MIN_TASK_SPAWN_SIZE_LOG2_ANOTHER.load(Ordering::Relaxed)
             && ACTIVE_TASKS_COUNT.load(Ordering::Relaxed) < MAX_TASKS_COUNT
     }
 

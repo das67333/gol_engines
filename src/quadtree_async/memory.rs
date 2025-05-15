@@ -1,5 +1,4 @@
 use super::{ExecutionStatistics, NodeIdx, QuadTreeNode};
-use crate::NODES_CREATED_COUNT;
 use std::{cell::UnsafeCell, hint::spin_loop, sync::atomic::Ordering};
 
 pub(super) struct MemoryManager<Extra> {
@@ -186,7 +185,7 @@ impl<Extra: Default> MemoryManagerRaw<Extra> {
                 lock.store(false, Ordering::Release);
 
                 ExecutionStatistics::on_insertion::<0>();
-                NODES_CREATED_COUNT.fetch_add(1, Ordering::Relaxed);
+                // NODES_CREATED_COUNT.fetch_add(1, Ordering::Relaxed);
                 break;
             }
 

@@ -18,7 +18,7 @@ pub(super) struct QuadTreeNode<Extra> {
     pub(super) status: AtomicU8,
     pub(super) flags: u8,
     pub(super) lock: AtomicBool,
-    pub(super) lock_extra: AtomicBool, // lock for extra information
+    pub(super) status_extra: AtomicU8, // status for extra
     pub(super) extra: Extra, // extra information for engine: () for hashlife and u64 for streamlife
 }
 
