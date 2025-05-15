@@ -16,16 +16,27 @@ pub(super) struct QuadTreeNode<Extra> {
     /// valid only if `status` is `STATUS_CACHED`
     pub(super) cache: NodeIdx,
     pub(super) status: AtomicU8,
-    pub(super) is_leaf: bool,
-    pub(super) is_used: bool,
+    pub(super) flags: u8,
     pub(super) lock: AtomicBool,
+    pub(super) lock_extra: AtomicBool, // lock for extra information
     pub(super) extra: Extra, // extra information for engine: () for hashlife and u64 for streamlife
 }
 
 impl<Extra> QuadTreeNode<Extra> {
-    pub(super) const STATUS_NOT_CACHED: u8 = 0;
-    pub(super) const STATUS_PROCESSING: u8 = 1;
-    pub(super) const STATUS_CACHED: u8 = 2;
+    pub(super) fn not_used(&self) -> bool {
+        self.flags & 1 << 1 == 0
+    }
+
+    pub(super) fn build_flags(is_leaf: bool, is_used: bool) -> u8 {
+        let mut flags = 0;
+        if is_leaf {
+            flags |= 1 << 0;
+        }
+        if is_used {
+            flags |= 1 << 1;
+        }
+        flags
+    }
 
     pub(super) fn hash(nw: NodeIdx, ne: NodeIdx, sw: NodeIdx, se: NodeIdx) -> usize {
         let h = 0u32

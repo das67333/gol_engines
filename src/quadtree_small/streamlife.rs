@@ -89,11 +89,11 @@ impl StreamLifeEngineSmall {
             return self.base.mem.get(idx, size_log2).extra & 0xffffffff0000ffff;
         }
 
-        let (nw, ne, sw, se, meta) = {
+        let (nw, ne, sw, se, extra) = {
             let n = self.base.mem.get(idx, size_log2);
             (n.nw, n.ne, n.sw, n.se, n.extra)
         };
-        if (meta & 0xffff0000) != (1 << 16) {
+        if (extra & 0xffff0000) != (1 << 16) {
             let mut childlanes = [0u64; 9];
             let mut adml: u64 = 0xff;
             /*
@@ -272,54 +272,6 @@ impl StreamLifeEngineSmall {
         (((lanes1 >> 4) & lanes2) | ((lanes2 >> 4) & lanes1)) & 15 != 0
     }
 
-    fn four_children_overlapping(&mut self, arr: &[NodeIdx; 9], size_log2: u32) -> [NodeIdx; 4] {
-        [
-            self.base
-                .mem
-                .find_or_create_node(arr[0], arr[1], arr[3], arr[4], size_log2 + 1),
-            self.base
-                .mem
-                .find_or_create_node(arr[1], arr[2], arr[4], arr[5], size_log2 + 1),
-            self.base
-                .mem
-                .find_or_create_node(arr[3], arr[4], arr[6], arr[7], size_log2 + 1),
-            self.base
-                .mem
-                .find_or_create_node(arr[4], arr[5], arr[7], arr[8], size_log2 + 1),
-        ]
-    }
-
-    fn ninechildren(&mut self, idx: NodeIdx, size_log2: u32) -> [NodeIdx; 9] {
-        let [nw, ne, sw, se] = {
-            let n = self.base.mem.get(idx, size_log2);
-            [n.nw, n.ne, n.sw, n.se]
-        };
-        let [nw_, ne_, sw_, se_] =
-            [nw, ne, sw, se].map(|x| self.base.mem.get(x, size_log2 - 1).clone());
-
-        [
-            nw,
-            self.base
-                .mem
-                .find_or_create_node(nw_.ne, ne_.nw, nw_.se, ne_.sw, size_log2 - 1),
-            ne,
-            self.base
-                .mem
-                .find_or_create_node(nw_.sw, nw_.se, sw_.nw, sw_.ne, size_log2 - 1),
-            self.base
-                .mem
-                .find_or_create_node(nw_.se, ne_.sw, sw_.ne, se_.nw, size_log2 - 1),
-            self.base
-                .mem
-                .find_or_create_node(ne_.sw, ne_.se, se_.nw, se_.ne, size_log2 - 1),
-            sw,
-            self.base
-                .mem
-                .find_or_create_node(sw_.ne, se_.nw, sw_.se, se_.sw, size_log2 - 1),
-            se,
-        ]
-    }
-
     fn merge_universes(&mut self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> NodeIdx {
         if idx.1 == NodeIdx(0) {
             return idx.0;
@@ -378,8 +330,8 @@ impl StreamLifeEngineSmall {
                 (NodeIdx(0), NodeIdx(0))
             }
         } else {
-            let mut ch91 = self.ninechildren(idx.0, size_log2);
-            let mut ch92 = self.ninechildren(idx.1, size_log2);
+            let mut ch91 = self.base.nine_children_overlapping(idx.0, size_log2);
+            let mut ch92 = self.base.nine_children_overlapping(idx.1, size_log2);
 
             let both_stages = self.base.generations_per_update_log2.unwrap() + 2 >= size_log2;
 
@@ -403,8 +355,8 @@ impl StreamLifeEngineSmall {
                 }
             }
 
-            let mut ch41 = self.four_children_overlapping(&ch91, size_log2 - 2);
-            let mut ch42 = self.four_children_overlapping(&ch92, size_log2 - 2);
+            let mut ch41 = self.base.four_children_overlapping(&ch91, size_log2 - 2);
+            let mut ch42 = self.base.four_children_overlapping(&ch92, size_log2 - 2);
 
             for i in 0..4 {
                 let fh = self.update_binode((ch41[i], ch42[i]), size_log2 - 1);

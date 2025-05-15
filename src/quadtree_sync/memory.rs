@@ -255,6 +255,6 @@ impl<Extra: Clone + Default> MemoryManagerRaw<Extra> {
     }
 
     fn bytes_total(&self) -> usize {
-        self.hashtable.len() * std::mem::size_of::<QuadTreeNode<Extra>>()
+        self.hashtable.capacity() * std::mem::size_of::<QuadTreeNode<Extra>>()
     }
 }

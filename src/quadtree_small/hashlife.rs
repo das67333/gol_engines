@@ -92,6 +92,52 @@ impl<Extra: Clone + Default> HashLifeEngineSmall<Extra> {
             .find_or_create_leaf_from_u64(u64::from_le_bytes(arr.map(|x| (x >> 4) as u8)))
     }
 
+    pub(super) fn nine_children_overlapping(
+        &mut self,
+        idx: NodeIdx,
+        size_log2: u32,
+    ) -> [NodeIdx; 9] {
+        let [nw, ne, sw, se] = {
+            let n = self.mem.get(idx, size_log2);
+            [n.nw, n.ne, n.sw, n.se]
+        };
+        let [nw_, ne_, sw_, se_] = [nw, ne, sw, se].map(|x| self.mem.get(x, size_log2 - 1).clone());
+
+        [
+            nw,
+            self.mem
+                .find_or_create_node(nw_.ne, ne_.nw, nw_.se, ne_.sw, size_log2 - 1),
+            ne,
+            self.mem
+                .find_or_create_node(nw_.sw, nw_.se, sw_.nw, sw_.ne, size_log2 - 1),
+            self.mem
+                .find_or_create_node(nw_.se, ne_.sw, sw_.ne, se_.nw, size_log2 - 1),
+            self.mem
+                .find_or_create_node(ne_.sw, ne_.se, se_.nw, se_.ne, size_log2 - 1),
+            sw,
+            self.mem
+                .find_or_create_node(sw_.ne, se_.nw, sw_.se, se_.sw, size_log2 - 1),
+            se,
+        ]
+    }
+
+    pub(super) fn four_children_overlapping(
+        &mut self,
+        arr: &[NodeIdx; 9],
+        size_log2: u32,
+    ) -> [NodeIdx; 4] {
+        [
+            self.mem
+                .find_or_create_node(arr[0], arr[1], arr[3], arr[4], size_log2 + 1),
+            self.mem
+                .find_or_create_node(arr[1], arr[2], arr[4], arr[5], size_log2 + 1),
+            self.mem
+                .find_or_create_node(arr[3], arr[4], arr[6], arr[7], size_log2 + 1),
+            self.mem
+                .find_or_create_node(arr[4], arr[5], arr[7], arr[8], size_log2 + 1),
+        ]
+    }
+
     /// `size_log2` is related to `nw`, `ne`, `sw`, `se` and return value
     fn update_nodes_single(
         &mut self,

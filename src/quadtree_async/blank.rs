@@ -9,7 +9,7 @@ impl BlankNodes {
         Self { data: vec![] }
     }
 
-    pub(super) fn get<Extra: Default>(
+    pub(super) fn get_mut<Extra: Default>(
         &mut self,
         size_log2: u32,
         mem: &MemoryManager<Extra>,
@@ -24,6 +24,11 @@ impl BlankNodes {
             };
         }
         v[i]
+    }
+
+    pub(super) fn get(&self, size_log2: u32) -> NodeIdx {
+        let i = (size_log2 - LEAF_SIZE_LOG2) as usize;
+        self.data[i]
     }
 
     pub(super) fn clear(&mut self) {

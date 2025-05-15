@@ -1,10 +1,6 @@
 use super::{ExecutionStatistics, NodeIdx, QuadTreeNode};
 use crate::NODES_CREATED_COUNT;
-use std::{
-    cell::UnsafeCell,
-    hint::spin_loop,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{cell::UnsafeCell, hint::spin_loop, sync::atomic::Ordering};
 
 pub(super) struct MemoryManager<Extra> {
     base: UnsafeCell<MemoryManagerRaw<Extra>>,
@@ -103,20 +99,10 @@ impl<Extra: Default> MemoryManager<Extra> {
             .get_mut()
             .hashtable
             .fill_with(QuadTreeNode::default);
-        self.base.get_mut().stats.reset();
-        self.base.get_mut().poisoned.store(false, Ordering::Relaxed);
     }
 
     pub(super) fn bytes_total(&self) -> usize {
         unsafe { (*self.base.get()).bytes_total() }
-    }
-
-    pub(super) fn poisoned(&self) -> bool {
-        unsafe { (*self.base.get()).poisoned.load(Ordering::Relaxed) }
-    }
-
-    pub(super) fn should_spawn(&self, size_log2: u32) -> bool {
-        unsafe { (*self.base.get()).stats.should_spawn(size_log2) }
     }
 }
 
@@ -124,10 +110,6 @@ impl<Extra: Default> MemoryManager<Extra> {
 struct MemoryManagerRaw<Extra> {
     /// buffer where heads of linked lists are stored
     hashtable: Vec<QuadTreeNode<Extra>>,
-    /// statistics managing poisoning and spawning async tasks
-    stats: ExecutionStatistics,
-    /// if true, the hashtable is poisoned and should be restored from the backup
-    poisoned: AtomicBool,
 }
 
 impl<Extra: Default> MemoryManagerRaw<Extra> {
@@ -141,8 +123,6 @@ impl<Extra: Default> MemoryManagerRaw<Extra> {
             hashtable: (0..1u64 << cap_log2)
                 .map(|_| QuadTreeNode::default())
                 .collect(),
-            stats: ExecutionStatistics::new(cap_log2),
-            poisoned: AtomicBool::new(false),
         }
     }
 
@@ -168,22 +148,13 @@ impl<Extra: Default> MemoryManagerRaw<Extra> {
         hash: usize,
         is_leaf: bool,
     ) -> NodeIdx {
-        if self.poisoned.load(Ordering::Relaxed) {
+        if ExecutionStatistics::is_poisoned() {
             return NodeIdx::default();
         }
 
         let mask = self.hashtable.len() - 1;
         let mut index = hash & mask;
-
-        // prefetch(hashtable[index])
-        // TODO: research prefetch levels, QuadTreeNode alignments
-        // #[cfg(target_arch = "x86_64")]
-        // {
-        //     use std::arch::x86_64::*;
-        //     _mm_prefetch::<_MM_HINT_T0>(
-        //         (self.hashtable.get_unchecked(index) as *const QuadTreeNode) as *const i8,
-        //     );
-        // }
+        let flags = QuadTreeNode::<Extra>::build_flags(is_leaf, true);
 
         loop {
             // First check if we can acquire the lock for this index
@@ -199,43 +170,32 @@ impl<Extra: Default> MemoryManagerRaw<Extra> {
             // Now safely get the mutable reference after acquiring the lock
             let n = self.hashtable.get_unchecked_mut(index);
 
-            if n.nw == nw
-                && n.ne == ne
-                && n.sw == sw
-                && n.se == se
-                && n.is_leaf == is_leaf
-                && n.is_used
-            {
-                n.lock.store(false, Ordering::Release);
+            if n.nw == nw && n.ne == ne && n.sw == sw && n.se == se && n.flags == flags {
+                lock.store(false, Ordering::Release);
                 break;
             }
 
-            if !n.is_used {
+            if n.not_used() {
                 n.nw = nw;
                 n.ne = ne;
                 n.sw = sw;
                 n.se = se;
-                n.is_leaf = is_leaf;
-                n.is_used = true;
-                n.lock.store(false, Ordering::Release);
+                n.flags = flags;
+                lock.store(false, Ordering::Release);
 
-                if self.stats.should_poison_on_creation() {
-                    self.poisoned.store(true, Ordering::Relaxed);
-                    return NodeIdx::default();
-                }
+                ExecutionStatistics::on_insertion::<0>();
                 NODES_CREATED_COUNT.fetch_add(1, Ordering::Relaxed);
                 break;
             }
 
-            let next_index = index.wrapping_add(1) & mask;
-            n.lock.store(false, Ordering::Release);
-            index = next_index;
+            lock.store(false, Ordering::Release);
+            index = index.wrapping_add(1) & mask;
         }
 
         NodeIdx(index as u32)
     }
 
     fn bytes_total(&self) -> usize {
-        self.hashtable.len() * std::mem::size_of::<QuadTreeNode<Extra>>()
+        self.hashtable.capacity() * std::mem::size_of::<QuadTreeNode<Extra>>()
     }
 }

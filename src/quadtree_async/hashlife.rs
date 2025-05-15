@@ -1,4 +1,7 @@
-use super::{BlankNodes, MemoryManager, NodeIdx, QuadTreeNode, LEAF_SIZE, LEAF_SIZE_LOG2};
+use super::{
+    status, BlankNodes, ExecutionStatistics, MemoryManager, NodeIdx, QuadTreeNode, LEAF_SIZE,
+    LEAF_SIZE_LOG2,
+};
 use crate::{
     quadtree_async::TasksCountGuard, GoLEngine, Pattern, PatternNode, Topology,
     MIN_TASK_SPAWN_SIZE_LOG2, WORKER_THREADS,
@@ -16,6 +19,7 @@ pub struct HashLifeEngineAsync<Extra> {
     pub(super) generations_per_update_log2: Option<u32>,
     pub(super) topology: Topology,
     pub(super) blank_nodes: BlankNodes,
+    pub(super) _stats: ExecutionStatistics,
 }
 
 impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
@@ -190,15 +194,15 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
     fn update_node_sync(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
         let n = self.mem.get(node);
         let status = n.status.load(Ordering::Acquire);
-        if status == QuadTreeNode::<Extra>::STATUS_CACHED {
+        if status == status::CACHED {
             return n.cache;
         }
 
-        if status == QuadTreeNode::<Extra>::STATUS_NOT_CACHED
+        if status == status::NOT_CACHED
             && n.status
                 .compare_exchange(
-                    QuadTreeNode::<Extra>::STATUS_NOT_CACHED,
-                    QuadTreeNode::<Extra>::STATUS_PROCESSING,
+                    status::NOT_CACHED,
+                    status::PROCESSING,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 )
@@ -206,18 +210,17 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
         {
             let cache = self.update_inner_sync(node, size_log2);
             self.mem.get_mut(node).cache = cache;
-            n.status
-                .store(QuadTreeNode::<Extra>::STATUS_CACHED, Ordering::Release);
-            return cache;
-        }
-
-        while n.status.load(Ordering::Acquire) != QuadTreeNode::<Extra>::STATUS_CACHED {
-            if self.mem.poisoned() {
-                return NodeIdx::default();
+            n.status.store(status::CACHED, Ordering::Release);
+            cache
+        } else {
+            while n.status.load(Ordering::Acquire) != status::CACHED {
+                if ExecutionStatistics::is_poisoned() {
+                    return NodeIdx::default();
+                }
+                spin_loop();
             }
-            spin_loop();
+            n.cache
         }
-        n.cache
     }
 
     fn update_inner_async(
@@ -242,7 +245,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
                 let mut arr9;
                 if both_stages {
                     arr9 = this.nine_children_overlapping(n.nw, n.ne, n.sw, n.se);
-                    if this.mem.should_spawn(size_log2) {
+                    if ExecutionStatistics::should_spawn(size_log2) {
                         let _guard = TasksCountGuard::new(9);
                         let this_ptr = this as *const _ as usize;
                         let handles = arr9.map(|x| {
@@ -265,7 +268,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
                 }
 
                 let mut arr4 = this.four_children_overlapping(&arr9);
-                if this.mem.should_spawn(size_log2) {
+                if ExecutionStatistics::should_spawn(size_log2) {
                     let _guard = TasksCountGuard::new(4);
                     let this_ptr = this as *const _ as usize;
                     let handles = arr4.map(|x| {
@@ -295,15 +298,15 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
     pub(super) async fn update_node_async(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
         let n = self.mem.get(node);
         let status = n.status.load(Ordering::Acquire);
-        if status == QuadTreeNode::<Extra>::STATUS_CACHED {
+        if status == status::CACHED {
             return n.cache;
         }
 
-        if status == QuadTreeNode::<Extra>::STATUS_NOT_CACHED
+        if status == status::NOT_CACHED
             && n.status
                 .compare_exchange(
-                    QuadTreeNode::<Extra>::STATUS_NOT_CACHED,
-                    QuadTreeNode::<Extra>::STATUS_PROCESSING,
+                    status::NOT_CACHED,
+                    status::PROCESSING,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 )
@@ -315,18 +318,17 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
                 self.update_inner_sync(node, size_log2)
             };
             self.mem.get_mut(node).cache = cache;
-            n.status
-                .store(QuadTreeNode::<Extra>::STATUS_CACHED, Ordering::Release);
-            return cache;
-        }
-
-        while n.status.load(Ordering::Acquire) != QuadTreeNode::<Extra>::STATUS_CACHED {
-            if self.mem.poisoned() {
-                return NodeIdx::default();
+            n.status.store(status::CACHED, Ordering::Release);
+            cache
+        } else {
+            while n.status.load(Ordering::Acquire) != status::CACHED {
+                if ExecutionStatistics::is_poisoned() {
+                    return NodeIdx::default();
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
+            n.cache
         }
-        n.cache
     }
 
     /// Add a frame around the field: if `self.topology` is Unbounded, frame is blank,
@@ -334,7 +336,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
     /// The field becomes two times bigger.
     pub(super) fn with_frame(&mut self, idx: NodeIdx, size_log2: u32) -> NodeIdx {
         let n = self.mem.get(idx);
-        let b = self.blank_nodes.get(size_log2 - 1, &self.mem);
+        let b = self.blank_nodes.get_mut(size_log2 - 1, &self.mem);
         let [nw, ne, sw, se] = match self.topology {
             Topology::Torus => [self.mem.find_or_create_node(n.se, n.sw, n.ne, n.nw); 4],
             Topology::Unbounded => [
@@ -358,7 +360,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
             return false;
         }
 
-        let b = self.blank_nodes.get(self.size_log2 - 2, &self.mem);
+        let b = self.blank_nodes.get_mut(self.size_log2 - 2, &self.mem);
 
         let root = self.mem.get(self.root);
         let [nw, ne, sw, se] = [
@@ -408,6 +410,19 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
         cache.insert(idx, result);
         result
     }
+
+    pub(super) fn with_capacity(cap_log2: u32) -> Self {
+        let mem = MemoryManager::with_capacity(cap_log2);
+        Self {
+            size_log2: LEAF_SIZE_LOG2,
+            root: mem.find_or_create_leaf_from_u64(0),
+            mem,
+            generations_per_update_log2: None,
+            topology: Topology::Unbounded,
+            blank_nodes: BlankNodes::new(),
+            _stats: ExecutionStatistics::new(cap_log2),
+        }
+    }
 }
 
 impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
@@ -419,15 +434,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
             .checked_next_power_of_two()
             .unwrap()
             .trailing_zeros();
-        let mem = MemoryManager::with_capacity(cap_log2);
-        Self {
-            size_log2: LEAF_SIZE_LOG2,
-            root: mem.find_or_create_leaf_from_u64(0),
-            mem,
-            generations_per_update_log2: None,
-            topology: Topology::Unbounded,
-            blank_nodes: BlankNodes::new(),
-        }
+        Self::with_capacity(cap_log2)
     }
 
     fn load_pattern(&mut self, pattern: &Pattern, topology: Topology) -> Result<()> {
@@ -438,6 +445,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         self.size_log2 = size_log2;
         self.mem.clear();
         self.blank_nodes.clear();
+        ExecutionStatistics::reset();
         let mut cache = HashMap::new();
         self.root =
             Self::from_pattern_recursive(pattern.get_root(), pattern, &self.mem, &mut cache);
@@ -511,7 +519,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
                 .unwrap()
                 .block_on(async { self.update_node_async(self.root, self.size_log2).await })
         };
-        if self.mem.poisoned() {
+        if ExecutionStatistics::is_poisoned() {
             self.load_pattern(&backup, self.topology)?;
             return Err(anyhow!(
                 "HashLifeAsync: overfilled MemoryManager, try smaller step"
@@ -542,6 +550,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         let pattern = self.current_state();
         self.mem.clear();
         self.blank_nodes.clear();
+        ExecutionStatistics::reset();
         let mut cache = HashMap::new();
         self.root =
             Self::from_pattern_recursive(pattern.get_root(), &pattern, &self.mem, &mut cache);

@@ -9,7 +9,7 @@ impl BlankNodes {
         Self { data: vec![] }
     }
 
-    pub(super) fn get<Extra: Clone + Default>(
+    pub(super) fn get_mut<Extra: Clone + Default>(
         &mut self,
         size_log2: u32,
         mem: &MemoryManager<Extra>,

@@ -1,9 +1,11 @@
-use super::{hashlife::HashLifeEngineAsync, NodeIdx, LEAF_SIZE_LOG2};
+use super::{
+    hashlife::HashLifeEngineAsync, status, CacheEntry, ExecutionStatistics, NodeIdx, QuadTreeNode,
+    StreamLifeCache, TasksCountGuard, LEAF_SIZE_LOG2,
+};
 use crate::{GoLEngine, Pattern, Topology, WORKER_THREADS};
 use anyhow::{anyhow, Result};
-use dashmap::DashMap;
 use num_bigint::BigInt;
-use std::sync::atomic::Ordering;
+use std::{future::Future, hint::spin_loop, pin::Pin, sync::atomic::Ordering};
 
 type MemoryManager = super::MemoryManager<u64>;
 
@@ -12,7 +14,7 @@ pub struct StreamLifeEngineAsync {
     base: HashLifeEngineAsync<u64>,
     // streamlife-specific
     biroot: Option<(NodeIdx, NodeIdx)>,
-    bicache: DashMap<(NodeIdx, NodeIdx), (NodeIdx, NodeIdx)>,
+    bicache: StreamLifeCache,
 }
 
 impl StreamLifeEngineAsync {
@@ -72,25 +74,43 @@ impl StreamLifeEngineAsync {
         dmap | (lmask << 32)
     }
 
-    fn node2lanes(&mut self, idx: NodeIdx, size_log2: u32) -> u64 {
-        if idx == self.base.blank_nodes.get(size_log2, &self.base.mem) {
+    fn node2lanes(&self, idx: NodeIdx, size_log2: u32) -> u64 {
+        if idx == self.base.blank_nodes.get(size_log2) {
             // blank node
             return 0xffff;
         }
 
-        if size_log2 == LEAF_SIZE_LOG2 + 1 {
-            let n = self.base.mem.get_mut(idx);
-            if n.extra & 0xffff0000 != 1 << 16 {
-                n.extra = self.determine_direction(n.nw, n.ne, n.sw, n.se) | (1 << 16);
-            }
-            return n.extra & 0xffffffff0000ffff;
+        while self
+            .base
+            .mem
+            .get(idx)
+            .lock_extra
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
         }
 
-        let (nw, ne, sw, se, meta) = {
+        if size_log2 == LEAF_SIZE_LOG2 + 1 {
+            let n = self.base.mem.get_mut(idx);
+            let mut extra = n.extra;
+            if extra & 0xffff0000 != 1 << 16 {
+                extra = self.determine_direction(n.nw, n.ne, n.sw, n.se) | (1 << 16);
+                n.extra = extra;
+            }
+            self.base
+                .mem
+                .get(idx)
+                .lock_extra
+                .store(false, Ordering::Release);
+            return extra & 0xffffffff0000ffff;
+        }
+
+        let (nw, ne, sw, se, mut extra) = {
             let n = self.base.mem.get(idx);
             (n.nw, n.ne, n.sw, n.se, n.extra)
         };
-        if (meta & 0xffff0000) != (1 << 16) {
+        if (extra & 0xffff0000) != (1 << 16) {
             let mut childlanes = [0u64; 9];
             let mut adml: u64 = 0xff;
             /*
@@ -115,6 +135,11 @@ impl StreamLifeEngineAsync {
             }
             if adml == 0 {
                 self.base.mem.get_mut(idx).extra = 1 << 16;
+                self.base
+                    .mem
+                    .get(idx)
+                    .lock_extra
+                    .store(false, Ordering::Release);
                 return 0;
             }
 
@@ -146,7 +171,7 @@ impl StreamLifeEngineAsync {
                 let cl = [tlx[2], tlx[3], blx[0], blx[1]];
                 let cr = [trx[2], trx[3], brx[0], brx[1]];
 
-                let prepared = |mem: &mut MemoryManager, x: &[u64; 4]| {
+                let prepared = |mem: &MemoryManager, x: &[u64; 4]| {
                     let nw = mem.find_or_create_leaf_from_u64(x[0]);
                     let ne = mem.find_or_create_leaf_from_u64(x[1]);
                     let sw = mem.find_or_create_leaf_from_u64(x[2]);
@@ -154,15 +179,15 @@ impl StreamLifeEngineAsync {
                     mem.find_or_create_node(nw, ne, sw, se)
                 };
 
-                let x = prepared(&mut self.base.mem, &tc);
+                let x = prepared(&self.base.mem, &tc);
                 childlanes[1] = self.node2lanes(x, LEAF_SIZE_LOG2 + 1);
-                let x = prepared(&mut self.base.mem, &cl);
+                let x = prepared(&self.base.mem, &cl);
                 childlanes[3] = self.node2lanes(x, LEAF_SIZE_LOG2 + 1);
-                let x = prepared(&mut self.base.mem, &cc);
+                let x = prepared(&self.base.mem, &cc);
                 childlanes[4] = self.node2lanes(x, LEAF_SIZE_LOG2 + 1);
-                let x = prepared(&mut self.base.mem, &cr);
+                let x = prepared(&self.base.mem, &cr);
                 childlanes[5] = self.node2lanes(x, LEAF_SIZE_LOG2 + 1);
-                let x = prepared(&mut self.base.mem, &bc);
+                let x = prepared(&self.base.mem, &bc);
                 childlanes[7] = self.node2lanes(x, LEAF_SIZE_LOG2 + 1);
                 adml &=
                     childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
@@ -177,19 +202,19 @@ impl StreamLifeEngineAsync {
                 let cl = [pptr_tl.sw, pptr_tl.se, pptr_bl.nw, pptr_bl.ne];
                 let cr = [pptr_tr.sw, pptr_tr.se, pptr_br.nw, pptr_br.ne];
 
-                let prepared = |mem: &mut MemoryManager, x: &[NodeIdx; 4]| {
+                let prepared = |mem: &MemoryManager, x: &[NodeIdx; 4]| {
                     mem.find_or_create_node(x[0], x[1], x[2], x[3])
                 };
 
-                let x = prepared(&mut self.base.mem, &tc);
+                let x = prepared(&self.base.mem, &tc);
                 childlanes[1] = self.node2lanes(x, size_log2 - 1);
-                let x = prepared(&mut self.base.mem, &cl);
+                let x = prepared(&self.base.mem, &cl);
                 childlanes[3] = self.node2lanes(x, size_log2 - 1);
-                let x = prepared(&mut self.base.mem, &cc);
+                let x = prepared(&self.base.mem, &cc);
                 childlanes[4] = self.node2lanes(x, size_log2 - 1);
-                let x = prepared(&mut self.base.mem, &cr);
+                let x = prepared(&self.base.mem, &cr);
                 childlanes[5] = self.node2lanes(x, size_log2 - 1);
-                let x = prepared(&mut self.base.mem, &bc);
+                let x = prepared(&self.base.mem, &bc);
                 childlanes[7] = self.node2lanes(x, size_log2 - 1);
                 adml &=
                     childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
@@ -243,13 +268,19 @@ impl StreamLifeEngineAsync {
                 lanes |= rotr32(childlanes[6], a2);
             }
 
-            self.base.mem.get_mut(idx).extra = adml | (1 << 16) | (lanes << 32);
+            extra = adml | (1 << 16) | (lanes << 32);
+            self.base.mem.get_mut(idx).extra = extra;
         }
 
-        self.base.mem.get(idx).extra & 0xffffffff0000ffff
+        self.base
+            .mem
+            .get(idx)
+            .lock_extra
+            .store(false, Ordering::Release);
+        extra & 0xffffffff0000ffff
     }
 
-    fn is_solitonic(&mut self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> bool {
+    fn is_solitonic(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> bool {
         let lanes1 = self.node2lanes(idx.0, size_log2);
         if lanes1 & 255 == 0 {
             return false;
@@ -265,10 +296,16 @@ impl StreamLifeEngineAsync {
         (((lanes1 >> 4) & lanes2) | ((lanes2 >> 4) & lanes1)) & 15 != 0
     }
 
-    fn merge_universes(&mut self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> NodeIdx {
-        if idx.1 == self.base.blank_nodes.get(size_log2, &self.base.mem) {
+    fn merge_universes(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> NodeIdx {
+        // if ExecutionStatistics::is_poisoned() {
+        //     return NodeIdx::default();
+        // }
+        if idx.1 == self.base.blank_nodes.get(size_log2) {
             return idx.0;
         }
+        // if idx.0 == self.base.blank_nodes.get(size_log2) {
+        //     return idx.1;
+        // }
         let m0 = self.base.mem.get(idx.0);
         let m1 = self.base.mem.get(idx.1);
         if size_log2 == LEAF_SIZE_LOG2 {
@@ -286,27 +323,133 @@ impl StreamLifeEngineAsync {
         }
     }
 
-    async fn update_binode(
-        &mut self,
+    fn update_binode_inner(
+        &self,
         idx: (NodeIdx, NodeIdx),
         size_log2: u32,
-    ) -> (NodeIdx, NodeIdx) {
-        // let p = self.bicache.entry(idx).or_insert_with(|| {
-        //     tokio::sync::OnceCell::new()
-        // });
+    ) -> Pin<Box<dyn Future<Output = (NodeIdx, NodeIdx)> + Send>> {
+        let this = self as *const _ as usize;
+        Box::pin(async move {
+            let this = unsafe { &*(this as *const StreamLifeEngineAsync) };
+            let both_stages = this.base.generations_per_update_log2.unwrap() + 2 >= size_log2;
+
+            let (mut arr90, mut arr91);
+            let n0 = this.base.mem.get(idx.0);
+            let n1 = this.base.mem.get(idx.1);
+            if both_stages {
+                arr90 = this
+                    .base
+                    .nine_children_overlapping(n0.nw, n0.ne, n0.sw, n0.se);
+                arr91 = this
+                    .base
+                    .nine_children_overlapping(n1.nw, n1.ne, n1.sw, n1.se);
+                if ExecutionStatistics::should_spawn(size_log2) {
+                    let _guard = TasksCountGuard::new(9);
+                    let this_ptr = this as *const _ as usize;
+                    let handles: [_; 9] = std::array::from_fn(|i| {
+                        tokio::spawn(async move {
+                            unsafe { &*(this_ptr as *const StreamLifeEngineAsync) }
+                                .update_binode((arr90[i], arr91[i]), size_log2 - 1)
+                                .await
+                        })
+                    });
+                    for (i, handle) in handles.into_iter().enumerate() {
+                        (arr90[i], arr91[i]) = handle.await.unwrap();
+                    }
+                } else {
+                    for (l, r) in arr90.iter_mut().zip(arr91.iter_mut()) {
+                        (*l, *r) = this.update_binode((*l, *r), size_log2 - 1).await;
+                    }
+                }
+            } else {
+                arr90 = this
+                    .base
+                    .nine_children_disjoint(n0.nw, n0.ne, n0.sw, n0.se, size_log2 - 1);
+                arr91 = this
+                    .base
+                    .nine_children_disjoint(n1.nw, n1.ne, n1.sw, n1.se, size_log2 - 1);
+            }
+
+            let mut arr4: [(NodeIdx, NodeIdx); 4] = {
+                let arr40 = this.base.four_children_overlapping(&arr90);
+                let arr41 = this.base.four_children_overlapping(&arr91);
+                std::array::from_fn(|i| (arr40[i], arr41[i]))
+            };
+
+            if ExecutionStatistics::should_spawn(size_log2) {
+                let _guard = TasksCountGuard::new(4);
+                let this_ptr = this as *const _ as usize;
+                let handles = arr4.map(|x| {
+                    tokio::spawn(async move {
+                        unsafe { &*(this_ptr as *const StreamLifeEngineAsync) }
+                            .update_binode(x, size_log2 - 1)
+                            .await
+                    })
+                });
+                for (i, handle) in handles.into_iter().enumerate() {
+                    arr4[i] = handle.await.unwrap();
+                }
+            } else {
+                for x in arr4.iter_mut() {
+                    *x = this.update_binode(*x, size_log2 - 1).await;
+                }
+            }
+
+            (
+                this.base
+                    .mem
+                    .find_or_create_node(arr4[0].0, arr4[1].0, arr4[2].0, arr4[3].0),
+                this.base
+                    .mem
+                    .find_or_create_node(arr4[0].1, arr4[1].1, arr4[2].1, arr4[3].1),
+            )
+        })
+    }
+
+    async fn update_binode(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> (NodeIdx, NodeIdx) {
+        if ExecutionStatistics::is_poisoned() {
+            return (NodeIdx::default(), NodeIdx::default());
+        }
+
+        let entry = self.bicache.entry(idx);
+        let status = entry.status.load(Ordering::Acquire);
+        if status == status::CACHED {
+            return entry.value;
+        }
+
+        if status == status::NOT_CACHED
+            && entry
+                .status
+                .compare_exchange(
+                    status::NOT_CACHED,
+                    status::PROCESSING,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            while entry.status.load(Ordering::Acquire) != status::CACHED {
+                if ExecutionStatistics::is_poisoned() {
+                    return (NodeIdx::default(), NodeIdx::default());
+                }
+                tokio::task::yield_now().await; // TODO
+            }
+            return entry.value;
+        }
+
         if self.is_solitonic(idx, size_log2) {
             let i1 = self.base.update_node_async(idx.0, size_log2).await;
             let i2 = self.base.update_node_async(idx.1, size_log2).await;
 
-            let b = self.base.blank_nodes.get(size_log2, &self.base.mem);
-            return if idx.0 == b || idx.1 == b {
+            let b = self.base.blank_nodes.get(size_log2);
+            let res = if idx.0 == b || idx.1 == b {
                 let (i3, ind3) = if idx.0 == b {
                     (NodeIdx(i2.0), NodeIdx(idx.1 .0))
                 } else {
                     (NodeIdx(i1.0), NodeIdx(idx.0 .0))
                 };
                 let lanes = self.node2lanes(ind3, size_log2);
-                let b = self.base.blank_nodes.get(size_log2 - 1, &self.base.mem);
+                let b = self.base.blank_nodes.get(size_log2 - 1);
                 if lanes & 0xf0 != 0 {
                     (b, i3)
                 } else {
@@ -315,16 +458,15 @@ impl StreamLifeEngineAsync {
             } else {
                 (i1, i2)
             };
+            entry.value = res;
+            entry.status.store(status::CACHED, Ordering::Release);
+            return res;
         }
 
-        if let Some(cache) = self.bicache.get(&idx) {
-            return *cache;
-        }
-
-        if size_log2 == LEAF_SIZE_LOG2 + 2 {
+        let result = if size_log2 == LEAF_SIZE_LOG2 + 2 {
             let hnode2 = self.merge_universes(idx, size_log2);
             let i3 = self.base.update_node_async(hnode2, size_log2).await;
-            let b = self.base.blank_nodes.get(size_log2 - 1, &self.base.mem);
+            let b = self.base.blank_nodes.get(size_log2 - 1);
 
             if i3 != b {
                 let lanes = self.node2lanes(hnode2, size_log2);
@@ -337,53 +479,11 @@ impl StreamLifeEngineAsync {
                 (b, b)
             }
         } else {
-            Box::pin(async {
-                let both_stages = self.base.generations_per_update_log2.unwrap() + 2 >= size_log2;
-
-                let (mut arr90, mut arr91);
-                if both_stages {
-                    let n0 = self.base.mem.get(idx.0);
-                    arr90 = self
-                        .base
-                        .nine_children_overlapping(n0.nw, n0.ne, n0.sw, n0.se);
-                    let n1 = self.base.mem.get(idx.1);
-                    arr91 = self
-                        .base
-                        .nine_children_overlapping(n1.nw, n1.ne, n1.sw, n1.se);
-                    for (l, r) in arr90.iter_mut().zip(arr91.iter_mut()) {
-                        (*l, *r) = self.update_binode((*l, *r), size_log2 - 1).await;
-                    }
-                } else {
-                    let n0 = self.base.mem.get(idx.0);
-                    arr90 =
-                        self.base
-                            .nine_children_disjoint(n0.nw, n0.ne, n0.sw, n0.se, size_log2 - 1);
-                    let n1 = self.base.mem.get(idx.1);
-                    arr91 =
-                        self.base
-                            .nine_children_disjoint(n1.nw, n1.ne, n1.sw, n1.se, size_log2 - 1);
-                }
-
-                let mut arr40 = self.base.four_children_overlapping(&arr90);
-                let mut arr41 = self.base.four_children_overlapping(&arr91);
-
-                for (l, r) in arr40.iter_mut().zip(arr41.iter_mut()) {
-                    (*l, *r) = self.update_binode((*l, *r), size_log2 - 1).await;
-                }
-
-                let res = (
-                    self.base
-                        .mem
-                        .find_or_create_node(arr40[0], arr40[1], arr40[2], arr40[3]),
-                    self.base
-                        .mem
-                        .find_or_create_node(arr41[0], arr41[1], arr41[2], arr41[3]),
-                );
-                self.bicache.insert(idx, res);
-                res
-            })
-            .await
-        }
+            self.update_binode_inner(idx, size_log2).await
+        };
+        entry.value = result;
+        entry.status.store(status::CACHED, Ordering::Release);
+        result
     }
 
     fn add_frame(&mut self, dx: &mut BigInt, dy: &mut BigInt) {
@@ -413,11 +513,17 @@ impl StreamLifeEngineAsync {
 
 impl GoLEngine for StreamLifeEngineAsync {
     fn new(mem_limit_mib: u32) -> Self {
-        // TODO: include bicache size in mem_limit_mib
+        let nodes = ((mem_limit_mib as u64) << 20)
+            / (std::mem::size_of::<QuadTreeNode<u64>>() + std::mem::size_of::<CacheEntry>()) as u64;
+        // previous power of two
+        let cap_log2 = (nodes / 2 + 1)
+            .checked_next_power_of_two()
+            .unwrap()
+            .trailing_zeros();
         Self {
-            base: HashLifeEngineAsync::new(mem_limit_mib),
+            base: HashLifeEngineAsync::<u64>::with_capacity(cap_log2),
             biroot: None,
-            bicache: DashMap::new(),
+            bicache: StreamLifeCache::with_capacity(cap_log2),
         }
     }
 
@@ -452,7 +558,7 @@ impl GoLEngine for StreamLifeEngineAsync {
             // it guarantees that self.base.blank_nodes doesn't mutate during the update
             self.base
                 .blank_nodes
-                .get(self.base.size_log2, &self.base.mem),
+                .get_mut(self.base.size_log2, &self.base.mem),
         ));
         let biroot = {
             let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -466,7 +572,7 @@ impl GoLEngine for StreamLifeEngineAsync {
                 .unwrap()
                 .block_on(async { self.update_binode(biroot, self.base.size_log2).await })
         };
-        if self.base.mem.poisoned() {
+        if ExecutionStatistics::is_poisoned() {
             self.load_pattern(&backup, self.base.topology)?;
             return Err(anyhow!(
                 "StreamLifeAsync: overfilled MemoryManager, try smaller step"
@@ -502,9 +608,7 @@ impl GoLEngine for StreamLifeEngineAsync {
     }
 
     fn bytes_total(&self) -> usize {
-        let bicache_bytes =
-            self.bicache.capacity() * size_of::<((NodeIdx, NodeIdx), (NodeIdx, NodeIdx))>();
-        self.base.bytes_total() + bicache_bytes
+        self.base.bytes_total() + self.bicache.bytes_total()
     }
 }
 

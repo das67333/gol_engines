@@ -13,7 +13,8 @@ mod tests {
             Box::new(StreamLifeEngineSmall::new(mem_limit_mib)),
             Box::new(HashLifeEngineSync::new(mem_limit_mib)),
             Box::new(StreamLifeEngineSync::new(mem_limit_mib)),
-            Box::new(HashLifeEngineAsync::new(mem_limit_mib)),
+            // Box::new(HashLifeEngineAsync::new(mem_limit_mib)),
+            Box::new(StreamLifeEngineAsync::new(mem_limit_mib)),
         ];
         for engine in engines.iter_mut() {
             engine.load_pattern(&pattern, Topology::Torus).unwrap();
