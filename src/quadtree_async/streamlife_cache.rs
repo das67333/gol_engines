@@ -78,7 +78,9 @@ impl StreamLifeCacheRaw {
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
-                spin_loop();
+                while lock.load(Ordering::Relaxed) {
+                    spin_loop();
+                }
             }
 
             // Now safely get the mutable reference after acquiring the lock

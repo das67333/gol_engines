@@ -80,15 +80,14 @@ impl StreamLifeEngineAsync {
             return 0xffff;
         }
 
-        while self
-            .base
-            .mem
-            .get(idx)
-            .lock_extra
+        let lock = &self.base.mem.get(idx).lock_extra;
+        while lock
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            spin_loop();
+            while lock.load(Ordering::Relaxed) {
+                spin_loop();
+            }
         }
 
         if size_log2 == LEAF_SIZE_LOG2 + 1 {
@@ -98,11 +97,7 @@ impl StreamLifeEngineAsync {
                 extra = self.determine_direction(n.nw, n.ne, n.sw, n.se) | (1 << 16);
                 n.extra = extra;
             }
-            self.base
-                .mem
-                .get(idx)
-                .lock_extra
-                .store(false, Ordering::Release);
+            lock.store(false, Ordering::Release);
             return extra & 0xffffffff0000ffff;
         }
 
@@ -135,11 +130,7 @@ impl StreamLifeEngineAsync {
             }
             if adml == 0 {
                 self.base.mem.get_mut(idx).extra = 1 << 16;
-                self.base
-                    .mem
-                    .get(idx)
-                    .lock_extra
-                    .store(false, Ordering::Release);
+                lock.store(false, Ordering::Release);
                 return 0;
             }
 
@@ -272,11 +263,7 @@ impl StreamLifeEngineAsync {
             self.base.mem.get_mut(idx).extra = extra;
         }
 
-        self.base
-            .mem
-            .get(idx)
-            .lock_extra
-            .store(false, Ordering::Release);
+        lock.store(false, Ordering::Release);
         extra & 0xffffffff0000ffff
     }
 

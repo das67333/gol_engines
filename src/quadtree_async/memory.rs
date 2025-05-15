@@ -161,10 +161,12 @@ impl<Extra: Default> MemoryManagerRaw<Extra> {
             let lock = &(*self.hashtable.as_mut_ptr().add(index)).lock;
 
             while lock
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
-                spin_loop();
+                while lock.load(Ordering::Relaxed) {
+                    spin_loop();
+                }
             }
 
             // Now safely get the mutable reference after acquiring the lock

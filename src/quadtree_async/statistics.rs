@@ -79,6 +79,7 @@ impl ExecutionStatistics {
                     > LENGTH_LIMIT.load(Ordering::Relaxed)
             {
                 POISONED.store(true, Ordering::Relaxed);
+                eprintln!("## Poisoned: {}", I);
             }
         });
     }
