@@ -55,6 +55,7 @@ impl<Extra: Clone + Default> PrefetchedNode<Extra> {
     }
 }
 
+/// Stores the nodes of the quadtree.
 pub(super) struct MemoryManager<Extra> {
     base: UnsafeCell<MemoryManagerRaw<Extra>>,
 }

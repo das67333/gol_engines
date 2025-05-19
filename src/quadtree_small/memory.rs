@@ -20,6 +20,7 @@ struct KIVMap<Extra> {
     hashtable: Vec<NodeIdx>,
 }
 
+/// Stores the nodes of the quadtree.
 pub(super) struct MemoryManager<Extra> {
     layers: Vec<KIVMap<Extra>>,
 }
@@ -308,7 +309,7 @@ impl<Extra: Clone + Default> MemoryManager<Extra> {
 
         let nodes_total = self.layers.iter().map(|m| m.len()).sum::<usize>();
         s += "Nodes' sizes (side lengths) distribution:\n";
-        s += &format!("total - {}\n", nodes_total);
+        s += &format!("total - {nodes_total}\n");
         for (i, m) in self.layers.iter().enumerate() {
             let percent = m.len() * 100 / nodes_total;
             if percent == 0 {

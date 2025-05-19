@@ -9,7 +9,11 @@ use std::{future::Future, hint::spin_loop, pin::Pin, sync::atomic::Ordering};
 
 type MemoryManager = super::MemoryManager<u64>;
 
-/// Implementation of [StreamLife algorithm](https://conwaylife.com/wiki/StreamLife)
+/// Implementation of [StreamLife algorithm](https://conwaylife.com/wiki/StreamLife).
+/// 
+/// It is build on top of [HashLifeEngineAsync]. Unlike [StreamLifeEngineSmall]
+/// and [StreamLifeEngineSync], it uses a static hashtable for caching results of
+/// `update_binode` function.
 pub struct StreamLifeEngineAsync {
     base: HashLifeEngineAsync<u64>,
     // streamlife-specific

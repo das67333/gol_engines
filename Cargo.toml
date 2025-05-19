@@ -9,8 +9,12 @@ license = "GPL-3.0"
 keywords = ["game-of-life", "simd", "hashlife", "streamlife"]
 categories = ["algorithms", "concurrency", "simulation"]
 
+[features]
+cli_deps = ["clap"]
+
 [[bin]]
-name = "bench_otca"
+name = "gol_engines_cli"
+required-features = ["cli_deps"]
 
 [[bin]]
 name = "bench_0e0p"
@@ -25,8 +29,9 @@ flate2 = "1.1"
 num-bigint = "0.4"
 rand = "0.9"
 rand_chacha = "0.9"
-
 tokio = { version = "1.44", features = ["rt-multi-thread", "sync"] }
+
+clap = { version = "4.5", optional = true }
 
 [dev-dependencies]
 serial_test = "3.2"

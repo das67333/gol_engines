@@ -13,24 +13,20 @@ fn detect_format(filename: &str) -> Option<PatternFormat> {
 }
 
 fn main() {
+    // updating all patterns in res/very_large_patterns
     let paths = std::fs::read_dir("res/very_large_patterns").unwrap();
     let mut engine = HashLifeEngineSync::new(16 << 10);
     for (i, path) in paths.enumerate() {
         let path = path.unwrap().path();
         let name = path.file_name().unwrap().to_str().unwrap();
-        if i != 6 {
-            continue;
-        }
-        println!("i={}\t{}", i, name);
+        println!("i={i}\t{name}");
+
         let format = detect_format(name).unwrap();
         let data = std::fs::read(path).unwrap();
         let pattern = Pattern::from_format(format, &data).unwrap();
 
-        for gens_log2 in 0..=30 {
-            // let timer = std::time::Instant::now();
+        for gens_log2 in 5..=5 {
             engine.load_pattern(&pattern, Topology::Unbounded).unwrap();
-            // let elapsed_build = timer.elapsed();
-            // println!("build time: {:?}", elapsed_build);
 
             let timer = std::time::Instant::now();
             engine.update(gens_log2).unwrap();

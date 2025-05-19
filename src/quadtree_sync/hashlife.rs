@@ -6,7 +6,10 @@ use ahash::AHashMap as HashMap;
 use anyhow::{anyhow, Result};
 use num_bigint::BigInt;
 
-/// Implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife)
+/// Implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife).
+///
+/// It stores nodes in a single pre-allocated open-addressing hashtable
+/// with linear probing. The hashtable never grows.
 pub struct HashLifeEngineSync<Extra> {
     pub(super) size_log2: u32,
     pub(super) root: NodeIdx,

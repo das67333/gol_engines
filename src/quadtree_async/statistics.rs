@@ -1,7 +1,5 @@
 //! A thread-local statistics collector for quadtree operations.
-use crate::{
-    MAX_TASKS_COUNT, MIN_TASK_SPAWN_SIZE_LOG2, MIN_TASK_SPAWN_SIZE_LOG2_ANOTHER, TASKS_SPAWN_COUNT,
-};
+use crate::{MAX_TASKS_COUNT, MIN_TASK_SPAWN_SIZE_LOG2, TASKS_SPAWN_COUNT};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
@@ -33,7 +31,7 @@ static POISONED: AtomicBool = AtomicBool::new(false);
 ///
 /// This struct provides thread-local counters that periodically flush to a global
 /// atomic counter to minimize contention. It helps track quadtree node operations
-/// and determine when to spawn new tasks or poison MemoryManager
+/// and determine when to spawn new tasks or poison hashtables
 /// based on execution metrics.
 ///
 /// Uses 8-bit local counters with a fixed threshold of 256 operations before
@@ -65,11 +63,6 @@ impl ExecutionStatistics {
             && ACTIVE_TASKS_COUNT.load(Ordering::Relaxed) < MAX_TASKS_COUNT
     }
 
-    pub(super) fn should_spawn2(size_log2: u32) -> bool {
-        size_log2 >= MIN_TASK_SPAWN_SIZE_LOG2_ANOTHER.load(Ordering::Relaxed)
-            && ACTIVE_TASKS_COUNT.load(Ordering::Relaxed) < MAX_TASKS_COUNT
-    }
-
     /// Checks if an insertion overfills the container.
     ///
     /// Increments the local length counter and potentially flushes to global counter.
@@ -86,7 +79,7 @@ impl ExecutionStatistics {
                     > LENGTH_LIMIT.load(Ordering::Relaxed)
             {
                 POISONED.store(true, Ordering::Relaxed);
-                eprintln!("## Poisoned: {}", I);
+                eprintln!("## Poisoned: {I}");
             }
         });
     }

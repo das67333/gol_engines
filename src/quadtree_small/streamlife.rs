@@ -6,7 +6,9 @@ use num_bigint::BigInt;
 
 type MemoryManager = super::MemoryManager<u64>;
 
-/// Implementation of [StreamLife algorithm](https://conwaylife.com/wiki/StreamLife)
+/// Implementation of [StreamLife algorithm](https://conwaylife.com/wiki/StreamLife).
+/// 
+/// It is build on top of [HashLifeEngineSmall].
 pub struct StreamLifeEngineSmall {
     base: HashLifeEngineSmall<u64>,
     // streamlife-specific

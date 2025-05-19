@@ -11,7 +11,10 @@ use anyhow::{anyhow, Result};
 use num_bigint::BigInt;
 use std::{future::Future, hint::spin_loop, pin::Pin, sync::atomic::Ordering};
 
-/// Implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife)
+/// Parallel implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife).
+/// 
+/// Like [HashLifeEngineSync], it stores nodes in a single pre-allocated
+/// open-addressing hashtable with linear probing, and the hashtable never grows.
 pub struct HashLifeEngineAsync<Extra> {
     pub(super) size_log2: u32,
     pub(super) root: NodeIdx,

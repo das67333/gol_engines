@@ -1,6 +1,7 @@
 use super::{ExecutionStatistics, NodeIdx, QuadTreeNode};
 use std::{cell::UnsafeCell, hint::spin_loop, sync::atomic::Ordering};
 
+/// Stores the nodes of the quadtree.
 pub(super) struct MemoryManager<Extra> {
     base: UnsafeCell<MemoryManagerRaw<Extra>>,
 }

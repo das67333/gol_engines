@@ -719,11 +719,10 @@ impl Pattern {
                     .split(|&x| x == b' ')
                     .map(|part| {
                         std::str::from_utf8(part)
-                            .with_context(|| format!("Invalid UTF-8 sequence in {:?}", part))
+                            .with_context(|| format!("Invalid UTF-8 sequence in {part:?}"))
                             .and_then(|s| {
-                                s.parse::<u32>().with_context(|| {
-                                    format!("Failed to parse integer from '{}'", s)
-                                })
+                                s.parse::<u32>()
+                                    .with_context(|| format!("Failed to parse integer from '{s}'"))
                             })
                     })
                     .collect::<Result<_>>()?;
@@ -887,7 +886,7 @@ impl Pattern {
         }
 
         let mut codes = HashMap::new();
-        let mut result = format!("[M2] (gol_engines {})\n#R B3/S23\n", VERSION).into_bytes();
+        let mut result = format!("[M2] (gol_engines {VERSION})\n#R B3/S23\n").into_bytes();
         inner(
             self,
             self.root,

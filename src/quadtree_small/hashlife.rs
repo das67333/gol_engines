@@ -8,8 +8,8 @@ use num_bigint::BigInt;
 ///
 /// This implementation is similar to the one in [lifelib](https://gitlab.com/apgoucher/lifelib).
 /// It uses a hashtable with chaining collision handling technique and
-/// separate storage of nodes corresponding to squares of different sizes.
-/// It gradually increases the size of the hashtable as it grows.
+/// stores nodes corresponding to squares of different sizes separately.
+/// It increases the size of the hashtable as it grows.
 ///
 /// Every blank node has an index of 0, and a node is identified by a pair of index and size.
 pub struct HashLifeEngineSmall<Extra> {

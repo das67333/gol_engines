@@ -6,7 +6,9 @@ use num_bigint::BigInt;
 
 type MemoryManager = super::MemoryManager<u64>;
 
-/// Implementation of [StreamLife algorithm](https://conwaylife.com/wiki/StreamLife)
+/// Implementation of [StreamLife algorithm](https://conwaylife.com/wiki/StreamLife).
+/// 
+/// It is build on top of [HashLifeEngineSync].
 pub struct StreamLifeEngineSync {
     base: HashLifeEngineSync<u64>,
     // streamlife-specific
@@ -402,9 +404,9 @@ impl StreamLifeEngineSync {
 
 impl GoLEngine for StreamLifeEngineSync {
     fn new(mem_limit_mib: u32) -> Self {
-        // TODO: include bicache size in mem_limit_mib
+        // one half of memory is reserved for bicache
         Self {
-            base: HashLifeEngineSync::new(mem_limit_mib),
+            base: HashLifeEngineSync::new(mem_limit_mib / 2),
             biroot: None,
             bicache: HashMap::new(),
         }
