@@ -31,8 +31,8 @@ The structure `Pattern` is designed to be a fast and compact checkpoint for the 
 
 ## Usage
 
-0
+TODO
 
-## Example
+## Benchmark
 
-0
+TODO: tables, scalability
