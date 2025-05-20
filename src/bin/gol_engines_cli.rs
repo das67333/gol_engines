@@ -80,6 +80,10 @@ struct MetafyArgs {
     /// Path to the file where the resulting pattern will be saved
     #[arg(short, long)]
     output: String,
+
+    /// Count population of the resulting pattern
+    #[arg(short, long)]
+    population: bool,
 }
 
 #[derive(Args, Debug)]
@@ -190,13 +194,29 @@ fn main() {
             updated.to_file(&args.output).unwrap();
         }
         Action::Metafy(args) => {
+            let timer = std::time::Instant::now();
             let pattern = Pattern::from_file(&args.pattern).unwrap();
             let meta_0 = Pattern::from_file(&args.meta_0).unwrap();
             let meta_1 = Pattern::from_file(&args.meta_1).unwrap();
+            println!(
+                "Loaded patterns in {:.1} secs",
+                timer.elapsed().as_secs_f64()
+            );
+
+            let timer = std::time::Instant::now();
             let metafied = pattern.metafy([&meta_0, &meta_1], args.k).unwrap();
+            println!(
+                "Metafied pattern in {:.1} secs",
+                timer.elapsed().as_secs_f64()
+            );
+            if args.population {
+                let population = metafied.population();
+                println!("Population: {}", population.to_formatted_string(&fmt));
+            }
             metafied.to_file(&args.output).unwrap();
         }
         Action::Stats(args) => {
+            let timer = std::time::Instant::now();
             let mut pattern = Pattern::from_file(&args.pattern).unwrap();
             pattern.expand(3); // expand to at least leaf size
             let hash = pattern.hash();
@@ -208,6 +228,10 @@ fn main() {
                 .load_pattern(&pattern, gol_engines::Topology::Unbounded)
                 .unwrap();
             print!("{}", engine.sizes_distribution());
+            println!(
+                "Computed stats in {:.1} secs",
+                timer.elapsed().as_secs_f64()
+            );
         }
     }
 }

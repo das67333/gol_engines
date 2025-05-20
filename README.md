@@ -25,23 +25,148 @@ The structure `Pattern` is designed to be a fast and compact checkpoint for the 
 ## Features
 
 - Parallel HashLife and StreamLife!
+- Crossplatform
 - Right now only supports patterns with B3/S23 rule
 - Can read and write .rle, .mc and .mc.gz file formats
-- Can efficiently metafy patterns (build multi-level OTCA metapixel)
+- Can efficiently metafy patterns (for example, create multi-level OTCA metapixel)
 
-## Usage
+## Building
 
-TODO
+Assuming you have Rust installed (see https://rustup.rs/), you can compile the cli interface with
+```
+cargo build --release --bin gol_engines_cli --features=cli_deps
+```
 
 ## Examples
 
-### Update
+#### Update
 
+Update in one step:
+```
+$ target/release/gol_engines_cli update \
+    res/very_large_patterns/0e0p-metaglider.mc.gz \
+    --output=res/temp.mc.gz \
+    --mem-limit-gib=12 \
+    --workers=16 \
+    --gens-log2=12 \
+    --population
+Initialized engine in 5.4 secs
+Loaded pattern in 2.0 secs
+Updated pattern for 2^12 generations in 13.5 secs
+Population: 93_237_300
 ```
 
+Overfilled hashtable:
+```
+$ target/release/gol_engines_cli update \
+    res/very_large_patterns/0e0p-metaglider.mc.gz \
+    --output=res/temp.mc.gz \
+    --mem-limit-gib=6 \
+    --workers=16 \
+    --gens-log2=12 \
+    --population
+Initialized engine in 2.7 secs
+Loaded pattern in 1.4 secs
+Overfilled hashtables, reducing step_log2 from 12 to 10 (and running GC)
+Updated for 1024 out of 4096 generations
+Updated for 2048 out of 4096 generations
+Updated for 3072 out of 4096 generations
+Overfilled hashtables, running GC
+Updated pattern for 2^12 generations in 31.5 secs
+Population: 93_237_300
 ```
 
-### Help
+Providing step-log2 manually:
+```
+$ target/release/gol_engines_cli update \
+    res/very_large_patterns/0e0p-metaglider.mc.gz \
+    --output=res/temp.mc.gz \
+    --mem-limit-gib=6 \
+    --workers=16 \
+    --gens-log2=12 \
+    --step-log2=10 \
+    --population
+Initialized engine in 2.7 secs
+Loaded pattern in 1.3 secs
+Updated for 1024 out of 4096 generations
+Updated for 2048 out of 4096 generations
+Updated for 3072 out of 4096 generations
+Overfilled hashtables, running GC
+Updated pattern for 2^12 generations in 18.6 secs
+Population: 93_237_300
+```
+
+And with streamlife:
+```
+$ target/release/gol_engines_cli update \
+    res/very_large_patterns/0e0p-metaglider.mc.gz \
+    --output=res/temp.mc.gz \
+    --mem-limit-gib=13 \
+    --workers=6 \
+    --gens-log2=18 \
+    --engine=steamlife \
+    --population
+Initialized engine in 5.7 secs
+Loaded pattern in 2.0 secs
+Updated pattern for 2^18 generations in 60.2 secs
+Population: 93_235_655
+```
+
+#### Metafy
+
+Let's metafy glider:
+```
+$ target/release/gol_engines_cli metafy \
+    res/glider.rle res/otca_0.mc.gz res/otca_1.mc.gz \
+    --output=res/temp.mc.gz \
+    --population
+Loaded patterns in 0.0 secs
+Metafied pattern in 0.0 secs
+Population: 593_927
+```
+
+With bigger k:
+```
+$ target/release/gol_engines_cli metafy \
+    res/glider.rle res/otca_0.mc.gz res/otca_1.mc.gz \
+    --k=10 \
+    --output=res/temp.mc.gz \
+    --population
+Loaded patterns in 0.0 secs
+Metafied pattern in 0.0 secs
+Population: 155_233_185_229_932_687_224_687_411_801_884_328_181_836_255_094_962_897_687_012_037_389
+```
+
+k=0 does nothing:
+```
+$ target/release/gol_engines_cli metafy \
+    res/glider.rle res/otca_0.mc.gz res/otca_1.mc.gz \
+    --k=0 \
+    --output=res/temp.mc.gz \
+    --population
+Loaded patterns in 0.0 secs
+Metafied pattern in 0.0 secs
+Population: 5
+```
+
+#### Stats
+
+```
+$ target/release/gol_engines_cli stats \
+    res/very_large_patterns/0e0p-metaglider.mc.gz
+Hash: 0xc322148cce4e1279
+Population: 93_235_805
+Distribution of node sizes (side lengths of the squares):
+total -> 818008
+2^6   -> 36%
+2^7   -> 46%
+2^8   -> 12%
+2^9   ->  3%
+Computed stats in 1.4 secs
+```
+
+## Help
+
 ```
 $ target/release/gol_engines_cli help
 Tools for Conway's Game of Life
@@ -49,8 +174,9 @@ Tools for Conway's Game of Life
 Usage: gol_engines_cli <COMMAND>
 
 Commands:
-  update  Run the simulation
+  update  Run the simulation using parallel implementations of the update algorithms
   metafy  Replace every basic cell with a corresponding metacell (see https://conwaylife.com/wiki/Unit_cell) and repeat it k times
+  stats   Compute pattern's hash, population and nodes distribution
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -58,11 +184,12 @@ Options:
   -V, --version  Print version
 ```
 
+#### Update
 ```
 $ target/release/gol_engines_cli help update
 Run the simulation using parallel implementations of the update algorithms
 
-Usage: gol_engines_cli update [OPTIONS] --output <OUTPUT> --engine <ENGINE> --mem-limit-gib <MEM_LIMIT_GIB> --workers <WORKERS> --gens-log2 <GENS_LOG2> <PATTERN>
+Usage: gol_engines_cli update [OPTIONS] --output <OUTPUT> --mem-limit-gib <MEM_LIMIT_GIB> --workers <WORKERS> --gens-log2 <GENS_LOG2> <PATTERN>
 
 Arguments:
   <PATTERN>
@@ -74,10 +201,12 @@ Options:
 
   -e, --engine <ENGINE>
           The engine to use for the simulation, default is hashlife
+          
+          [default: hashlife]
 
           Possible values:
-          - hashlife:  See https://conwaylife.com/wiki/HashLife
-          - steamlife: See https://conwaylife.com/wiki/StreamLife
+          - hashlife:   See https://conwaylife.com/wiki/HashLife
+          - streamlife: See https://conwaylife.com/wiki/StreamLife
 
   -m, --mem-limit-gib <MEM_LIMIT_GIB>
           Maximum memory (in GiB) allocated to the hash tables; all other usage is typically negligible
@@ -98,10 +227,14 @@ Options:
           - unbounded: The pattern is unbounded in all directions
           - torus:     Opposite bounds of the field are stitched together
 
+  -p, --population
+          Count population of the resulting pattern
+
   -h, --help
           Print help (see a summary with '-h')
 ```
 
+#### Metafy
 ```
 $ target/release/gol_engines_cli help metafy
 Replace every basic cell with a corresponding metacell (see https://conwaylife.com/wiki/Unit_cell) and repeat it k times
@@ -116,9 +249,11 @@ Arguments:
 Options:
   -k, --k <K>            The number of times to apply the metacell replacement, default is 1 [default: 1]
   -o, --output <OUTPUT>  Path to the file where the resulting pattern will be saved
+  -p, --population       Count population of the resulting pattern
   -h, --help             Print help
 ```
 
+#### Stats
 ```
 $ target/release/gol_engines_cli help stats
 Compute pattern's hash, population and nodes distribution
@@ -135,3 +270,12 @@ Options:
 ## Benchmark
 
 TODO: tables, scalability
+
+## Tips
+
+As all the hashtables are power-of-two sized, there are certain memory-limit-gib that double the sizes of them. They are:
+
+- $12 \cdot 2^k$ for hashlife
+- $13 \cdot 2^k$ for streamlife
+
+I reached best performance with 16 workers for hashlife and 6 workers for streamlife on 96-core virtual machine for 0e0p-metaglider. The best value can depend on the pattern structure. You can try other values, but notice that it might be important to provide a whole physical (not logical) core for every worker.
