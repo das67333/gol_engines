@@ -93,7 +93,7 @@ enum Engine {
     /// See https://conwaylife.com/wiki/HashLife
     Hashlife,
     /// See https://conwaylife.com/wiki/StreamLife
-    Steamlife,
+    Streamlife,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -124,7 +124,7 @@ fn main() {
             let timer = std::time::Instant::now();
             let mut engine: Box<dyn GoLEngine> = match args.engine {
                 Engine::Hashlife => Box::new(HashLifeEngineAsync::new(mem_limit_mib)),
-                Engine::Steamlife => Box::new(StreamLifeEngineAsync::new(mem_limit_mib)),
+                Engine::Streamlife => Box::new(StreamLifeEngineAsync::new(mem_limit_mib)),
             };
             println!(
                 "Initialized engine in {:.1} secs",
@@ -140,11 +140,11 @@ fn main() {
             );
 
             let timer = std::time::Instant::now();
-            let mut step_log2 = args.step_log2.unwrap_or(args.gens_log2).max(args.gens_log2);
+            let mut step_log2 = args.step_log2.unwrap_or(args.gens_log2).min(args.gens_log2);
             let mut step = BigInt::from(1) << step_log2;
             let gens_total = BigInt::from(1) << args.gens_log2;
             let mut gens_left = gens_total.clone();
-            let mut clearing_gc_can_help = false;
+            let mut gc_can_help = false;
             loop {
                 match engine.update(step_log2) {
                     Ok(_) => {
@@ -157,13 +157,13 @@ fn main() {
                             &gens_total - &gens_left,
                             &gens_total
                         );
-                        clearing_gc_can_help = true;
+                        gc_can_help = true;
                     }
                     Err(_) => {
-                        if clearing_gc_can_help {
+                        if gc_can_help {
                             println!("Overfilled hashtables, running GC");
                             engine.run_gc();
-                            clearing_gc_can_help = false;
+                            gc_can_help = false;
                         } else {
                             let new_step_log2 = step_log2.checked_sub(2).unwrap();
                             println!(
