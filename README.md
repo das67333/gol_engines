@@ -33,6 +33,105 @@ The structure `Pattern` is designed to be a fast and compact checkpoint for the 
 
 TODO
 
+## Examples
+
+### Update
+
+```
+
+```
+
+### Help
+```
+$ target/release/gol_engines_cli help
+Tools for Conway's Game of Life
+
+Usage: gol_engines_cli <COMMAND>
+
+Commands:
+  update  Run the simulation
+  metafy  Replace every basic cell with a corresponding metacell (see https://conwaylife.com/wiki/Unit_cell) and repeat it k times
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+```
+$ target/release/gol_engines_cli help update
+Run the simulation using parallel implementations of the update algorithms
+
+Usage: gol_engines_cli update [OPTIONS] --output <OUTPUT> --engine <ENGINE> --mem-limit-gib <MEM_LIMIT_GIB> --workers <WORKERS> --gens-log2 <GENS_LOG2> <PATTERN>
+
+Arguments:
+  <PATTERN>
+          Path to the file containing the pattern; supports .rle, .mc and .mc.gz formats
+
+Options:
+  -o, --output <OUTPUT>
+          Path to the file where the resulting pattern will be saved
+
+  -e, --engine <ENGINE>
+          The engine to use for the simulation, default is hashlife
+
+          Possible values:
+          - hashlife:  See https://conwaylife.com/wiki/HashLife
+          - steamlife: See https://conwaylife.com/wiki/StreamLife
+
+  -m, --mem-limit-gib <MEM_LIMIT_GIB>
+          Maximum memory (in GiB) allocated to the hash tables; all other usage is typically negligible
+
+  -w, --workers <WORKERS>
+          The number of worker threads to use for the update
+
+  -g, --gens-log2 <GENS_LOG2>
+          The pattern will be updated by 2^gens_log2 generations
+
+  -s, --step-log2 <STEP_LOG2>
+          How many generations to update at once, uses `gens_log2` by default
+
+  -t, --topology <TOPOLOGY>
+          The topology of the pattern, default is unbounded
+
+          Possible values:
+          - unbounded: The pattern is unbounded in all directions
+          - torus:     Opposite bounds of the field are stitched together
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+```
+$ target/release/gol_engines_cli help metafy
+Replace every basic cell with a corresponding metacell (see https://conwaylife.com/wiki/Unit_cell) and repeat it k times
+
+Usage: gol_engines_cli metafy [OPTIONS] --output <OUTPUT> <PATTERN> <META_0> <META_1>
+
+Arguments:
+  <PATTERN>  Path to the file containing the pattern; supports .rle, .mc and .mc.gz formats
+  <META_0>   Path to the file containing the off state of the metacell
+  <META_1>   Path to the file containing the on state of the metacell
+
+Options:
+  -k, --k <K>            The number of times to apply the metacell replacement, default is 1 [default: 1]
+  -o, --output <OUTPUT>  Path to the file where the resulting pattern will be saved
+  -h, --help             Print help
+```
+
+```
+$ target/release/gol_engines_cli help stats
+Compute pattern's hash, population and nodes distribution
+
+Usage: gol_engines_cli stats <PATTERN>
+
+Arguments:
+  <PATTERN>  Path to the file containing the pattern; supports .rle, .mc and .mc.gz formats
+
+Options:
+  -h, --help  Print help
+```
+
 ## Benchmark
 
 TODO: tables, scalability

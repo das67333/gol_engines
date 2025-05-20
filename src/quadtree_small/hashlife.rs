@@ -454,6 +454,10 @@ impl<Extra: Clone + Default> HashLifeEngineSmall<Extra> {
         self.gc_mark(n.sw, size_log2 - 1);
         self.gc_mark(n.se, size_log2 - 1);
     }
+
+    pub fn sizes_distribution(&self) -> String {
+        self.mem.sizes_distribution()
+    }
 }
 
 impl<Extra: Clone + Default> GoLEngine for HashLifeEngineSmall<Extra> {

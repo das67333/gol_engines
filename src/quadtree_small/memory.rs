@@ -298,24 +298,18 @@ impl<Extra: Clone + Default> MemoryManager<Extra> {
         self.layers.iter().map(|m| m.bytes_total()).sum::<usize>()
     }
 
-    #[allow(dead_code)]
-    pub(super) fn stats_fast(&self) -> String {
+    pub(super) fn sizes_distribution(&self) -> String {
         let mut s = String::new();
 
-        s += &format!(
-            "Memory spent on kivtables: {} MB\n",
-            self.bytes_total() >> 20,
-        );
-
         let nodes_total = self.layers.iter().map(|m| m.len()).sum::<usize>();
-        s += "Nodes' sizes (side lengths) distribution:\n";
-        s += &format!("total - {nodes_total}\n");
+        s += "Distribution of node sizes (side lengths of the squares):\n";
+        s += &format!("total -> {nodes_total}\n");
         for (i, m) in self.layers.iter().enumerate() {
             let percent = m.len() * 100 / nodes_total;
             if percent == 0 {
                 continue;
             }
-            s += &format!("2^{:<2} -{:>3}%\n", LEAF_SIZE_LOG2 + i as u32, percent,);
+            s += &format!("2^{:<4}->{:>3}%\n", LEAF_SIZE_LOG2 + i as u32, percent);
         }
         s
     }

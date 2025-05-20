@@ -2,16 +2,16 @@
 name = "gol_engines"
 version = "0.1.0"
 edition = "2021"
-description = "Game of Life engines (simd, hashlife, streamlife)"
+description = "Tools for Conway's Game of Life"
 repository = "https://github.com/das67333/gol_engines"
 readme = "README.md"
-authors     = ["Suleiman Kazimov <solomon67334@gmail.com>"]
+authors = ["Suleiman Kazimov <solomon67334@gmail.com>"]
 license = "GPL-3.0"
 keywords = ["game-of-life", "simd", "hashlife", "streamlife"]
 categories = ["algorithms", "concurrency", "simulation"]
 
 [features]
-cli_deps = ["clap"]
+cli_deps = ["clap", "num-format"]
 
 [[bin]]
 name = "gol_engines_cli"
@@ -32,7 +32,10 @@ rand = "0.9"
 rand_chacha = "0.9"
 tokio = { version = "1.44", features = ["rt-multi-thread", "sync"] }
 
-clap = { version = "4.5", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+num-format = {version = "0.4", features = [
+    "with-num-bigint",
+], optional = true }
 
 [dev-dependencies]
 serial_test = "3.2"
