@@ -1,4 +1,4 @@
-#![warn(clippy::all, clippy::cargo)]
+#![warn(clippy::all)]
 
 mod pattern;
 mod quadtree_async;

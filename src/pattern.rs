@@ -7,7 +7,7 @@ use flate2::{
 };
 use num_bigint::BigInt;
 use rand::{Rng, SeedableRng};
-use std::io::Read;
+use std::{fs, io::Read, path::Path};
 
 /// Nodes typically have size of about 32 bytes, so 2^32 (128 GiB) nodes
 /// is generally enough.
@@ -351,7 +351,7 @@ impl Pattern {
     /// Returns an error if:
     /// - `metacells[0].size_log2` does not equal `metacells[1].size_log2`
     /// - metacells are smaller than 8x8
-    pub fn metafy(&self, metacells: &[Pattern; 2], level: u32) -> Result<Self> {
+    pub fn metafy(&self, metacells: [&Pattern; 2], level: u32) -> Result<Self> {
         if metacells[0].size_log2 != metacells[1].size_log2 {
             return Err(anyhow!(
                 "Metacells must have the same size_log2: {} != {}",
@@ -472,7 +472,7 @@ impl Pattern {
         for _ in 0..level - 1 {
             metacell_idx = [0, 1].map(|i| {
                 let result = build_pattern_from_metacells(
-                    &metacells[i],
+                    metacells[i],
                     metacell_idx,
                     metacells[i].root,
                     &mut kiv,
@@ -549,6 +549,94 @@ impl Pattern {
             PatternFormat::CompressedMacrocell => self.to_compressed_macrocell(),
             PatternFormat::RLE => self.to_rle(),
         }
+    }
+
+    /// Creates a pattern from a file.
+    ///
+    /// The format will be inferred from the file extension:
+    /// - `.mc` → `PatternFormat::Macrocell`
+    /// - `.mc.gz` → `PatternFormat::CompressedMacrocell`
+    /// - `.rle` → `PatternFormat::RLE`
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the file containing the pattern data.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing either the created `Pattern` or an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - File cannot be read
+    /// - File extension is not recognized
+    /// - Format-specific errors occur from `from_format`
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let data = fs::read(path).with_context(|| format!("Failed to read file: {:?}", path))?;
+
+        if path.extension() == Some("mc".as_ref()) {
+            return Self::from_format(PatternFormat::Macrocell, &data);
+        }
+
+        if path
+            .to_str()
+            .map(|s| s.ends_with(".mc.gz"))
+            .unwrap_or(false)
+        {
+            return Self::from_format(PatternFormat::CompressedMacrocell, &data);
+        }
+
+        if path.extension() == Some("rle".as_ref()) {
+            return Self::from_format(PatternFormat::RLE, &data);
+        }
+
+        Err(anyhow!("Cannot infer format from file path: {:?}", path))
+    }
+
+    /// Saves the pattern to a file.
+    ///
+    /// The format will be inferred from the file extension:
+    /// - `.rle` → `PatternFormat::RLE`
+    /// - `.mc` → `PatternFormat::Macrocell`
+    /// - `.mc.gz` → `PatternFormat::CompressedMacrocell`
+    ///
+    /// The file will be created or overwritten.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path where the pattern will be saved.
+    ///
+    /// # Returns
+    ///
+    /// A `Result<()>` indicating success or containing an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - File cannot be written
+    /// - File extension is not recognized
+    /// - Format-specific errors from `to_format`
+    pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let path = path.as_ref();
+
+        let format = if path.extension() == Some("mc".as_ref()) {
+            PatternFormat::Macrocell
+        } else if path
+            .to_str()
+            .map(|s| s.ends_with(".mc.gz"))
+            .unwrap_or(false)
+        {
+            PatternFormat::CompressedMacrocell
+        } else if path.extension() == Some("rle".as_ref()) {
+            PatternFormat::RLE
+        } else {
+            return Err(anyhow!("Cannot infer format from file path: {:?}", path));
+        };
+
+        let data = self.to_format(format)?;
+        fs::write(path, data).with_context(|| format!("Failed to write file: {:?}", path))
     }
 
     /// Creates a pattern from packed cell data. See [`PatternFormat::PackedCells`].
@@ -1553,7 +1641,7 @@ mod tests {
                 .unwrap();
 
         // Metafy with level 1
-        let metafied = glider.metafy(&[off_metacell, on_metacell], 1).unwrap();
+        let metafied = glider.metafy([&off_metacell, &on_metacell], 1).unwrap();
 
         // The metafied pattern should have 5 gliders (one for each ON cell in the original glider)
         assert_eq!(metafied.size_log2, 5);
@@ -1575,7 +1663,7 @@ mod tests {
         let size_log2 = |level: u32| 1 + level * 3;
         while size_log2(level) < HUGE_SIZE_LOG2_LIMIT {
             let metafied = pattern
-                .metafy(&[off_metacell.clone(), on_metacell.clone()], level)
+                .metafy([&off_metacell, &on_metacell], level)
                 .unwrap();
 
             assert_eq!(metafied.size_log2, size_log2(level));
@@ -1598,13 +1686,14 @@ mod tests {
             let pattern = Pattern::random(pattern_size_log2, Some(SEED)).unwrap();
             for metacell_size_log2 in 3..6 {
                 let metacell_total_count = BigInt::from(1) << metacell_size_log2 * 2;
-                let metacells =
-                    [1, 2].map(|x| Pattern::random(metacell_size_log2, Some(SEED + x)).unwrap());
+                let off_metacell = Pattern::random(metacell_size_log2, Some(SEED + 1)).unwrap();
+                let on_metacell = Pattern::random(metacell_size_log2, Some(SEED + 2)).unwrap();
+                let metacells = [&off_metacell, &on_metacell];
 
                 let mut populations = [BigInt::from(0), BigInt::from(1)];
                 let mut total_count = BigInt::from(1);
                 for level in 0..10 {
-                    let metafied = pattern.metafy(&metacells, level).unwrap();
+                    let metafied = pattern.metafy(metacells, level).unwrap();
 
                     assert_eq!(
                         metafied.size_log2,

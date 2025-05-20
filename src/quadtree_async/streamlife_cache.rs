@@ -28,6 +28,7 @@ impl StreamLifeCache {
         }
     }
 
+    #[allow(clippy::mut_from_ref)]
     pub(super) fn entry(&self, key: (NodeIdx, NodeIdx)) -> &mut CacheEntry {
         unsafe { (*self.base.get()).find_or_create_entry(key) }
     }

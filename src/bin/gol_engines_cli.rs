@@ -1,1 +1,142 @@
-fn main() {}
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use gol_engines::{GoLEngine, HashLifeEngineAsync, Pattern, StreamLifeEngineAsync};
+use num_bigint::BigInt;
+use std::any;
+
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct CLIParser {
+    #[command(subcommand)]
+    action: Action,
+}
+
+#[derive(Subcommand, Debug)]
+enum Action {
+    /// Run the simulation
+    Update(UpdateArgs),
+    /// Replace every basic cell with a corresponding metacell (see https://conwaylife.com/wiki/Unit_cell) and repeat it k times
+    Metafy(MetafyArgs),
+}
+
+#[derive(Args, Debug)]
+struct UpdateArgs {
+    /// Path to the file containing the pattern; supports .rle, .mc and .mc.gz formats
+    pattern: String,
+
+    /// Path to the file where the resulting pattern will be saved
+    #[arg(short, long)]
+    output: String,
+
+    /// The engine to use for the simulation, default is hashlife
+    #[arg(short, long, value_enum)]
+    engine: Engine,
+
+    /// Maximum memory (in GiB) allocated to the hash tables;
+    /// all other usage is typically negligible
+    #[arg(short, long)]
+    mem_limit_gib: u32,
+
+    /// The number of worker threads to use for the update
+    #[arg(short, long)]
+    workers: u32,
+
+    /// The pattern will be updated by 2^gens_log2 generations
+    #[arg(short, long)]
+    gens_log2: u32,
+
+    /// How many generations to update at once, uses `gens_log2` by default
+    #[arg(short, long)]
+    step_log2: Option<u32>,
+
+    /// The topology of the pattern, default is unbounded
+    #[arg(short, long, value_enum)]
+    topology: Option<Topology>,
+}
+
+#[derive(Args, Debug)]
+struct MetafyArgs {
+    /// Path to the file containing the pattern; supports .rle, .mc and .mc.gz formats
+    pattern: String,
+
+    /// Path to the file containing the off state of the metacell
+    meta_0: String,
+
+    /// Path to the file containing the on state of the metacell
+    meta_1: String,
+
+    /// The number of times to apply the metacell replacement
+    #[arg(short, long)]
+    k: u32,
+
+    /// Path to the file where the resulting pattern will be saved
+    #[arg(short, long)]
+    output: String,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Engine {
+    /// See https://conwaylife.com/wiki/HashLife
+    Hashlife,
+    /// See https://conwaylife.com/wiki/StreamLife
+    Steamlife,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Topology {
+    /// The pattern is unbounded in all directions
+    Unbounded,
+    /// Opposite bounds of the field are stitched together
+    Torus,
+}
+
+fn main() {
+    let args = CLIParser::parse();
+
+    match args.action {
+        Action::Update(args) => {
+            MAX_WORKER_THREADS.store(args.workers, std::sync::atomic::Ordering::Relaxed);
+            let mem_limit_mib = args.mem_limit_gib.saturating_mul(1024);
+            let topology = match args.topology {
+                None | Some(Topology::Unbounded) => gol_engines::Topology::Unbounded,
+                Some(Topology::Torus) => gol_engines::Topology::Torus,
+            };
+
+            let timer = std::time::Instant::now();
+            let mut engine: Box<dyn GoLEngine> = match args.engine {
+                Engine::Hashlife => Box::new(HashLifeEngineAsync::new(mem_limit_mib)),
+                Engine::Steamlife => Box::new(StreamLifeEngineAsync::new(mem_limit_mib)),
+            };
+            println!(
+                "Initialized engine in {:.1f} secs",
+                timer.elapsed().as_secs_f64()
+            );
+
+            let timer = std::time::Instant::now();
+            let pattern = Pattern::from_file(&args.pattern).unwrap();
+            engine.load_pattern(&pattern, topology).unwrap();
+            println!(
+                "Loaded pattern in {:.1f} secs",
+                timer.elapsed().as_secs_f64()
+            );
+
+            let step_log2 = args.step_log2.unwrap_or(args.gens_log2).max(args.gens_log2);
+            let timer = std::time::Instant::now();
+            engine.update(args.gens_log2).unwrap();
+            println!(
+                "Updated pattern for 2^{} generations in {:.1f} secs",
+                args.gens_log2,
+                timer.elapsed().as_secs_f64()
+            );
+
+            let updated = engine.current_state();
+            updated.to_file(&args.output).unwrap();
+        }
+        Action::Metafy(args) => {
+            let pattern = Pattern::from_file(&args.pattern).unwrap();
+            let meta_0 = Pattern::from_file(&args.meta_0).unwrap();
+            let meta_1 = Pattern::from_file(&args.meta_1).unwrap();
+            let metafied = pattern.metafy([&meta_0, &meta_1], args.k).unwrap();
+            metafied.to_file(&args.output).unwrap();
+        }
+    }
+}

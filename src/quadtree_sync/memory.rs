@@ -74,6 +74,7 @@ impl<Extra: Clone + Default> MemoryManager<Extra> {
     }
 
     /// Get a mutable reference to the node at the given index.
+    #[allow(clippy::mut_from_ref)]
     pub(super) fn get_mut(&self, idx: NodeIdx) -> &mut QuadTreeNode<Extra> {
         unsafe { (*self.base.get()).get_mut(idx) }
     }
