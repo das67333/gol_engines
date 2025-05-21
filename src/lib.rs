@@ -17,7 +17,7 @@ pub use quadtree_small::{HashLifeEngineSmall, StreamLifeEngineSmall};
 pub use quadtree_sync::{HashLifeEngineSync, StreamLifeEngineSync};
 pub use simd::SIMDEngine;
 
-pub type DefaultEngine = SIMDEngine;
+pub type DefaultEngine = HashLifeEngineAsync;
 
 pub const VERSION: &str = "1.0";
 
