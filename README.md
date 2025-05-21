@@ -117,7 +117,7 @@ $ target/release/gol_engines_cli update \
     --mem-limit-gib=13 \
     --workers=6 \
     --gens-log2=18 \
-    --engine=steamlife \
+    --engine=streamlife \
     --population
 Initialized engine in 5.7 secs
 Loaded pattern in 2.0 secs

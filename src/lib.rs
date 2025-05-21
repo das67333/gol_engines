@@ -8,6 +8,7 @@ mod simd;
 mod topology;
 mod traits;
 
+pub use num_bigint::BigInt;
 pub use pattern::{Pattern, PatternFormat, PatternNode};
 pub use topology::Topology;
 pub use traits::GoLEngine;
@@ -17,9 +18,9 @@ pub use quadtree_small::{HashLifeEngineSmall, StreamLifeEngineSmall};
 pub use quadtree_sync::{HashLifeEngineSync, StreamLifeEngineSync};
 pub use simd::SIMDEngine;
 
-pub type DefaultEngine = SIMDEngine;
+pub type DefaultEngine = HashLifeEngineAsync;
 
-pub const VERSION: &str = "1.0";
+pub const VERSION: &str = "0.1.1";
 
 use std::sync::atomic::{AtomicU32, AtomicU64};
 pub static WORKER_THREADS: AtomicU32 = AtomicU32::new(0);
