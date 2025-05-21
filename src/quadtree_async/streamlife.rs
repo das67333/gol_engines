@@ -418,7 +418,7 @@ impl StreamLifeEngineAsync {
                 if ExecutionStatistics::is_poisoned() {
                     return (NodeIdx::default(), NodeIdx::default());
                 }
-                tokio::task::yield_now().await; // TODO
+                tokio::task::yield_now().await;
             }
             return entry.value;
         }
