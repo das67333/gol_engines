@@ -2,6 +2,17 @@
 
 Moved from https://github.com/das67333/conway/
 
+[![Crates.io][crates-badge]][crates-url]
+[![MIT licensed][gpl3-badge]][gpl3-url]
+[![Build Status][actions-badge]][actions-url]
+
+[crates-badge]: https://img.shields.io/crates/v/gol_engines.svg
+[crates-url]: https://crates.io/crates/gol_engines
+[gpl3-badge]: https://img.shields.io/badge/license-GPLv3-blue.svg
+[gpl3-url]: https://www.gnu.org/licenses/gpl-3.0.en.html
+[actions-badge]: https://github.com/das67333/gol_engines/actions/workflows/rust.yml/badge.svg
+[actions-url]: https://github.com/das67333/gol_engines/actions?branch%3Amain
+
 ## Overview
 
 The repository includes several cross-platform update algorithm implementations for Conway's Game of Life (focusing on [HashLife](https://conwaylife.com/wiki/HashLife) and [StreamLife](https://conwaylife.com/wiki/StreamLife)):
