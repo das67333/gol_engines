@@ -157,7 +157,7 @@ fn main() {
                             break;
                         }
                         println!(
-                            "Updated for {} out of {} generations",
+                            "Updated by {} out of {} generations",
                             &gens_total - &gens_left,
                             &gens_total
                         );
@@ -181,7 +181,7 @@ fn main() {
                 }
             }
             println!(
-                "Updated pattern for 2^{} generations in {:.1} secs",
+                "Updated pattern by 2^{} generations in {:.1} secs",
                 args.gens_log2,
                 timer.elapsed().as_secs_f64()
             );

@@ -496,7 +496,7 @@ mod tests {
     fn test_pattern_roundtrip() {
         for size_log2 in 3..10 {
             let original = Pattern::random(size_log2, Some(SEED)).unwrap();
-            let mut engine = StreamLifeEngineSync::new(1);
+            let mut engine = StreamLifeEngineSync::new(2);
             engine.load_pattern(&original, Topology::Unbounded).unwrap();
             let converted = engine.current_state();
 

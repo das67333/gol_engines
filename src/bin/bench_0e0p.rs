@@ -21,7 +21,7 @@ fn main() {
         let gens_log2 = 27;
         engine.update(gens_log2).unwrap();
         println!(
-            "Time on updating pattern for 2^{} generations: {:?}",
+            "Time on updating pattern by 2^{} generations: {:?}",
             gens_log2,
             timer.elapsed()
         );
