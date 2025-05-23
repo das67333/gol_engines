@@ -282,7 +282,9 @@ Options:
 
 ## Benchmark
 
-These are performances of different implementations of GoL algorithms in updating 0e0p-metaglider. It was done on Yandex.Cloud virtual machine with 32 logical cores and 96 GiB of RAM. Every engine had at least 64 GiB, which is enough to store all emerging nodes.
+These are performances of different implementations of GoL algorithms in updating 0e0p-metaglider. It was done on Yandex.Cloud virtual machine with 32 logical cores and 96 GiB of RAM. Every engine had at least 64 GiB, which is enough to store all emerging nodes. It used Golly 4.3, lifelib was compiled on clang-19 with flags `-O3 -march=native`, gol_engines 0.1.0 was compiled with cargo on Rust 1.86 in release mode.
+
+These are the performance results of different implementations of GoL algorithms when updating the 0e0p-metaglider. The benchmarks were conducted on a Yandex.Cloud virtual machine with 32 logical cores and 96 GiB of RAM. Each engine was able to allocate at least 64 GiB of memory, which is sufficient to store all emerging nodes. Golly version 4.3 was used. Lifelib was compiled with clang-19 using the `-O3 -march=native` flags. Gol_engines version 0.1.0 was compiled with cargo (Rust 1.86) in release mode.
 
 This is updating 0e0p-mataglider by $2^{14}$ generations with HashLife:
 
