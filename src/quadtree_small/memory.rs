@@ -174,10 +174,6 @@ impl<Extra: Clone + Default> KIVMap<Extra> {
         self.storage.bytes_total() + self.hashtable.capacity() * std::mem::size_of::<NodeIdx>()
     }
 
-    fn len(&self) -> usize {
-        self.storage.len()
-    }
-
     fn capacity(&self) -> usize {
         self.storage.capacity()
     }
@@ -296,21 +292,5 @@ impl<Extra: Clone + Default> MemoryManager<Extra> {
 
     pub(super) fn bytes_total(&self) -> usize {
         self.layers.iter().map(|m| m.bytes_total()).sum::<usize>()
-    }
-
-    pub(super) fn sizes_distribution(&self) -> String {
-        let mut s = String::new();
-
-        let nodes_total = self.layers.iter().map(|m| m.len()).sum::<usize>();
-        s += "Distribution of node sizes (side lengths of the squares):\n";
-        s += &format!("total -> {nodes_total}\n");
-        for (i, m) in self.layers.iter().enumerate() {
-            let percent = m.len() * 100 / nodes_total;
-            if percent == 0 {
-                continue;
-            }
-            s += &format!("2^{:<4}->{:>3}%\n", LEAF_SIZE_LOG2 + i as u32, percent);
-        }
-        s
     }
 }
