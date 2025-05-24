@@ -3,15 +3,31 @@
 Moved from https://github.com/das67333/conway/
 
 [![Crates.io][crates-badge]][crates-url]
-[![MIT licensed][gpl3-badge]][gpl3-url]
+[![License: GPL v3][gpl3-badge]][gpl3-url]
 [![Build Status][actions-badge]][actions-url]
 
 [crates-badge]: https://img.shields.io/crates/v/gol_engines.svg
 [crates-url]: https://crates.io/crates/gol_engines
 [gpl3-badge]: https://img.shields.io/badge/license-GPLv3-blue.svg
-[gpl3-url]: https://www.gnu.org/licenses/gpl-3.0.en.html
+[gpl3-url]: https://www.gnu.org/licenses/gpl-3.0
 [actions-badge]: https://github.com/das67333/gol_engines/actions/workflows/rust.yml/badge.svg
 [actions-url]: https://github.com/das67333/gol_engines/actions?branch%3Amain
+
+## Table of Contents
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Features](#features)
+- [Building](#building)
+- [Examples](#examples)
+  - [Update](#update)
+  - [Metafy](#metafy)
+  - [Stats](#stats)
+- [Help](#help)
+  - [Update Command](#update)
+  - [Metafy Command](#metafy)
+  - [Stats Command](#stats)
+- [Benchmark](#benchmark)
+- [Tips](#tips)
 
 ## Overview
 
@@ -45,7 +61,14 @@ The `Pattern` structure is designed to be a fast and compact checkpoint for the 
 
 ## Building
 
-Assuming you have Rust installed (see https://rustup.rs/), you can compile the cli interface with
+If you don't have Rust installed, these commands should be sufficient:
+```
+sudo apt install -y build-essential
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+```
+
+CLI interface can be compiled with
 ```
 cargo build --release --bin gol_engines_cli --features=cli_deps
 ```
@@ -63,9 +86,9 @@ $ target/release/gol_engines_cli update \
     --workers=16 \
     --gens-log2=12 \
     --population
-Initialized engine in 5.4 secs
-Loaded pattern in 2.0 secs
-Updated pattern by 2^12 generations in 13.5 secs
+Initialized engine in 5.3 secs
+Loaded pattern in 1.8 secs
+Updated pattern by 2^12 generations in 13.6 secs
 Population: 93_237_300
 ```
 
@@ -78,14 +101,14 @@ $ target/release/gol_engines_cli update \
     --workers=16 \
     --gens-log2=12 \
     --population
-Initialized engine in 2.7 secs
-Loaded pattern in 1.4 secs
+Initialized engine in 2.6 secs
+Loaded pattern in 1.3 secs
 Overfilled hashtables, reducing step_log2 from 12 to 10 (and running GC)
 Updated by 1024 out of 4096 generations
 Updated by 2048 out of 4096 generations
 Updated by 3072 out of 4096 generations
 Overfilled hashtables, running GC
-Updated pattern by 2^12 generations in 31.5 secs
+Updated pattern by 2^12 generations in 32.9 secs
 Population: 93_237_300
 ```
 
@@ -99,13 +122,13 @@ $ target/release/gol_engines_cli update \
     --gens-log2=12 \
     --step-log2=10 \
     --population
-Initialized engine in 2.7 secs
+Initialized engine in 2.6 secs
 Loaded pattern in 1.3 secs
 Updated by 1024 out of 4096 generations
 Updated by 2048 out of 4096 generations
 Updated by 3072 out of 4096 generations
 Overfilled hashtables, running GC
-Updated pattern by 2^12 generations in 18.6 secs
+Updated pattern by 2^12 generations in 20.8 secs
 Population: 93_237_300
 ```
 
@@ -119,9 +142,9 @@ $ target/release/gol_engines_cli update \
     --gens-log2=18 \
     --engine=streamlife \
     --population
-Initialized engine in 5.7 secs
+Initialized engine in 6.1 secs
 Loaded pattern in 2.0 secs
-Updated pattern by 2^18 generations in 60.2 secs
+Updated pattern by 2^18 generations in 58.5 secs
 Population: 93_235_655
 ```
 
@@ -150,7 +173,7 @@ Metafied pattern in 0.0 secs
 Population: 155_233_185_229_932_687_224_687_411_801_884_328_181_836_255_094_962_897_687_012_037_389
 ```
 
-k=0 does nothing:
+k=0 doesn't modify the pattern:
 ```
 $ target/release/gol_engines_cli metafy \
     res/glider.rle res/otca_0.mc.gz res/otca_1.mc.gz \
@@ -170,12 +193,12 @@ $ target/release/gol_engines_cli stats \
 Hash: 0xc322148cce4e1279
 Population: 93_235_805
 Distribution of node sizes (side lengths of the squares):
-total -> 818008
+total -> 818007
 2^6   -> 36%
 2^7   -> 46%
 2^8   -> 12%
 2^9   ->  3%
-Computed stats in 1.4 secs
+Computed stats in 1.0 secs
 ```
 
 ## Help
@@ -281,8 +304,6 @@ Options:
 ```
 
 ## Benchmark
-
-These are performances of different implementations of GoL algorithms in updating 0e0p-metaglider. It was done on Yandex.Cloud virtual machine with 32 logical cores and 96 GiB of RAM. Every engine had at least 64 GiB, which is enough to store all emerging nodes. It used Golly 4.3, lifelib was compiled on clang-19 with flags `-O3 -march=native`, gol_engines 0.1.0 was compiled with cargo on Rust 1.86 in release mode.
 
 These are the performance results of different implementations of GoL algorithms when updating the 0e0p-metaglider. The benchmarks were conducted on a Yandex.Cloud virtual machine with 32 logical cores and 96 GiB of RAM. Each engine was able to allocate at least 64 GiB of memory, which is sufficient to store all emerging nodes. Golly version 4.3 was used. Lifelib was compiled with clang-19 using the `-O3 -march=native` flags. Gol_engines version 0.1.0 was compiled with cargo (Rust 1.86) in release mode.
 

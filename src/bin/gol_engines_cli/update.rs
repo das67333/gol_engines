@@ -1,6 +1,9 @@
 use crate::util::print_population;
 use clap::{Args, ValueEnum};
-use gol_engines::{GoLEngine, HashLifeEngineAsync, Pattern, StreamLifeEngineAsync, WORKER_THREADS};
+use gol_engines::{
+    GoLEngine, HashLifeEngineAsync, HashLifeEngineSync, Pattern, StreamLifeEngineAsync,
+    StreamLifeEngineSync, WORKER_THREADS,
+};
 use num_bigint::BigInt;
 
 #[derive(Args, Debug)]
@@ -21,8 +24,9 @@ pub(super) struct UpdateArgs {
     #[arg(short, long)]
     mem_limit_gib: u32,
 
-    /// The number of worker threads to use for the update
-    #[arg(short, long)]
+    /// The number of worker threads to use for the update, default is 1;
+    /// ignored for single-threaded engines
+    #[arg(short, long, default_value_t = 1)]
     workers: u32,
 
     /// The pattern will be updated by 2^gens_log2 generations
@@ -44,10 +48,14 @@ pub(super) struct UpdateArgs {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Engine {
-    /// See https://conwaylife.com/wiki/HashLife
+    /// Parallel implementation of HashLife
     Hashlife,
-    /// See https://conwaylife.com/wiki/StreamLife
+    /// Single-threaded implementation of HashLife
+    HashlifeSt,
+    /// Parallel implementation of StreamLife
     Streamlife,
+    /// Single-threaded implementation of StreamLife
+    StreamlifeSt,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -59,6 +67,17 @@ enum Topology {
 }
 
 pub(super) fn run_update(args: UpdateArgs) {
+    let mut step_log2 = args.step_log2.unwrap_or(args.gens_log2);
+    assert!(
+        step_log2 <= args.gens_log2,
+        "step_log2 cannot exceed gens_log2"
+    );
+    assert!(args.workers > 0, "Number of workers must be greater than 0");
+    assert!(
+        args.mem_limit_gib > 0,
+        "Memory limit must be greater than 0"
+    );
+
     WORKER_THREADS.store(args.workers, std::sync::atomic::Ordering::Relaxed);
     let mem_limit_mib = args.mem_limit_gib.saturating_mul(1024);
     let topology = match args.topology {
@@ -69,7 +88,9 @@ pub(super) fn run_update(args: UpdateArgs) {
     let timer = std::time::Instant::now();
     let mut engine: Box<dyn GoLEngine> = match args.engine {
         Engine::Hashlife => Box::new(HashLifeEngineAsync::new(mem_limit_mib)),
+        Engine::HashlifeSt => Box::new(HashLifeEngineSync::new(mem_limit_mib)),
         Engine::Streamlife => Box::new(StreamLifeEngineAsync::new(mem_limit_mib)),
+        Engine::StreamlifeSt => Box::new(StreamLifeEngineSync::new(mem_limit_mib)),
     };
     println!(
         "Initialized engine in {:.1} secs",
@@ -85,7 +106,6 @@ pub(super) fn run_update(args: UpdateArgs) {
     );
 
     let timer = std::time::Instant::now();
-    let mut step_log2 = args.step_log2.unwrap_or(args.gens_log2).min(args.gens_log2);
     let mut step = BigInt::from(1) << step_log2;
     let gens_total = BigInt::from(1) << args.gens_log2;
     let mut gens_left = gens_total.clone();

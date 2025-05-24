@@ -17,7 +17,7 @@ struct CLIParser {
 
 #[derive(Subcommand, Debug)]
 enum Action {
-    /// Run the simulation using parallel implementations of the update algorithms
+    /// Run the simulation using high-performance implementations of the update algorithms
     Update(UpdateArgs),
     /// Replace every basic cell with a corresponding metacell (see https://conwaylife.com/wiki/Unit_cell) and repeat it k times
     Metafy(MetafyArgs),
