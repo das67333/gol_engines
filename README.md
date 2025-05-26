@@ -37,11 +37,9 @@ The repository includes several cross-platform update algorithm implementations 
 - HashLifeEngineSmall is similar to the one in [lifelib](https://gitlab.com/apgoucher/lifelib) --- it uses a hashtable with a chaining collision handling technique and stores nodes corresponding to squares of different sizes separately. Nodes of different sizes are indexed independently, zero index corresponds to the blank node. Leaf size is $8\times8$, hash function is [Golly](https://golly.sourceforge.io/)-based `let h = nw * 5 + ne * 17 + sw * 257 + se * 65537; h += h >> 11`.
 - StreamLifeEngineSmall is based on HashLifeEngineSmall; it caches results of updates in a single standard hashtable (which is open-addressing) with a fast hash function from [ahash](https://crates.io/crates/ahash/).
 - HashLifeEngineSync uses a single pre-allocated open-addressing hashtable with linear probing. Unlike HashLifeEngineSmall, the hashtable never grows. If the hashtable reaches load factor 0.75 during the update, the algorithm temporarily "poisons" the hashtable to quickly terminate the update, clears the hashtable and loads the configuration of cells it stored before the update.
-- StreamLifeEngineSync is like StreamLifeEngineSmall, but it is based on HashLifeEngineSync.
+- StreamLifeEngineSync also uses a preallocated open-addresssing hashtable that never grows. If it overfills, the algorithm also "poisons" the hashtables and terminates the update.
 - HashLifeEngineAsync is the HashLifeEngineSync that was modified to thread-safely execute in parallel. It uses asynchronous runtime [tokio](https://tokio.rs/). New asynchronous tasks (lightweight threads) for recursive calls are spawned only when processing a square not smaller than a given threshold (`MIN_TASK_SPAWN_SIZE_LOG2`) and total number of running asynchronous tasks is smaller than `MAX_TASKS_COUNT`.
-- StreamLifeEngineAsync uses a preallocated open-addresssing hashtable that never grows (another one is in the internal HashLifeEngineAsync). If it overfills, the algorithm also "poisons" the hashtables and terminates the update. Recursive calls to the update function can spawn new asynchronous tasks, like in HashLifeEngineAsync.
-
-CLI interface uses parallel implementations (HashLifeEngineAsync and StreamLifeEngineAsync).
+- StreamLifeEngineAsync is like StreamLifeEngineSync, but it is based on HashLifeEngineAsync. Recursive calls to the update function can spawn new asynchronous tasks, like in HashLifeEngineAsync.
 
 Two topologies of the field are supported: Unbounded and Torus  (the latter on a $2^n\times2^n$ square grid).
 
@@ -58,10 +56,11 @@ The `Pattern` structure is designed to be a fast and compact checkpoint for the 
 - Right now only supports patterns with B3/S23 rule
 - Can read and write .rle, .mc and .mc.gz file formats
 - Can efficiently metafy patterns (for example, create multi-level OTCA metapixel)
+- Automatically handles overfilled hashtables, follows user memory limitations
 
 ## Building
 
-If you don't have Rust installed, these commands should be sufficient:
+If you don't have Rust installed, these commands should be sufficient (on modern Ubuntu):
 ```
 sudo apt install -y build-essential
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -187,6 +186,7 @@ Population: 5
 
 #### Stats
 
+For 0e0p-metaglider:
 ```
 $ target/release/gol_engines_cli stats \
     res/very_large_patterns/0e0p-metaglider.mc.gz
@@ -199,6 +199,27 @@ total -> 818007
 2^8   -> 12%
 2^9   ->  3%
 Computed stats in 1.0 secs
+```
+
+Pi calculator is much smaller:
+```
+$ target/release/gol_engines_cli stats \
+    res/very_large_patterns/pi.mc.gz             
+Hash: 0xd9c1db4109c7b2ab
+Population: 1_189_325
+Distribution of node sizes (side lengths of the squares):
+total -> 19699
+2^3   -> 15%
+2^4   -> 34%
+2^5   -> 24%
+2^6   ->  9%
+2^7   ->  5%
+2^8   ->  2%
+2^9   ->  2%
+2^10  ->  2%
+2^11  ->  1%
+2^12  ->  1%
+Computed stats in 0.1 secs
 ```
 
 ## Help
@@ -305,33 +326,33 @@ Options:
 
 ## Benchmark
 
-These are the performance results of different implementations of GoL algorithms when updating the 0e0p-metaglider. The benchmarks were conducted on a Yandex.Cloud virtual machine with 32 logical cores and 96 GiB of RAM. Each engine was able to allocate at least 64 GiB of memory, which is sufficient to store all emerging nodes. Golly version 4.3 was used. Lifelib was compiled with clang-19 using the `-O3 -march=native` flags. Gol_engines version 0.1.0 was compiled with cargo (Rust 1.86) in release mode.
+These are the performance results of different implementations of GoL algorithms when updating the 0e0p-metaglider. The benchmarks were conducted on a Yandex.Cloud virtual machine with 32 logical cores and 96 GiB of RAM. Each engine was able to allocate at least 64 GiB of memory, which is sufficient to store all emerging nodes. Golly version 4.3 was used. Lifelib was compiled with clang-19 using the `-O3 -march=native` flags. Gol_engines version 0.2.0 was compiled with cargo (Rust 1.87) in release mode. HashLifeEngineAsync used 24 workers, StreamLifeEngineAsync used 6 workers.
 
 This is updating 0e0p-mataglider by $2^{14}$ generations with HashLife:
 
 | Implementation      | Initialization time | Update time |
 | :------------------ | ------------------: | ----------: |
-| Golly               | -                   | 1026.5      |
-| lifelib             | -                   | 1007.7      |
-| HashLifeEngineSmall | -                   | 711.4       |
-| HashLifeEngineSync  | 24.6                | 633.2       |
-| HashLifeEngineAsync | 25.7                | 52.5        |
+| lifelib             | -                   | 912.1       |
+| Golly               | -                   | 848.5       |
+| HashLifeEngineSmall | -                   | 642.1       |
+| HashLifeEngineSync  | 23.8                | 431.5       |
+| HashLifeEngineAsync | 25.4                | 41.7        |
 
 And this is updating 0e0p-mataglider by $2^{27}$ generations with StreamLife:
 
-| Implementation      | Initialization time | Update time |
-| :------------------ | ------------------: | ----------: |
-| lifelib             | -                   | 1142.6      |
-| HashLifeEngineSmall | -                   | 908.9       |
-| HashLifeEngineSync  | 17.0                | 828.8       |
-| HashLifeEngineAsync | 27.0                | 295.3       |
+| Implementation        | Initialization time | Update time |
+| :-------------------- | ------------------: | ----------: |
+| lifelib               | -                   | 991.1       |
+| StreamLifeEngineSmall | -                   | 742.5       |
+| StreamLifeEngineSync  | 26.3                | 533.4       |
+| StreamLifeEngineAsync | 26.9                | 186.9       |
 
 ## Tips
 
 As all the hashtables are power-of-two sized, there are certain memory-limit-gib that double the sizes of them. They are:
 
 - $12 \cdot 2^k$ for hashlife (because hashlife node is 24 bytes in size)
-- $13 \cdot 2^k$ for streamlife (because node of internal hashlife is 32 bytes, streamlife node is 20 bytes and these hashtables are initialized with equal length)
+- $13 \cdot 2^k$ for streamlife (because node of internal hashlife is 32 bytes, streamlife node is 20 bytes and these hashtables are initialized with equal capacity)
 
 I reached best performance with 16-24 workers for hashlife and 6 workers for streamlife on 96-core virtual machine for 0e0p-metaglider. The best value can depend on the pattern structure. You can try other values, but notice that it might be important to provide a whole physical (not logical) core for every worker.
 
@@ -342,3 +363,5 @@ This is updating 0e0p-metaglider with HashLifeEngineAsync by $2^{12}$ generation
 This is the same for $2^{15}$ generations and StreamLifeEngineAsync:
 
 ![StreamLifeEngineAsync](https://github.com/user-attachments/assets/201b1d76-ccef-46e4-a8a9-7610e8a14448)
+
+Small patterns (even the pi calculator) cannot benefit from parallelization as their simulations don't involve enough operations that can be performed independently.
