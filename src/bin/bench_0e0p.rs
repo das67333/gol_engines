@@ -4,11 +4,12 @@ use std::sync::atomic::*;
 
 fn main() {
     let timer = std::time::Instant::now();
-    let mut engine = StreamLifeEngineAsync::new(32 << 10);
+    let mut engine = StreamLifeEngineAsync::new(4 << 10);
     println!("Time spent on initializing engine: {:?}", timer.elapsed());
     let pattern = Pattern::from_file("res/very_large_patterns/0e0p-metaglider.mc.gz").unwrap();
 
-    for workers in [2, 4, 8, 12, 16, 20, 24, 32, 40, 48] {
+    for workers in 8..=8 {
+        // [2, 4, 8, 12, 16, 20, 24, 32, 40, 48] {
         WORKER_THREADS.store(workers, Ordering::Relaxed);
         println!("Using {} worker threads", workers);
 
@@ -18,7 +19,7 @@ fn main() {
         println!("Time spent on loading pattern: {:?}", timer.elapsed());
 
         let timer = std::time::Instant::now();
-        let gens_log2 = 27;
+        let gens_log2 = 10;
         engine.update(gens_log2).unwrap();
         println!(
             "Time on updating pattern by 2^{} generations: {:?}",

@@ -20,10 +20,10 @@ pub use simd::SIMDEngine;
 
 pub type DefaultEngine = HashLifeEngineAsync;
 
-pub const VERSION: &str = "0.1.1";
+pub const VERSION: &str = "0.2.0";
 
 use std::sync::atomic::{AtomicU32, AtomicU64};
 pub static WORKER_THREADS: AtomicU32 = AtomicU32::new(0);
-pub static MIN_TASK_SPAWN_SIZE_LOG2: AtomicU32 = AtomicU32::new(12);
+pub const MIN_TASK_SPAWN_SHIFT: u32 = 5;
 pub const MAX_TASKS_COUNT: u64 = 1024;
 pub static TASKS_SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);

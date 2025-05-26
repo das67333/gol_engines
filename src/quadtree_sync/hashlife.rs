@@ -330,6 +330,18 @@ impl<Extra: Clone + Default> HashLifeEngineSync<Extra> {
         cache.insert(idx, result);
         result
     }
+
+    pub(super) fn with_capacity(cap_log2: u32) -> Self {
+        let mem = MemoryManager::with_capacity(cap_log2);
+        Self {
+            size_log2: LEAF_SIZE_LOG2,
+            root: mem.find_or_create_leaf_from_u64(0),
+            mem,
+            generations_per_update_log2: None,
+            topology: Topology::Unbounded,
+            blank_nodes: BlankNodes::new(),
+        }
+    }
 }
 
 impl<Extra: Clone + Default> GoLEngine for HashLifeEngineSync<Extra> {
@@ -341,15 +353,7 @@ impl<Extra: Clone + Default> GoLEngine for HashLifeEngineSync<Extra> {
             .checked_next_power_of_two()
             .unwrap()
             .trailing_zeros();
-        let mem = MemoryManager::with_capacity(cap_log2);
-        Self {
-            size_log2: LEAF_SIZE_LOG2,
-            root: mem.find_or_create_leaf_from_u64(0),
-            mem,
-            generations_per_update_log2: None,
-            topology: Topology::Unbounded,
-            blank_nodes: BlankNodes::new(),
-        }
+        Self::with_capacity(cap_log2)
     }
 
     fn load_pattern(&mut self, pattern: &Pattern, topology: Topology) -> Result<()> {
@@ -422,7 +426,7 @@ impl<Extra: Clone + Default> GoLEngine for HashLifeEngineSync<Extra> {
         }
 
         self.root = self.update_node(self.root, self.size_log2);
-        if self.mem.poisoned() {
+        if self.mem.is_poisoned() {
             self.load_pattern(&backup, self.topology)?;
             return Err(anyhow!(
                 "HashLifeSync: overfilled MemoryManager, try smaller step"

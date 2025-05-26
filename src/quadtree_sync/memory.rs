@@ -160,7 +160,7 @@ impl<Extra: Clone + Default> MemoryManager<Extra> {
         unsafe { (*self.base.get()).bytes_total() }
     }
 
-    pub(super) fn poisoned(&self) -> bool {
+    pub(super) fn is_poisoned(&self) -> bool {
         unsafe { (*self.base.get()).poisoned }
     }
 }

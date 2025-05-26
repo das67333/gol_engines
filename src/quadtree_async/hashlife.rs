@@ -3,8 +3,7 @@ use super::{
     LEAF_SIZE_LOG2,
 };
 use crate::{
-    quadtree_async::TasksCountGuard, GoLEngine, Pattern, PatternNode, Topology,
-    MIN_TASK_SPAWN_SIZE_LOG2, WORKER_THREADS,
+    quadtree_async::TasksCountGuard, GoLEngine, Pattern, PatternNode, Topology, WORKER_THREADS,
 };
 use ahash::AHashMap as HashMap;
 use anyhow::{anyhow, Result};
@@ -315,7 +314,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
                 )
                 .is_ok()
         {
-            let cache = if size_log2 >= MIN_TASK_SPAWN_SIZE_LOG2.load(Ordering::Relaxed) {
+            let cache = if size_log2 >= ExecutionStatistics::get_min_task_spawn_size_log2() {
                 self.update_inner_async(node, size_log2).await
             } else {
                 self.update_inner_sync(node, size_log2)
