@@ -426,7 +426,7 @@ impl<Extra: Clone + Default> GoLEngine for HashLifeEngineSync<Extra> {
         }
 
         self.root = self.update_node(self.root, self.size_log2);
-        if self.mem.poisoned() {
+        if self.mem.is_poisoned() {
             self.load_pattern(&backup, self.topology)?;
             return Err(anyhow!(
                 "HashLifeSync: overfilled MemoryManager, try smaller step"

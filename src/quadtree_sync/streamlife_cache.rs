@@ -36,10 +36,16 @@ impl StreamLifeCache {
     pub(super) fn bytes_total(&self) -> usize {
         unsafe { (*self.base.get()).bytes_total() }
     }
+
+    pub(super) fn is_poisoned(&self) -> bool {
+        unsafe { (*self.base.get()).poisoned }
+    }
 }
 
 struct StreamLifeCacheRaw {
     hashtable: Vec<CacheEntry>,
+    len: usize,
+    poisoned: bool,
     hasher: ahash::AHasher,
 }
 
@@ -53,6 +59,8 @@ impl StreamLifeCacheRaw {
             hashtable: (0..1u64 << cap_log2)
                 .map(|_| CacheEntry::default())
                 .collect(),
+            len: 0,
+            poisoned: false,
             hasher: ahash::AHasher::default(),
         }
     }
@@ -77,7 +85,10 @@ impl StreamLifeCacheRaw {
                 c.key = key;
                 c.is_used = true;
 
-                // ExecutionStatistics::on_insertion::<1>();
+                self.len += 1;
+                if self.len > self.hashtable.len() * 3 / 4 {
+                    self.poisoned = true;
+                }
                 break false;
             }
 

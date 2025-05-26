@@ -283,15 +283,13 @@ impl StreamLifeEngineAsync {
     }
 
     fn merge_universes(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> NodeIdx {
-        // if ExecutionStatistics::is_poisoned() {
-        //     return NodeIdx::default();
-        // }
-        if idx.1 == self.base.blank_nodes.get(size_log2) {
+        let b = self.base.blank_nodes.get(size_log2);
+        if idx.1 == b {
             return idx.0;
         }
-        // if idx.0 == self.base.blank_nodes.get(size_log2) {
-        //     return idx.1;
-        // }
+        if idx.0 == b {
+            return idx.1;
+        }
         let m0 = self.base.mem.get(idx.0);
         let m1 = self.base.mem.get(idx.1);
         if size_log2 == LEAF_SIZE_LOG2 {

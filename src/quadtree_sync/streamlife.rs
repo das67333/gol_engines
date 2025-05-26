@@ -269,8 +269,12 @@ impl StreamLifeEngineSync {
     }
 
     fn merge_universes(&mut self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> NodeIdx {
-        if idx.1 == self.base.blank_nodes.get_mut(size_log2, &self.base.mem) {
+        let b = self.base.blank_nodes.get_mut(size_log2, &self.base.mem);
+        if idx.1 == b {
             return idx.0;
+        }
+        if idx.0 == b {
+            return idx.1;
         }
         let m0 = self.base.mem.get(idx.0);
         let m1 = self.base.mem.get(idx.1);
@@ -290,6 +294,10 @@ impl StreamLifeEngineSync {
     }
 
     fn update_binode(&mut self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> (NodeIdx, NodeIdx) {
+        if self.bicache.is_poisoned() || self.base.mem.is_poisoned() {
+            return (NodeIdx::default(), NodeIdx::default());
+        }
+
         if self.is_solitonic(idx, size_log2) {
             let i1 = self.base.update_node(idx.0, size_log2);
             let i2 = self.base.update_node(idx.1, size_log2);
@@ -455,7 +463,7 @@ impl GoLEngine for StreamLifeEngineSync {
                 .get_mut(self.base.size_log2, &self.base.mem),
         ));
         let biroot = self.update_binode(biroot, self.base.size_log2);
-        if self.base.mem.poisoned() {
+        if self.bicache.is_poisoned() || self.base.mem.is_poisoned() {
             self.load_pattern(&backup, self.base.topology)?;
             return Err(anyhow!(
                 "StreamLifeSync: overfilled MemoryManager, try smaller step"
