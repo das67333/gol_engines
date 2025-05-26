@@ -1,6 +1,8 @@
-use super::{hashlife::HashLifeEngineSync, NodeIdx, LEAF_SIZE_LOG2};
+use super::{
+    hashlife::HashLifeEngineSync, CacheEntry, NodeIdx, QuadTreeNode, StreamLifeCache,
+    LEAF_SIZE_LOG2,
+};
 use crate::{GoLEngine, Pattern, Topology};
-use ahash::AHashMap as HashMap;
 use anyhow::{anyhow, Result};
 use num_bigint::BigInt;
 
@@ -13,7 +15,7 @@ pub struct StreamLifeEngineSync {
     base: HashLifeEngineSync<u64>,
     // streamlife-specific
     biroot: Option<(NodeIdx, NodeIdx)>,
-    bicache: HashMap<(NodeIdx, NodeIdx), (NodeIdx, NodeIdx)>,
+    bicache: StreamLifeCache,
 }
 
 impl StreamLifeEngineSync {
@@ -311,11 +313,12 @@ impl StreamLifeEngineSync {
             };
         }
 
-        if let Some(cache) = self.bicache.get(&idx) {
-            return *cache;
+        let (found, entry) = self.bicache.entry(idx);
+        if found {
+            return unsafe { (*entry).value };
         }
 
-        if size_log2 == LEAF_SIZE_LOG2 + 2 {
+        let res = if size_log2 == LEAF_SIZE_LOG2 + 2 {
             let hnode2 = self.merge_universes(idx, size_log2);
             let i3 = self.base.update_node(hnode2, size_log2);
             let b = self.base.blank_nodes.get_mut(size_log2 - 1, &self.base.mem);
@@ -364,17 +367,18 @@ impl StreamLifeEngineSync {
                 (*l, *r) = self.update_binode((*l, *r), size_log2 - 1);
             }
 
-            let res = (
+            (
                 self.base
                     .mem
                     .find_or_create_node(arr40[0], arr40[1], arr40[2], arr40[3]),
                 self.base
                     .mem
                     .find_or_create_node(arr41[0], arr41[1], arr41[2], arr41[3]),
-            );
-            self.bicache.insert(idx, res);
-            res
-        }
+            )
+        };
+
+        unsafe { (*entry).value = res };
+        res
     }
 
     fn add_frame(&mut self, dx: &mut BigInt, dy: &mut BigInt) {
@@ -404,11 +408,17 @@ impl StreamLifeEngineSync {
 
 impl GoLEngine for StreamLifeEngineSync {
     fn new(mem_limit_mib: u32) -> Self {
-        // one half of memory is reserved for bicache
+        let nodes = ((mem_limit_mib as u64) << 20)
+            / (std::mem::size_of::<QuadTreeNode<u64>>() + std::mem::size_of::<CacheEntry>()) as u64;
+        // previous power of two
+        let cap_log2 = (nodes / 2 + 1)
+            .checked_next_power_of_two()
+            .unwrap()
+            .trailing_zeros();
         Self {
-            base: HashLifeEngineSync::new(mem_limit_mib / 2),
+            base: HashLifeEngineSync::with_capacity(cap_log2),
             biroot: None,
-            bicache: HashMap::new(),
+            bicache: StreamLifeCache::with_capacity(cap_log2),
         }
     }
 
@@ -481,9 +491,7 @@ impl GoLEngine for StreamLifeEngineSync {
     }
 
     fn bytes_total(&self) -> usize {
-        let bicache_bytes =
-            self.bicache.capacity() * size_of::<((NodeIdx, NodeIdx), (NodeIdx, NodeIdx))>();
-        self.base.bytes_total() + bicache_bytes
+        self.base.bytes_total() + self.bicache.bytes_total()
     }
 }
 
