@@ -43,6 +43,8 @@ The repository includes several cross-platform update algorithm implementations 
 
 Two topologies of the field are supported: Unbounded and Torus  (the latter on a $2^n\times2^n$ square grid).
 
+CLI interface provides access to *Sync and *Async variants.
+
 ## Architecture
 
 ![architecture](https://github.com/user-attachments/assets/c1755385-a828-4ab4-bcef-5dd9f8b77423)
