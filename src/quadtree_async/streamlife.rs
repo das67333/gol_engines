@@ -398,29 +398,30 @@ impl StreamLifeEngineAsync {
         }
 
         let entry = self.bicache.entry(idx);
-        let status = entry.status.load(Ordering::Acquire);
-        if status == status::CACHED {
-            return entry.value;
+        let status = unsafe { &(*entry).status };
+        let status_value = status.load(Ordering::Acquire);
+        if status_value == status::CACHED {
+            return unsafe { (*entry).value };
         }
 
-        if status == status::NOT_CACHED
-            && entry
-                .status
+        let entry_usize = entry as usize;
+        if !(status_value == status::NOT_CACHED
+            && status
                 .compare_exchange(
                     status::NOT_CACHED,
                     status::PROCESSING,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 )
-                .is_err()
+                .is_ok())
         {
-            while entry.status.load(Ordering::Acquire) != status::CACHED {
+            while status.load(Ordering::Acquire) != status::CACHED {
                 if ExecutionStatistics::is_poisoned() {
                     return (NodeIdx::default(), NodeIdx::default());
                 }
                 tokio::task::yield_now().await;
             }
-            return entry.value;
+            return unsafe { (*(entry_usize as *const CacheEntry)).value };
         }
 
         if self.is_solitonic(idx, size_log2) {
@@ -444,8 +445,8 @@ impl StreamLifeEngineAsync {
             } else {
                 (i1, i2)
             };
-            entry.value = res;
-            entry.status.store(status::CACHED, Ordering::Release);
+            unsafe { (*(entry_usize as *mut CacheEntry)).value = res };
+            status.store(status::CACHED, Ordering::Release);
             return res;
         }
 
@@ -467,8 +468,9 @@ impl StreamLifeEngineAsync {
         } else {
             self.update_binode_inner(idx, size_log2).await
         };
-        entry.value = result;
-        entry.status.store(status::CACHED, Ordering::Release);
+
+        unsafe { (*(entry_usize as *mut CacheEntry)).value = result };
+        status.store(status::CACHED, Ordering::Release);
         result
     }
 

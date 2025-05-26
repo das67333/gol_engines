@@ -29,7 +29,7 @@ impl StreamLifeCache {
     }
 
     #[allow(clippy::mut_from_ref)]
-    pub(super) fn entry(&self, key: (NodeIdx, NodeIdx)) -> &mut CacheEntry {
+    pub(super) fn entry(&self, key: (NodeIdx, NodeIdx)) -> *mut CacheEntry {
         unsafe { (*self.base.get()).find_or_create_entry(key) }
     }
 
@@ -61,7 +61,7 @@ impl StreamLifeCacheRaw {
         }
     }
 
-    unsafe fn find_or_create_entry(&mut self, key: (NodeIdx, NodeIdx)) -> &mut CacheEntry {
+    unsafe fn find_or_create_entry(&mut self, key: (NodeIdx, NodeIdx)) -> *mut CacheEntry {
         let hash = {
             let mut hasher = self.hasher.clone();
             (key.0 .0, key.1 .0).hash(&mut hasher);
