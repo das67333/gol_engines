@@ -364,6 +364,6 @@ This is updating 0e0p-metaglider with HashLifeEngineAsync by $2^{12}$ generation
 
 This is the same for $2^{15}$ generations and StreamLifeEngineAsync:
 
-![StreamLifeEngineAsync](https://github.com/user-attachments/assets/201b1d76-ccef-46e4-a8a9-7610e8a14448)
+![StreamLifeEngineAsync](https://github.com/user-attachments/assets/36f20b44-325b-428e-9346-7d14161dbf13)
 
 Small patterns (even the pi calculator) cannot benefit from parallelization as their simulations don't involve enough operations that can be performed independently.
