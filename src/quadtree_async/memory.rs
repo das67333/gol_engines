@@ -21,12 +21,6 @@ impl<Extra: Default> MemoryManager<Extra> {
         unsafe { (*self.base.get()).get(idx) }
     }
 
-    /// Get a mutable reference to the node at the given index.
-    #[allow(clippy::mut_from_ref)]
-    pub(super) fn get_mut(&self, idx: NodeIdx) -> &mut QuadTreeNode<Extra> {
-        unsafe { (*self.base.get()).get_mut(idx) }
-    }
-
     /// Find a leaf node with the given parts.
     /// If the node is not found, it is created.
     ///
@@ -131,12 +125,6 @@ impl<Extra: Default> MemoryManagerRaw<Extra> {
     #[inline]
     fn get(&self, idx: NodeIdx) -> &QuadTreeNode<Extra> {
         unsafe { self.hashtable.get_unchecked(idx.0 as usize) }
-    }
-
-    /// Get a mutable reference to the node at the given index.
-    #[inline]
-    fn get_mut(&mut self, idx: NodeIdx) -> &mut QuadTreeNode<Extra> {
-        unsafe { self.hashtable.get_unchecked_mut(idx.0 as usize) }
     }
 
     /// Find an item in hashtable; if it is not present, it is created and its index in hashtable is returned.
