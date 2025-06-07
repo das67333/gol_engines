@@ -362,14 +362,16 @@ As all the hashtables are power-of-two sized, there are certain memory-limit-gib
 - $12 \cdot 2^k$ for hashlife (because hashlife node is 24 bytes in size)
 - $13 \cdot 2^k$ for streamlife (because node of internal hashlife is 32 bytes, streamlife node is 20 bytes and these hashtables are initialized with equal capacity)
 
-I reached best performance with 16-24 workers for hashlife and 6 workers for streamlife on 96-core virtual machine for 0e0p-metaglider. The best value can depend on the pattern structure. You can try other values, but notice that it might be important to provide a whole physical (not logical) core for every worker.
+I reached best performance with about 24 workers for hashlife and 6 workers for streamlife on 96-core virtual machine for 0e0p-metaglider. The best value can depend on the pattern structure and hardware used. You can try other values, but notice that it might be important to provide a whole physical (not logical) core for every worker.
 
 This is updating 0e0p-metaglider with HashLifeEngineAsync by $2^{12}$ generations with different values of `WORKER_THREADS`:
 
-![HashLifeEngineAsync](https://github.com/user-attachments/assets/12b744c6-6e70-4d99-8e53-cf8a38264a47)
+![HashLifeEngineAsync](https://github.com/user-attachments/assets/7f0ee110-56fd-48e1-8acb-bcc103e53dd6)
+
 
 This is the same for $2^{15}$ generations and StreamLifeEngineAsync:
 
-![StreamLifeEngineAsync](https://github.com/user-attachments/assets/201b1d76-ccef-46e4-a8a9-7610e8a14448)
+![StreamLifeEngineAsync](https://github.com/user-attachments/assets/15f900fb-953a-40f5-bae4-b85b30385660)
 
-Small patterns (even the pi calculator) cannot benefit from parallelization as their simulations don't involve enough operations that can be performed independently.
+
+Small patterns (even the pi calculator) cannot benefit from parallelization as their simulations don't involve enough operations that can be performed independently or such operations are too lightweight.
