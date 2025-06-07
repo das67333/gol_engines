@@ -1,4 +1,4 @@
-use crate::util::print_population;
+use crate::util::{local_time, print_population};
 use clap::{Args, ValueEnum};
 use gol_engines::{
     GoLEngine, HashLifeEngineAsync, HashLifeEngineSync, Pattern, StreamLifeEngineAsync,
@@ -15,7 +15,7 @@ pub(super) struct UpdateArgs {
     #[arg(short, long)]
     output: String,
 
-    /// The engine to use for the simulation, default is hashlife
+    /// The engine to use for the simulation
     #[arg(short, long, value_enum, default_value_t = Engine::Hashlife)]
     engine: Engine,
 
@@ -24,7 +24,7 @@ pub(super) struct UpdateArgs {
     #[arg(short, long)]
     mem_limit_gib: u32,
 
-    /// The number of worker threads to use for the update, default is 1;
+    /// The number of worker threads to use for the update;
     /// ignored for single-threaded engines
     #[arg(short, long, default_value_t = 1)]
     workers: u32,
@@ -37,9 +37,9 @@ pub(super) struct UpdateArgs {
     #[arg(short, long)]
     step_log2: Option<u32>,
 
-    /// The topology of the pattern, default is unbounded
-    #[arg(short, long, value_enum)]
-    topology: Option<Topology>,
+    /// The topology of the pattern
+    #[arg(short, long, value_enum, default_value_t = Topology::Unbounded)]
+    topology: Topology,
 
     /// Count population of the resulting pattern
     #[arg(short, long)]
@@ -81,8 +81,8 @@ pub(super) fn run_update(args: UpdateArgs) {
     WORKER_THREADS.store(args.workers, std::sync::atomic::Ordering::Relaxed);
     let mem_limit_mib = args.mem_limit_gib.saturating_mul(1024);
     let topology = match args.topology {
-        None | Some(Topology::Unbounded) => gol_engines::Topology::Unbounded,
-        Some(Topology::Torus) => gol_engines::Topology::Torus,
+        Topology::Unbounded => gol_engines::Topology::Unbounded,
+        Topology::Torus => gol_engines::Topology::Torus,
     };
 
     let timer = std::time::Instant::now();
@@ -118,7 +118,8 @@ pub(super) fn run_update(args: UpdateArgs) {
                     break;
                 }
                 println!(
-                    "Updated by {} out of {} generations",
+                    "{}  Updated by {} out of {} generations",
+                    local_time(),
                     &gens_total - &gens_left,
                     &gens_total
                 );
@@ -126,14 +127,16 @@ pub(super) fn run_update(args: UpdateArgs) {
             }
             Err(_) => {
                 if gc_can_help {
-                    println!("Overfilled hashtables, running GC");
+                    println!("{}  Overfilled hashtables, running GC", local_time());
                     engine.run_gc();
                     gc_can_help = false;
                 } else {
                     let new_step_log2 = step_log2.checked_sub(2).unwrap();
                     println!(
-                        "Overfilled hashtables, reducing step_log2 from {} to {} (and running GC)",
-                        step_log2, new_step_log2
+                        "{}  Overfilled hashtables, reducing step_log2 from {} to {}",
+                        local_time(),
+                        step_log2,
+                        new_step_log2
                     );
                     step_log2 = new_step_log2;
                     step = BigInt::from(1) << step_log2;

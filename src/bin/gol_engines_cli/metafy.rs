@@ -13,7 +13,7 @@ pub(super) struct MetafyArgs {
     /// Path to the file containing the on state of the metacell
     meta_1: String,
 
-    /// The number of times to apply the metacell replacement, default is 1
+    /// The number of times to apply the metacell replacement
     #[arg(short, long, default_value_t = 1)]
     k: u32,
 

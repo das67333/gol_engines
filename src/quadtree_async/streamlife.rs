@@ -84,14 +84,14 @@ impl StreamLifeEngineAsync {
             return 0xffff;
         }
 
-        let status = &self.base.mem.get(idx).status_extra;
-        let status_value = status.load(Ordering::Acquire);
-        if status_value == status::CACHED {
-            return self.base.mem.get(idx).extra;
+        let n = self.base.mem.get(idx);
+        let status = n.status_extra.load(Ordering::Acquire);
+        if status == status::CACHED {
+            return unsafe { *n.extra.get() };
         }
 
-        if !(status_value == status::NOT_CACHED
-            && status
+        if !(status == status::NOT_CACHED
+            && n.status_extra
                 .compare_exchange(
                     status::NOT_CACHED,
                     status::PROCESSING,
@@ -100,21 +100,20 @@ impl StreamLifeEngineAsync {
                 )
                 .is_ok())
         {
-            while status.load(Ordering::Acquire) != status::CACHED {
+            while n.status_extra.load(Ordering::Acquire) != status::CACHED {
                 if ExecutionStatistics::is_poisoned() {
                     return 0;
                 }
                 // tokio::task::yield_now().await;
                 spin_loop();
             }
-            return self.base.mem.get(idx).extra;
+            return unsafe { *n.extra.get() };
         }
 
         if size_log2 == LEAF_SIZE_LOG2 + 1 {
-            let n = self.base.mem.get_mut(idx);
             let extra = self.determine_direction(n.nw, n.ne, n.sw, n.se);
-            n.extra = extra;
-            status.store(status::CACHED, Ordering::Release);
+            unsafe { *n.extra.get() = extra };
+            n.status_extra.store(status::CACHED, Ordering::Release);
             return extra;
         }
 
@@ -146,8 +145,8 @@ impl StreamLifeEngineAsync {
             adml &= childlanes[8];
         }
         if adml == 0 {
-            self.base.mem.get_mut(idx).extra = 0;
-            status.store(status::CACHED, Ordering::Release);
+            unsafe { *n.extra.get() = 0 };
+            n.status_extra.store(status::CACHED, Ordering::Release);
             return 0;
         }
 
@@ -261,8 +260,8 @@ impl StreamLifeEngineAsync {
         }
 
         let extra = adml | (lanes << 32);
-        self.base.mem.get_mut(idx).extra = extra;
-        status.store(status::CACHED, Ordering::Release);
+        unsafe { *n.extra.get() = extra };
+        n.status_extra.store(status::CACHED, Ordering::Release);
         extra
     }
 

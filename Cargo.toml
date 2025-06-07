@@ -1,6 +1,6 @@
 [package]
 name = "gol_engines"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Tools for Conway's Game of Life"
 repository = "https://github.com/das67333/gol_engines"
@@ -12,7 +12,7 @@ categories = ["algorithms", "concurrency", "simulation"]
 include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
 
 [features]
-cli_deps = ["clap", "num-format"]
+cli_deps = ["chrono", "clap", "num-format"]
 
 [[bin]]
 name = "gol_engines_cli"
@@ -33,6 +33,7 @@ rand = "0.9"
 rand_chacha = "0.9"
 tokio = { version = "1.44", features = ["rt-multi-thread", "sync"] }
 
+chrono = { version = "0.4", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 num-format = { version = "0.4", features = [
     "with-num-bigint",

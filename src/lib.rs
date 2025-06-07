@@ -20,7 +20,7 @@ pub use simd::SIMDEngine;
 
 pub type DefaultEngine = HashLifeEngineAsync;
 
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.2.1";
 
 use std::sync::atomic::{AtomicU32, AtomicU64};
 pub static WORKER_THREADS: AtomicU32 = AtomicU32::new(0);

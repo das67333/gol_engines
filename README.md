@@ -87,9 +87,9 @@ $ target/release/gol_engines_cli update \
     --workers=16 \
     --gens-log2=12 \
     --population
-Initialized engine in 5.3 secs
-Loaded pattern in 1.8 secs
-Updated pattern by 2^12 generations in 13.6 secs
+Initialized engine in 5.5 secs
+Loaded pattern in 1.9 secs
+Updated pattern by 2^12 generations in 13.8 secs
 Population: 93_237_300
 ```
 
@@ -102,14 +102,14 @@ $ target/release/gol_engines_cli update \
     --workers=16 \
     --gens-log2=12 \
     --population
-Initialized engine in 2.6 secs
+Initialized engine in 2.7 secs
 Loaded pattern in 1.3 secs
-Overfilled hashtables, reducing step_log2 from 12 to 10 (and running GC)
-Updated by 1024 out of 4096 generations
-Updated by 2048 out of 4096 generations
-Updated by 3072 out of 4096 generations
-Overfilled hashtables, running GC
-Updated pattern by 2^12 generations in 32.9 secs
+2025-05-31T17:13:55.452  Overfilled hashtables, reducing step_log2 from 12 to 10
+2025-05-31T17:14:00.764  Updated by 1024 out of 4096 generations
+2025-05-31T17:14:04.786  Updated by 2048 out of 4096 generations
+2025-05-31T17:14:09.006  Updated by 3072 out of 4096 generations
+2025-05-31T17:14:12.680  Overfilled hashtables, running GC
+Updated pattern by 2^12 generations in 37.5 secs
 Population: 93_237_300
 ```
 
@@ -123,13 +123,13 @@ $ target/release/gol_engines_cli update \
     --gens-log2=12 \
     --step-log2=10 \
     --population
-Initialized engine in 2.6 secs
-Loaded pattern in 1.3 secs
-Updated by 1024 out of 4096 generations
-Updated by 2048 out of 4096 generations
-Updated by 3072 out of 4096 generations
-Overfilled hashtables, running GC
-Updated pattern by 2^12 generations in 20.8 secs
+Initialized engine in 2.9 secs
+Loaded pattern in 1.5 secs
+2025-05-31T17:16:42.996  Updated by 1024 out of 4096 generations
+2025-05-31T17:16:47.033  Updated by 2048 out of 4096 generations
+2025-05-31T17:16:51.217  Updated by 3072 out of 4096 generations
+2025-05-31T17:16:54.960  Overfilled hashtables, running GC
+Updated pattern by 2^12 generations in 23.6 secs
 Population: 93_237_300
 ```
 
@@ -143,9 +143,9 @@ $ target/release/gol_engines_cli update \
     --gens-log2=18 \
     --engine=streamlife \
     --population
-Initialized engine in 6.1 secs
-Loaded pattern in 2.0 secs
-Updated pattern by 2^18 generations in 58.5 secs
+Initialized engine in 6.3 secs
+Loaded pattern in 2.3 secs
+Updated pattern by 2^18 generations in 67.8 secs
 Population: 93_235_655
 ```
 
@@ -206,7 +206,7 @@ Computed stats in 1.0 secs
 Pi calculator is much smaller:
 ```
 $ target/release/gol_engines_cli stats \
-    res/very_large_patterns/pi.mc.gz             
+    res/very_large_patterns/pi.mc.gz
 Hash: 0xd9c1db4109c7b2ab
 Population: 1_189_325
 Distribution of node sizes (side lengths of the squares):
@@ -246,9 +246,9 @@ Options:
 #### Update
 ```
 $ target/release/gol_engines_cli help update
-Run the simulation using parallel implementations of the update algorithms
+Run the simulation using high-performance implementations of the update algorithms
 
-Usage: gol_engines_cli update [OPTIONS] --output <OUTPUT> --mem-limit-gib <MEM_LIMIT_GIB> --workers <WORKERS> --gens-log2 <GENS_LOG2> <PATTERN>
+Usage: gol_engines_cli update [OPTIONS] --output <OUTPUT> --mem-limit-gib <MEM_LIMIT_GIB> --gens-log2 <GENS_LOG2> <PATTERN>
 
 Arguments:
   <PATTERN>
@@ -259,19 +259,23 @@ Options:
           Path to the file where the resulting pattern will be saved
 
   -e, --engine <ENGINE>
-          The engine to use for the simulation, default is hashlife
+          The engine to use for the simulation
           
           [default: hashlife]
 
           Possible values:
-          - hashlife:   See https://conwaylife.com/wiki/HashLife
-          - streamlife: See https://conwaylife.com/wiki/StreamLife
+          - hashlife:      Parallel implementation of HashLife
+          - hashlife-st:   Single-threaded implementation of HashLife
+          - streamlife:    Parallel implementation of StreamLife
+          - streamlife-st: Single-threaded implementation of StreamLife
 
   -m, --mem-limit-gib <MEM_LIMIT_GIB>
           Maximum memory (in GiB) allocated to the hash tables; all other usage is typically negligible
 
   -w, --workers <WORKERS>
-          The number of worker threads to use for the update
+          The number of worker threads to use for the update; ignored for single-threaded engines
+          
+          [default: 1]
 
   -g, --gens-log2 <GENS_LOG2>
           The pattern will be updated by 2^gens_log2 generations
@@ -280,7 +284,9 @@ Options:
           How many generations to update at once, uses `gens_log2` by default
 
   -t, --topology <TOPOLOGY>
-          The topology of the pattern, default is unbounded
+          The topology of the pattern
+          
+          [default: unbounded]
 
           Possible values:
           - unbounded: The pattern is unbounded in all directions
@@ -306,7 +312,7 @@ Arguments:
   <META_1>   Path to the file containing the on state of the metacell
 
 Options:
-  -k, --k <K>            The number of times to apply the metacell replacement, default is 1 [default: 1]
+  -k, --k <K>            The number of times to apply the metacell replacement [default: 1]
   -o, --output <OUTPUT>  Path to the file where the resulting pattern will be saved
   -p, --population       Count population of the resulting pattern
   -h, --help             Print help
@@ -356,14 +362,16 @@ As all the hashtables are power-of-two sized, there are certain memory-limit-gib
 - $12 \cdot 2^k$ for hashlife (because hashlife node is 24 bytes in size)
 - $13 \cdot 2^k$ for streamlife (because node of internal hashlife is 32 bytes, streamlife node is 20 bytes and these hashtables are initialized with equal capacity)
 
-I reached best performance with 16-24 workers for hashlife and 6 workers for streamlife on 96-core virtual machine for 0e0p-metaglider. The best value can depend on the pattern structure. You can try other values, but notice that it might be important to provide a whole physical (not logical) core for every worker.
+I reached best performance with about 24 workers for hashlife and 6 workers for streamlife on 96-core virtual machine for 0e0p-metaglider. The best value can depend on the pattern structure and hardware used. You can try other values, but notice that it might be important to provide a whole physical (not logical) core for every worker.
 
 This is updating 0e0p-metaglider with HashLifeEngineAsync by $2^{12}$ generations with different values of `WORKER_THREADS`:
 
-![HashLifeEngineAsync](https://github.com/user-attachments/assets/12b744c6-6e70-4d99-8e53-cf8a38264a47)
+![HashLifeEngineAsync](https://github.com/user-attachments/assets/7f0ee110-56fd-48e1-8acb-bcc103e53dd6)
+
 
 This is the same for $2^{15}$ generations and StreamLifeEngineAsync:
 
-![StreamLifeEngineAsync](https://github.com/user-attachments/assets/36f20b44-325b-428e-9346-7d14161dbf13)
+![StreamLifeEngineAsync](https://github.com/user-attachments/assets/15f900fb-953a-40f5-bae4-b85b30385660)
 
-Small patterns (even the pi calculator) cannot benefit from parallelization as their simulations don't involve enough operations that can be performed independently.
+
+Small patterns (even the pi calculator) cannot benefit from parallelization as their simulations don't involve enough operations that can be performed independently or such operations are too lightweight.
