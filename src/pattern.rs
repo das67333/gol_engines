@@ -91,8 +91,6 @@ pub struct Pattern {
     size_log2: SizeLog2,
     /// Storage for the quadtree nodes.
     kiv: KIVMap,
-    /// Caches blank nodes for faster search.
-    blank_nodes: Vec<NodeIdx>,
 }
 
 impl Pattern {
@@ -181,17 +179,17 @@ impl Pattern {
                     .wrapping_add(x >> 2)
             };
 
+            let mut result = 0;
             match kiv.get_node(idx) {
-                PatternNode::Leaf(cells) => *cells,
+                PatternNode::Leaf(cells) => result = *cells,
                 PatternNode::Node { nw, ne, sw, se } => {
-                    let mut result = 0;
                     for x in [*nw, *ne, *sw, *se] {
                         result = combine(result, inner(x, cache, kiv));
                     }
-                    cache.insert(idx, result);
-                    result
                 }
             }
+            cache.insert(idx, result);
+            result
         }
 
         let mut cache = HashMap::new();
@@ -266,11 +264,7 @@ impl Pattern {
         }
         self.size_log2 = self.size_log2.max(3);
         while self.size_log2 < size_log2 {
-            let blank = Self::find_or_create_blank_node(
-                self.size_log2,
-                &mut self.kiv,
-                &mut self.blank_nodes,
-            );
+            let blank = self.kiv.find_or_create_blank_node(self.size_log2);
 
             self.root = self.kiv.find_or_create_node(PatternNode::Node {
                 nw: self.root,
@@ -489,7 +483,6 @@ impl Pattern {
             root,
             size_log2: self.size_log2 + level * metacells[0].size_log2,
             kiv,
-            blank_nodes: vec![],
         })
     }
 
@@ -706,7 +699,6 @@ impl Pattern {
             root: nodes_curr[0],
             size_log2,
             kiv,
-            blank_nodes: vec![],
         })
     }
 
@@ -773,7 +765,6 @@ impl Pattern {
     /// - A rule other than B3/S23 is specified
     fn from_macrocell(data: &[u8]) -> Result<Self> {
         let mut kiv = KIVMap::new();
-        let mut blank_nodes = vec![];
         let mut codes_and_sizes = HashMap::<u32, (NodeIdx, SizeLog2)>::new();
         let mut last_code_and_size = None;
 
@@ -827,11 +818,7 @@ impl Pattern {
 
                 let mut resolve = |x: u32| -> Result<NodeIdx> {
                     if x == 0 {
-                        Ok(Self::find_or_create_blank_node(
-                            numbers[0] - 1,
-                            &mut kiv,
-                            &mut blank_nodes,
-                        ))
+                        Ok(kiv.find_or_create_blank_node(numbers[0] - 1))
                     } else {
                         let (code, size_log2) =
                             codes_and_sizes.get(&x).copied().ok_or_else(|| {
@@ -896,7 +883,6 @@ impl Pattern {
             root,
             size_log2,
             kiv,
-            blank_nodes,
         })
     }
 
@@ -916,7 +902,6 @@ impl Pattern {
             idx: NodeIdx,
             size_log2: SizeLog2,
             codes: &mut HashMap<NodeIdx, usize>,
-            blank_nodes: &mut Vec<NodeIdx>,
             result: &mut Vec<u8>,
         ) -> usize {
             // if already serialized
@@ -924,7 +909,7 @@ impl Pattern {
                 return x;
             }
             // if node is blank
-            if let Some(x) = Pattern::find_blank_node(size_log2, &this.kiv, blank_nodes) {
+            if let Some(x) = this.kiv.find_blank_node(size_log2) {
                 if x == idx {
                     return 0;
                 }
@@ -954,10 +939,10 @@ impl Pattern {
                     let new_line = format!(
                         "{} {} {} {} {}\n",
                         size_log2,
-                        inner(this, nw, size_log2 - 1, codes, blank_nodes, result),
-                        inner(this, ne, size_log2 - 1, codes, blank_nodes, result),
-                        inner(this, sw, size_log2 - 1, codes, blank_nodes, result),
-                        inner(this, se, size_log2 - 1, codes, blank_nodes, result),
+                        inner(this, nw, size_log2 - 1, codes, result),
+                        inner(this, ne, size_log2 - 1, codes, result),
+                        inner(this, sw, size_log2 - 1, codes, result),
+                        inner(this, se, size_log2 - 1, codes, result),
                     );
                     result.extend_from_slice(new_line.as_bytes());
                 }
@@ -966,8 +951,7 @@ impl Pattern {
             codes.len()
         }
 
-        let mut blank_nodes = self.blank_nodes.clone();
-        if let Some(x) = Self::find_blank_node(self.size_log2, &self.kiv, &mut blank_nodes) {
+        if let Some(x) = self.kiv.find_blank_node(self.size_log2) {
             if x == self.root {
                 return Err(anyhow!("Cannot serialize blank pattern"));
             }
@@ -975,14 +959,7 @@ impl Pattern {
 
         let mut codes = HashMap::new();
         let mut result = format!("[M2] (gol_engines {VERSION})\n#R B3/S23\n").into_bytes();
-        inner(
-            self,
-            self.root,
-            self.size_log2,
-            &mut codes,
-            &mut blank_nodes,
-            &mut result,
-        );
+        inner(self, self.root, self.size_log2, &mut codes, &mut result);
 
         Ok(result)
     }
@@ -1291,89 +1268,6 @@ impl Pattern {
 
         Ok(result)
     }
-
-    /// Finds or creates a blank node (containing all dead cells) of the
-    /// specified size.
-    ///
-    /// This is an internal utility method used to efficiently represent empty
-    /// regions in the quadtree.
-    ///
-    /// # Arguments
-    ///
-    /// * `size_log2` - Log base 2 of the node's side length.
-    /// * `kiv` - The key-index-value map storing the pattern nodes.
-    /// * `blank_nodes` - Cache of previously created blank nodes of different sizes.
-    ///
-    /// # Returns
-    ///
-    /// The index of the found or newly created blank node.
-    fn find_or_create_blank_node(
-        size_log2: SizeLog2,
-        kiv: &mut KIVMap,
-        blank_nodes: &mut Vec<NodeIdx>,
-    ) -> NodeIdx {
-        let i = (size_log2.max(3) - 3) as usize;
-        while blank_nodes.len() <= i {
-            let next = if let Some(&b) = blank_nodes.last() {
-                PatternNode::Node {
-                    nw: b,
-                    ne: b,
-                    sw: b,
-                    se: b,
-                }
-            } else {
-                PatternNode::Leaf(0)
-            };
-            blank_nodes.push(kiv.find_or_create_node(next));
-        }
-        blank_nodes[i]
-    }
-
-    /// Finds a blank node (containing all dead cells) of the specified size.
-    ///
-    /// Similar to `find_or_create_blank_node`, but returns `None` if the node doesn't
-    /// already exist in the provided `kiv`. This allows the function to take a
-    /// const reference to `KIVMap` rather than requiring a mutable reference.
-    ///
-    /// # Arguments
-    ///
-    /// * `size_log2` - Log base 2 of the node's side length.
-    /// * `kiv` - The key-index-value map storing the pattern nodes (immutable).
-    /// * `blank_nodes` - Cache of previously created blank nodes of different sizes.
-    ///
-    /// # Returns
-    ///
-    /// An `Option` containing the index of the found blank node, or `None` if
-    /// the requested blank node doesn't exist in the `kiv`.
-    fn find_blank_node(
-        size_log2: SizeLog2,
-        kiv: &KIVMap,
-        blank_nodes: &mut Vec<NodeIdx>,
-    ) -> Option<NodeIdx> {
-        let i = (size_log2.max(3) - 3) as usize;
-        if let Some(&b) = blank_nodes.get(i) {
-            return Some(b);
-        }
-        let i = (size_log2.max(3) - 3) as usize;
-        while blank_nodes.len() <= i {
-            let next = if let Some(&b) = blank_nodes.last() {
-                PatternNode::Node {
-                    nw: b,
-                    ne: b,
-                    sw: b,
-                    se: b,
-                }
-            } else {
-                PatternNode::Leaf(0)
-            };
-            if let Some(k) = kiv.find_node(next) {
-                blank_nodes.push(k);
-            } else {
-                return None;
-            }
-        }
-        Some(blank_nodes[i])
-    }
 }
 
 impl Default for Pattern {
@@ -1385,7 +1279,6 @@ impl Default for Pattern {
             root: kiv.find_or_create_node(PatternNode::Leaf(0)),
             size_log2: 3,
             kiv: KIVMap::new(),
-            blank_nodes: vec![],
         }
     }
 }
@@ -1445,7 +1338,8 @@ impl PatternNode {
 struct KIVMap {
     hashmap_chains: Vec<NodeIdx>,
     storage: Vec<NodeAndNext>,
-    capacity_log2: u32,
+    /// Caches blank nodes for faster search.
+    blank_nodes: Vec<NodeIdx>,
 }
 
 #[derive(Clone, Copy)]
@@ -1467,7 +1361,7 @@ impl KIVMap {
         KIVMap {
             hashmap_chains: vec![0; 1 << Self::INITIAL_CAPACITY_LOG2],
             storage,
-            capacity_log2: Self::INITIAL_CAPACITY_LOG2,
+            blank_nodes: vec![],
         }
     }
 
@@ -1503,17 +1397,19 @@ impl KIVMap {
             node,
             next: self.hashmap_chains[i],
         });
-        let idx = (self.storage.len() - 1).try_into().expect("Index overflow");
+        let idx = (self.storage.len() - 1)
+            .try_into()
+            .expect("KIVMap NodeIdx overflow");
         self.hashmap_chains[i] = idx;
-        if self.storage.len() > self.hashmap_chains.len() && self.capacity_log2 != u32::BITS {
+        if self.storage.len() > self.hashmap_chains.len() {
             self.rehash();
         }
         idx
     }
 
     fn rehash(&mut self) {
-        self.capacity_log2 += 1;
         let new_size = self.hashmap_chains.len() * 2;
+        assert!(new_size <= 1 << 32, "KIVMap NodeIdx overflow");
         let mut new_chains = vec![0; new_size];
         for &chain in &self.hashmap_chains {
             let mut curr = chain as usize;
@@ -1527,6 +1423,80 @@ impl KIVMap {
             }
         }
         self.hashmap_chains = new_chains;
+    }
+
+    /// Finds or creates a blank node (containing all dead cells) of the
+    /// specified size.
+    ///
+    /// This is an internal utility method used to efficiently represent empty
+    /// regions in the quadtree.
+    ///
+    /// # Arguments
+    ///
+    /// * `size_log2` - Log base 2 of the node's side length.
+    /// * `kiv` - The key-index-value map storing the pattern nodes.
+    /// * `blank_nodes` - Cache of previously created blank nodes of different sizes.
+    ///
+    /// # Returns
+    ///
+    /// The index of the found or newly created blank node.
+    fn find_or_create_blank_node(&mut self, size_log2: SizeLog2) -> NodeIdx {
+        let i = (size_log2.max(3) - 3) as usize;
+        while self.blank_nodes.len() <= i {
+            let next = if let Some(&b) = self.blank_nodes.last() {
+                PatternNode::Node {
+                    nw: b,
+                    ne: b,
+                    sw: b,
+                    se: b,
+                }
+            } else {
+                PatternNode::Leaf(0)
+            };
+            let idx = self.find_or_create_node(next);
+            self.blank_nodes.push(idx);
+        }
+        self.blank_nodes[i]
+    }
+
+    /// Finds a blank node (containing all dead cells) of the specified size.
+    ///
+    /// Similar to `find_or_create_blank_node`, but returns `None` if the node doesn't
+    /// already exist in the provided `kiv`. This allows the function to take a
+    /// const reference to `KIVMap` rather than requiring a mutable reference.
+    ///
+    /// # Arguments
+    ///
+    /// * `size_log2` - Log base 2 of the node's side length.
+    /// * `kiv` - The key-index-value map storing the pattern nodes (immutable).
+    /// * `blank_nodes` - Cache of previously created blank nodes of different sizes.
+    ///
+    /// # Returns
+    ///
+    /// An `Option` containing the index of the found blank node, or `None` if
+    /// the requested blank node doesn't exist in the `kiv`.
+    fn find_blank_node(&self, size_log2: SizeLog2) -> Option<NodeIdx> {
+        let i = (size_log2.max(3) - 3) as usize;
+        if let Some(&b) = self.blank_nodes.get(i) {
+            return Some(b);
+        }
+        let i = (size_log2.max(3) - 3) as usize;
+        while self.blank_nodes.len() <= i {
+            let next = if let Some(&b) = self.blank_nodes.last() {
+                PatternNode::Node {
+                    nw: b,
+                    ne: b,
+                    sw: b,
+                    se: b,
+                }
+            } else {
+                PatternNode::Leaf(0)
+            };
+            if self.find_node(next).is_none() {
+                return None;
+            }
+        }
+        Some(self.blank_nodes[i])
     }
 }
 
@@ -1595,7 +1565,6 @@ mod tests {
             root: node,
             size_log2,
             kiv,
-            blank_nodes: vec![],
         }
     }
 
