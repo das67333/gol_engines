@@ -482,7 +482,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         }
 
         let mut cache = HashMap::new();
-        let mut pattern = Pattern::default();
+        let mut pattern = Pattern::new(Some(self.size_log2));
         let root = inner(
             self.root,
             self.size_log2,

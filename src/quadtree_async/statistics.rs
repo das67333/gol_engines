@@ -1,5 +1,5 @@
 //! A thread-local statistics collector for quadtree operations.
-use crate::{MAX_TASKS_COUNT, MIN_TASK_SPAWN_SHIFT, TASKS_SPAWN_COUNT};
+use crate::{MAX_TASKS_COUNT, MIN_TASK_SPAWN_SHIFT, TASKS_SPAWNED_COUNT};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
@@ -121,7 +121,7 @@ pub(super) struct TasksCountGuard(u8);
 
 impl TasksCountGuard {
     pub(super) fn new(count: u8) -> Self {
-        TASKS_SPAWN_COUNT.fetch_add(count as u64, Ordering::Relaxed);
+        TASKS_SPAWNED_COUNT.fetch_add(count as u64, Ordering::Relaxed);
         ACTIVE_TASKS_COUNT.fetch_add(count as u64, Ordering::Relaxed);
         Self(count)
     }

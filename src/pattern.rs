@@ -94,6 +94,27 @@ pub struct Pattern {
 }
 
 impl Pattern {
+    /// Creates a new empty pattern. It initializes an 8x8 empty grid.
+    /// 
+    /// # Arguments
+    /// * `approx_size_log2`: 
+    ///   An optional hint for the approximate size of the pattern.  
+    ///   If provided, the internal [`KIVMap`] pre-allocates blank nodes
+    ///   up to that size to speed up future access.
+    pub fn new(approx_size_log2: Option<SizeLog2>) -> Self {
+        let mut kiv = KIVMap::new();
+        // fill cache of blank nodes
+        if let Some(size_log2) = approx_size_log2 {
+            kiv.find_or_create_blank_node(size_log2);
+        }
+
+        Self {
+            root: kiv.find_or_create_node(PatternNode::Leaf(0)),
+            size_log2: 3,
+            kiv,
+        }
+    }
+
     /// Returns the root node index of the pattern.
     ///
     /// The root node represents the top-level quadtree node covering the entire pattern.
@@ -1270,19 +1291,6 @@ impl Pattern {
     }
 }
 
-impl Default for Pattern {
-    /// Creates a new empty pattern with the following properties:
-    /// - An 8x8 empty grid (size_log2 = 3)
-    fn default() -> Self {
-        let mut kiv = KIVMap::new();
-        Self {
-            root: kiv.find_or_create_node(PatternNode::Leaf(0)),
-            size_log2: 3,
-            kiv: KIVMap::new(),
-        }
-    }
-}
-
 /// A node is either a leaf (8x8 cells) or a non-leaf (4x4 nodes).
 /// Cells in the leaf are stored as a 64-bit integer in row-major order.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1480,21 +1488,21 @@ impl KIVMap {
         if let Some(&b) = self.blank_nodes.get(i) {
             return Some(b);
         }
-        let i = (size_log2.max(3) - 3) as usize;
-        while self.blank_nodes.len() <= i {
-            let next = if let Some(&b) = self.blank_nodes.last() {
-                PatternNode::Node {
-                    nw: b,
-                    ne: b,
-                    sw: b,
-                    se: b,
-                }
-            } else {
-                PatternNode::Leaf(0)
-            };
-            self.find_node(next)?;
+
+        let (n, mut last) = if let Some(&b) = self.blank_nodes.last() {
+            (self.blank_nodes.len(), b)
+        } else {
+            (1, self.find_node(PatternNode::Leaf(0))?)
+        };
+        for _ in n..=i {
+            last = self.find_node(PatternNode::Node {
+                nw: last,
+                ne: last,
+                sw: last,
+                se: last,
+            })?;
         }
-        Some(self.blank_nodes[i])
+        Some(last)
     }
 }
 

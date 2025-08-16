@@ -540,7 +540,7 @@ impl<Extra: Clone + Default> GoLEngine for HashLifeEngineSmall<Extra> {
         }
 
         let mut cache = HashMap::new();
-        let mut pattern = Pattern::default();
+        let mut pattern = Pattern::new(Some(self.size_log2));
         let root = inner(
             self.root,
             self.size_log2,
