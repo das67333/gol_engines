@@ -29,8 +29,8 @@ fn main() {
 
         let updated = engine.current_state();
         println!(
-            "TASKS_SPAWN_COUNT: {}",
-            TASKS_SPAWN_COUNT.swap(0, Ordering::Relaxed)
+            "TASKS_SPAWNED_COUNT: {}",
+            TASKS_SPAWNED_COUNT.swap(0, Ordering::Relaxed)
         );
         println!("Population: {}", updated.population());
         println!("Hash: 0x{:016x}", updated.hash());

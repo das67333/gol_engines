@@ -1492,9 +1492,7 @@ impl KIVMap {
             } else {
                 PatternNode::Leaf(0)
             };
-            if self.find_node(next).is_none() {
-                return None;
-            }
+            self.find_node(next)?;
         }
         Some(self.blank_nodes[i])
     }
