@@ -1,6 +1,4 @@
-use super::{
-    BlankNodes, MemoryManager, NodeIdx, PrefetchedNode, QuadTreeNode, LEAF_SIZE, LEAF_SIZE_LOG2,
-};
+use super::{BlankNodes, MemoryManager, NodeIdx, QuadTreeNode, LEAF_SIZE, LEAF_SIZE_LOG2};
 use crate::{GoLEngine, Pattern, PatternNode, Topology};
 use ahash::AHashMap as HashMap;
 use anyhow::{anyhow, Result};
@@ -156,63 +154,35 @@ impl<Extra: Clone + Default> HashLifeEngineSync<Extra> {
         ]
     }
 
-    /// `size_log2` is related to `nw`, `ne`, `sw`, `se` and return value
-    fn update_nodes_single(
-        &self,
-        nw: NodeIdx,
-        ne: NodeIdx,
-        sw: NodeIdx,
-        se: NodeIdx,
-        size_log2: u32,
-    ) -> NodeIdx {
-        let arr9 = self.nine_children_disjoint(nw, ne, sw, se, size_log2);
+    fn update_node_inner(&self, n: &QuadTreeNode<Extra>, size_log2: u32) -> NodeIdx {
+        let generations_log2 = self.generations_per_update_log2.unwrap();
+        let both_stages = generations_log2 + 2 >= size_log2;
+        if size_log2 == LEAF_SIZE_LOG2 + 1 {
+            let steps = if both_stages {
+                LEAF_SIZE / 2
+            } else {
+                1 << generations_log2
+            };
+            self.update_leaves(n.nw, n.ne, n.sw, n.se, steps)
+        } else {
+            let mut arr9;
+            if both_stages {
+                arr9 = self.nine_children_overlapping(n.nw, n.ne, n.sw, n.se);
+                for x in arr9.iter_mut() {
+                    *x = self.update_node(*x, size_log2 - 1);
+                }
+            } else {
+                arr9 = self.nine_children_disjoint(n.nw, n.ne, n.sw, n.se, size_log2 - 1);
+            }
 
-        let mut arr4 = self.four_children_overlapping(&arr9);
-        for x in arr4.iter_mut() {
-            *x = self.update_node(*x, size_log2);
+            let mut arr4 = self.four_children_overlapping(&arr9);
+            for x in arr4.iter_mut() {
+                *x = self.update_node(*x, size_log2 - 1);
+            }
+
+            self.mem
+                .find_or_create_node(arr4[0], arr4[1], arr4[2], arr4[3])
         }
-        let [nw, ne, sw, se] = arr4;
-        self.mem.find_or_create_node(nw, ne, sw, se)
-    }
-
-    /// `size_log2` is related to `nw`, `ne`, `sw`, `se` and return value
-    fn update_nodes_double(
-        &self,
-        nw: NodeIdx,
-        ne: NodeIdx,
-        sw: NodeIdx,
-        se: NodeIdx,
-        size_log2: u32,
-    ) -> NodeIdx {
-        let [nw_, ne_, sw_, se_] = [nw, ne, sw, se].map(|x| self.mem.get(x));
-
-        // First stage
-        let p11 = PrefetchedNode::new(&self.mem, nw_.se, ne_.sw, sw_.ne, se_.nw, size_log2);
-        let p01 = PrefetchedNode::new(&self.mem, nw_.ne, ne_.nw, nw_.se, ne_.sw, size_log2);
-        let p12 = PrefetchedNode::new(&self.mem, ne_.sw, ne_.se, se_.nw, se_.ne, size_log2);
-        let p10 = PrefetchedNode::new(&self.mem, nw_.sw, nw_.se, sw_.nw, sw_.ne, size_log2);
-        let p21 = PrefetchedNode::new(&self.mem, sw_.ne, se_.nw, sw_.se, se_.sw, size_log2);
-
-        let t00 = self.update_node(nw, size_log2);
-        let t01 = self.update_node(p01.find_or_create(), size_log2);
-        let t02 = self.update_node(ne, size_log2);
-        let t12 = self.update_node(p12.find_or_create(), size_log2);
-        let t11 = self.update_node(p11.find_or_create(), size_log2);
-        let t10 = self.update_node(p10.find_or_create(), size_log2);
-        let t20 = self.update_node(sw, size_log2);
-        let t21 = self.update_node(p21.find_or_create(), size_log2);
-        let t22 = self.update_node(se, size_log2);
-
-        // Second stage
-        let pse = PrefetchedNode::new(&self.mem, t11, t12, t21, t22, size_log2);
-        let psw = PrefetchedNode::new(&self.mem, t10, t11, t20, t21, size_log2);
-        let pnw = PrefetchedNode::new(&self.mem, t00, t01, t10, t11, size_log2);
-        let pne = PrefetchedNode::new(&self.mem, t01, t02, t11, t12, size_log2);
-        let t_se = self.update_node(pse.find_or_create(), size_log2);
-        let t_sw = self.update_node(psw.find_or_create(), size_log2);
-        let t_nw = self.update_node(pnw.find_or_create(), size_log2);
-        let t_ne = self.update_node(pne.find_or_create(), size_log2);
-        self.mem.find_or_create_node(t_nw, t_ne, t_sw, t_se)
     }
 
     /// Recursively updates nodes in graph.
@@ -220,35 +190,13 @@ impl<Extra: Clone + Default> HashLifeEngineSync<Extra> {
     /// `size_log2` is related to `node`
     #[inline]
     pub(super) fn update_node(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
-        fn inner<Extra: Clone + Default>(
-            this: &HashLifeEngineSync<Extra>,
-            n: &mut QuadTreeNode<Extra>,
-            size_log2: u32,
-        ) -> NodeIdx {
-            let generations_log2 = this.generations_per_update_log2.unwrap();
-            let both_stages = generations_log2 + 2 >= size_log2;
-            let cache = if size_log2 == LEAF_SIZE_LOG2 + 1 {
-                let steps = if both_stages {
-                    LEAF_SIZE / 2
-                } else {
-                    1 << generations_log2
-                };
-                this.update_leaves(n.nw, n.ne, n.sw, n.se, steps)
-            } else if both_stages {
-                this.update_nodes_double(n.nw, n.ne, n.sw, n.se, size_log2 - 1)
-            } else {
-                this.update_nodes_single(n.nw, n.ne, n.sw, n.se, size_log2 - 1)
-            };
-            n.cache = cache;
-            n.has_cache = true;
-            cache
-        }
-
         let n = self.mem.get_mut(node);
         if n.has_cache {
             return n.cache;
         }
-        inner(self, n, size_log2)
+        n.cache = self.update_node_inner(n, size_log2);
+        n.has_cache = true;
+        n.cache
     }
 
     /// Add a frame around the field: if `self.topology` is Unbounded, frame is blank,

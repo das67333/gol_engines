@@ -95,9 +95,9 @@ pub struct Pattern {
 
 impl Pattern {
     /// Creates a new empty pattern. It initializes an 8x8 empty grid.
-    /// 
+    ///
     /// # Arguments
-    /// * `approx_size_log2`: 
+    /// * `approx_size_log2`:
     ///   An optional hint for the approximate size of the pattern.  
     ///   If provided, the internal [`KIVMap`] pre-allocates blank nodes
     ///   up to that size to speed up future access.
