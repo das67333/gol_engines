@@ -2,13 +2,17 @@ use super::{
     status, BlankNodes, ExecutionStatistics, MemoryManager, NodeIdx, QuadTreeNode, LEAF_SIZE,
     LEAF_SIZE_LOG2,
 };
-use crate::{
-    quadtree_async::TasksCountGuard, GoLEngine, Pattern, PatternNode, Topology, WORKER_THREADS,
-};
+use crate::{quadtree_async::TasksCountGuard, GoLEngine, Pattern, PatternNode, Topology};
 use ahash::AHashMap as HashMap;
 use anyhow::{anyhow, Result};
 use num_bigint::BigInt;
-use std::{future::Future, hint::spin_loop, pin::Pin, sync::atomic::Ordering};
+use std::{
+    collections::{HashSet, VecDeque},
+    future::Future,
+    hint::spin_loop,
+    pin::Pin,
+    sync::atomic::Ordering,
+};
 
 /// Parallel implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife).
 ///
@@ -223,6 +227,105 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
             }
             unsafe { *n.cache.get() }
         }
+    }
+
+    fn run_executor(&mut self) -> NodeIdx {
+        struct Task {
+            node: NodeIdx,
+            size_log2: u32,
+        }
+
+        let mut queue = VecDeque::new();
+        let mut processing = HashSet::new();
+        queue.push_front(Task {
+            node: self.root,
+            size_log2: self.size_log2,
+        });
+        processing.insert(self.root);
+        let mut max_processing_size = 0;
+
+        while let Some(task) = queue.pop_back() {
+            max_processing_size = max_processing_size.max(processing.len());
+            let n = self.mem.get(task.node);
+            let status = n.status.load(Ordering::Acquire);
+            if status == status::CACHED {
+                panic!("Already processed");
+                // continue;
+            }
+
+            let generations_log2 = self.generations_per_update_log2.unwrap();
+            let both_stages = generations_log2 + 2 >= task.size_log2;
+            let result = if task.size_log2 == LEAF_SIZE_LOG2 + 1 {
+                let steps = if both_stages {
+                    LEAF_SIZE / 2
+                } else {
+                    1 << generations_log2
+                };
+                self.update_leaves(n.nw, n.ne, n.sw, n.se, steps)
+            } else {
+                let mut arr9;
+                if both_stages {
+                    arr9 = self.nine_children_overlapping(n.nw, n.ne, n.sw, n.se);
+                    let mut should_reschedule = false;
+                    for x in arr9.iter_mut() {
+                        let n = self.mem.get(*x);
+                        if n.status.load(Ordering::Acquire) == status::CACHED {
+                            *x = unsafe { *n.cache.get() };
+                        } else {
+                            should_reschedule = true;
+                            if !processing.contains(x) {
+                                queue.push_back(Task {
+                                    node: *x,
+                                    size_log2: task.size_log2 - 1,
+                                });
+                                processing.insert(*x);
+                            }
+                        }
+                    }
+                    if should_reschedule {
+                        queue.push_front(task);
+                        continue;
+                    }
+                } else {
+                    arr9 = self.nine_children_disjoint(n.nw, n.ne, n.sw, n.se, task.size_log2 - 1);
+                }
+
+                let mut arr4 = self.four_children_overlapping(&arr9);
+                let mut should_reschedule = false;
+                for x in arr4.iter_mut() {
+                    let n = self.mem.get(*x);
+                    if n.status.load(Ordering::Acquire) == status::CACHED {
+                        *x = unsafe { *n.cache.get() };
+                    } else {
+                        should_reschedule = true;
+                        if !processing.contains(x) {
+                            queue.push_back(Task {
+                                node: *x,
+                                size_log2: task.size_log2 - 1,
+                            });
+                            processing.insert(*x);
+                        }
+                    }
+                }
+                if should_reschedule {
+                    queue.push_front(task);
+                    continue;
+                }
+
+                processing.remove(&task.node);
+                self.mem
+                    .find_or_create_node(arr4[0], arr4[1], arr4[2], arr4[3])
+            };
+
+            unsafe { *n.cache.get() = result };
+            n.status.store(status::CACHED, Ordering::Release);
+        }
+
+        println!("Max processing size: {}", max_processing_size);
+
+        let n = self.mem.get(self.root);
+        assert_eq!(n.status.load(Ordering::Acquire), status::CACHED);
+        unsafe { *n.cache.get() }
     }
 
     fn update_inner_async(
@@ -510,16 +613,18 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         }
 
         self.root = {
-            let mut builder = tokio::runtime::Builder::new_multi_thread();
-            let threads = WORKER_THREADS.load(Ordering::Relaxed);
-            if threads > 0 {
-                builder.worker_threads(WORKER_THREADS.load(Ordering::Relaxed) as usize);
-            }
+            // let mut builder = tokio::runtime::Builder::new_multi_thread();
+            // let threads = WORKER_THREADS.load(Ordering::Relaxed);
+            // if threads > 0 {
+            //     builder.worker_threads(WORKER_THREADS.load(Ordering::Relaxed) as usize);
+            // }
 
-            builder
-                .build()
-                .unwrap()
-                .block_on(async { self.update_node_async(self.root, self.size_log2).await })
+            // builder
+            //     .build()
+            //     .unwrap()
+            //     .block_on(async { self.update_node_async(self.root, self.size_log2).await })
+            self.run_executor()
+            // self.update_node_sync(self.root, self.size_log2)
         };
         if ExecutionStatistics::is_poisoned() {
             self.load_pattern(&backup, self.topology)?;
