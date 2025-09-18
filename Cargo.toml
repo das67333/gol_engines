@@ -40,7 +40,13 @@ num-format = { version = "0.4", features = [
 ], optional = true }
 
 [dev-dependencies]
+criterion = "0.7"
+crossbeam-channel = "0.5"
 serial_test = "3.2"
 
 [profile.release]
 debug = true
+
+[[bench]]
+name = "channel_throughput"
+harness = false
