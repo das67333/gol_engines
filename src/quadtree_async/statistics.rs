@@ -15,7 +15,7 @@ static ACTIVE_TASKS_COUNT: AtomicU64 = AtomicU64::new(0);
 const MAX_TRACKED_CONTAINERS: usize = 2;
 
 /// Global accumulated lengths flushed from all threads.
-static LENGTH_GLOBAL_COUNT: [AtomicUsize; MAX_TRACKED_CONTAINERS] =
+pub static LENGTH_GLOBAL_COUNT: [AtomicUsize; MAX_TRACKED_CONTAINERS] =
     [AtomicUsize::new(0), AtomicUsize::new(0)];
 
 thread_local! {

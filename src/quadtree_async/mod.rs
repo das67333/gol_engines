@@ -3,13 +3,13 @@ mod hashlife;
 mod memory;
 mod node;
 mod statistics;
-mod streamlife;
-mod streamlife_cache;
+// mod streamlife;
+// mod streamlife_cache;
 
 mod status {
-    pub(super) const NOT_CACHED: u8 = 0;
-    pub(super) const PROCESSING: u8 = 1;
-    pub(super) const CACHED: u8 = 2;
+    pub(super) const NOT_CACHED: usize = 0;
+    pub(super) const CACHED: usize = 1;
+    pub(super) const PROCESSING: usize = 2;
 }
 
 const LEAF_SIZE: u64 = 8;
@@ -19,7 +19,7 @@ use blank::BlankNodes;
 use memory::MemoryManager;
 use node::{NodeIdx, QuadTreeNode};
 use statistics::{ExecutionStatistics, TasksCountGuard};
-use streamlife_cache::{CacheEntry, StreamLifeCache};
+// use streamlife_cache::{CacheEntry, StreamLifeCache};
 
-pub use streamlife::StreamLifeEngineAsync;
+// pub use streamlife::StreamLifeEngineAsync;
 pub type HashLifeEngineAsync = hashlife::HashLifeEngineAsync<()>;

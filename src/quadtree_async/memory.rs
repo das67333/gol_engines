@@ -6,7 +6,7 @@ pub(super) struct MemoryManager<Extra> {
     base: UnsafeCell<MemoryManagerRaw<Extra>>,
 }
 
-unsafe impl<Extra> Sync for MemoryManager<Extra> {}
+unsafe impl<Extra: Sync> Sync for MemoryManager<Extra> {}
 
 impl<Extra: Default> MemoryManager<Extra> {
     /// Create a new memory manager with a capacity of `1 << cap_log2`.

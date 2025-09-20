@@ -4,7 +4,7 @@ use std::sync::atomic::*;
 
 fn main() {
     let timer = std::time::Instant::now();
-    let mut engine = HashLifeEngineAsync::new(3 << 10);
+    let mut engine = HashLifeEngineAsync::new(5 << 10);
     println!("Time spent on initializing engine: {:?}", timer.elapsed());
     
     let timer = std::time::Instant::now();

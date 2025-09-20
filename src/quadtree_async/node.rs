@@ -1,6 +1,6 @@
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicU8},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize},
 };
 
 /// Location of a node is determined by its `idx`.
@@ -9,20 +9,29 @@ pub(super) struct NodeIdx(pub(super) u32);
 
 /// A node of the quadtree.
 ///
-/// If the node is a leaf, `nw` and `ne` are the data.
+/// If the node is a leaf, `nw` and `ne` encode cells (8x8).
 #[derive(Debug, Default)]
 pub(super) struct QuadTreeNode<Extra> {
+    // read-only after creation
     pub(super) nw: NodeIdx,
     pub(super) ne: NodeIdx,
     pub(super) sw: NodeIdx,
     pub(super) se: NodeIdx,
+
+    // status for cache field: NOT_CACHED, CACHED or pointer to ProcessingData
+    pub(super) status: AtomicUsize,
     /// valid only if `status` is `STATUS_CACHED`
     pub(super) cache: UnsafeCell<NodeIdx>,
-    pub(super) status: AtomicU8,
+    // encodes `is_leaf` and `is_used`
     pub(super) flags: u8,
+    // synchronization between hashtable insertions
     pub(super) lock: AtomicBool,
-    pub(super) status_extra: AtomicU8,   // status for extra
-    pub(super) extra: UnsafeCell<Extra>, // extra information for engine: () for hashlife and u64 for streamlife
+
+    // fields for streamlife
+    // status for extra
+    // pub(super) status_extra: AtomicUsize,
+    // extra information for engine: () for hashlife and u64 for streamlife
+    pub(super) extra: UnsafeCell<Extra>,
 }
 
 unsafe impl<Extra> Sync for QuadTreeNode<Extra> {}

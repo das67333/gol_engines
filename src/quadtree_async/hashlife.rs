@@ -6,8 +6,9 @@ use crate::{quadtree_async::TasksCountGuard, GoLEngine, Pattern, PatternNode, To
 use ahash::AHashMap as HashMap;
 use anyhow::{anyhow, Result};
 use num_bigint::BigInt;
+use smallvec::{smallvec, SmallVec};
 use std::{
-    collections::{HashSet, VecDeque},
+    alloc::{alloc, dealloc, Layout},
     future::Future,
     hint::spin_loop,
     pin::Pin,
@@ -229,33 +230,55 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
         }
     }
 
-    fn run_executor(&mut self) -> NodeIdx {
+    #[inline(never)]
+    fn run_executor(&self) -> NodeIdx {
         struct Task {
             node: NodeIdx,
             size_log2: u32,
         }
 
-        let mut queue = VecDeque::new();
-        let mut processing = HashSet::new();
-        queue.push_front(Task {
-            node: self.root,
-            size_log2: self.size_log2,
-        });
-        processing.insert(self.root);
-        let mut max_processing_size = 0;
+        type Dependents = SmallVec<[NodeIdx; 2]>;
 
-        while let Some(task) = queue.pop_back() {
-            max_processing_size = max_processing_size.max(processing.len());
-            let n = self.mem.get(task.node);
-            let status = n.status.load(Ordering::Acquire);
-            if status == status::CACHED {
-                panic!("Already processed");
-                // continue;
+        #[derive(Clone, Default)]
+        struct ProcessingData {
+            arr: [NodeIdx; 9],
+            mask9_waiting: u32,
+            mask4_waiting: u32,
+            waiting_cnt: u32,
+            dependents: Dependents,
+        }
+
+        fn build_status_processing(dependents: Dependents) -> usize {
+            unsafe {
+                let ptr = alloc(Layout::new::<ProcessingData>()) as *mut _;
+                let pd = ProcessingData {
+                    dependents,
+                    ..Default::default()
+                };
+                std::ptr::write(ptr, pd);
+                ptr as usize
             }
+        }
+
+        let mut queue = Vec::new();
+        {
+            // initialize first task
+            queue.push(Task {
+                node: self.root,
+                size_log2: self.size_log2,
+            });
+            let n = self.mem.get(self.root);
+            let status_processing = build_status_processing(smallvec![]);
+            n.status.store(status_processing, Ordering::Relaxed);
+        }
+
+        while let Some(task) = queue.pop() {
+            let n = self.mem.get(task.node);
 
             let generations_log2 = self.generations_per_update_log2.unwrap();
             let both_stages = generations_log2 + 2 >= task.size_log2;
             let result = if task.size_log2 == LEAF_SIZE_LOG2 + 1 {
+                // base case: node consists of leaves
                 let steps = if both_stages {
                     LEAF_SIZE / 2
                 } else {
@@ -263,68 +286,127 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
                 };
                 self.update_leaves(n.nw, n.ne, n.sw, n.se, steps)
             } else {
-                let mut arr9;
-                if both_stages {
-                    arr9 = self.nine_children_overlapping(n.nw, n.ne, n.sw, n.se);
-                    let mut should_reschedule = false;
-                    for x in arr9.iter_mut() {
-                        let n = self.mem.get(*x);
-                        if n.status.load(Ordering::Acquire) == status::CACHED {
-                            *x = unsafe { *n.cache.get() };
-                        } else {
-                            should_reschedule = true;
-                            if !processing.contains(x) {
-                                queue.push_back(Task {
+                let data =
+                    unsafe { &mut *(n.status.load(Ordering::Relaxed) as *mut ProcessingData) };
+
+                if data.mask4_waiting == 0 {
+                    // arr4 is not ready
+                    if !both_stages {
+                        data.arr =
+                            self.nine_children_disjoint(n.nw, n.ne, n.sw, n.se, task.size_log2 - 1);
+                    } else {
+                        if data.mask9_waiting == 0 {
+                            data.arr = self.nine_children_overlapping(n.nw, n.ne, n.sw, n.se);
+                            data.mask9_waiting = 0b1_1111_1111;
+                        }
+
+                        let mut waiting_cnt = 0;
+                        for (i, x) in data.arr.iter_mut().enumerate() {
+                            if data.mask9_waiting & (1 << i) == 0 {
+                                continue;
+                            }
+
+                            let node = self.mem.get(*x);
+                            let status = node.status.load(Ordering::Relaxed);
+                            if status == status::CACHED {
+                                data.mask9_waiting &= !(1 << i);
+                                *x = unsafe { *node.cache.get() };
+                                continue;
+                            }
+
+                            waiting_cnt += 1;
+                            if status == status::NOT_CACHED {
+                                queue.push(Task {
                                     node: *x,
                                     size_log2: task.size_log2 - 1,
                                 });
-                                processing.insert(*x);
+                                let status_processing =
+                                    build_status_processing(smallvec![task.node]);
+                                node.status.store(status_processing, Ordering::Relaxed);
+                                continue;
                             }
+
+                            // node we need is already processing
+                            let pd = unsafe { &mut *(status as *mut ProcessingData) };
+                            pd.dependents.push(task.node);
+                        }
+
+                        if data.mask9_waiting != 0 {
+                            data.waiting_cnt = waiting_cnt;
+                            // node is waiting its dependencies
+                            continue;
                         }
                     }
-                    if should_reschedule {
-                        queue.push_front(task);
-                        continue;
-                    }
-                } else {
-                    arr9 = self.nine_children_disjoint(n.nw, n.ne, n.sw, n.se, task.size_log2 - 1);
+
+                    let arr4 = self.four_children_overlapping(&data.arr);
+                    data.arr[..4].copy_from_slice(&arr4);
+                    data.mask4_waiting = 0b1111;
                 }
 
-                let mut arr4 = self.four_children_overlapping(&arr9);
-                let mut should_reschedule = false;
-                for x in arr4.iter_mut() {
-                    let n = self.mem.get(*x);
-                    if n.status.load(Ordering::Acquire) == status::CACHED {
-                        *x = unsafe { *n.cache.get() };
-                    } else {
-                        should_reschedule = true;
-                        if !processing.contains(x) {
-                            queue.push_back(Task {
-                                node: *x,
-                                size_log2: task.size_log2 - 1,
-                            });
-                            processing.insert(*x);
-                        }
+                let mut waiting_cnt = 0;
+                for (i, x) in data.arr.iter_mut().take(4).enumerate() {
+                    if data.mask4_waiting & (1 << i) == 0 {
+                        continue;
                     }
+
+                    let node = self.mem.get(*x);
+                    let status = node.status.load(Ordering::Relaxed);
+                    if status == status::CACHED {
+                        data.mask4_waiting &= !(1 << i);
+                        *x = unsafe { *node.cache.get() };
+                        continue;
+                    }
+
+                    waiting_cnt += 1;
+                    if status == status::NOT_CACHED {
+                        queue.push(Task {
+                            node: *x,
+                            size_log2: task.size_log2 - 1,
+                        });
+                        let status_processing = build_status_processing(smallvec![task.node]);
+                        node.status.store(status_processing, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    // node we need is already processing
+                    let pd = unsafe { &mut *(status as *mut ProcessingData) };
+                    pd.dependents.push(task.node);
                 }
-                if should_reschedule {
-                    queue.push_front(task);
+
+                if data.mask4_waiting != 0 {
+                    data.waiting_cnt = waiting_cnt;
                     continue;
                 }
 
-                processing.remove(&task.node);
                 self.mem
-                    .find_or_create_node(arr4[0], arr4[1], arr4[2], arr4[3])
+                    .find_or_create_node(data.arr[0], data.arr[1], data.arr[2], data.arr[3])
             };
 
             unsafe { *n.cache.get() = result };
-            n.status.store(status::CACHED, Ordering::Release);
+            let old_status = n.status.swap(status::CACHED, Ordering::Relaxed); // TODO: mem order?
+            let pd = unsafe { &mut *(old_status as *mut ProcessingData) };
+            for &dependent in pd.dependents.iter() {
+                let n = self.mem.get(dependent);
+                let data_ref =
+                    unsafe { &mut *(n.status.load(Ordering::Relaxed) as *mut ProcessingData) };
+                data_ref.waiting_cnt -= 1;
+                if data_ref.waiting_cnt == 0 {
+                    queue.push(Task {
+                        node: dependent,
+                        size_log2: task.size_log2 + 1,
+                    });
+                }
+            }
+            unsafe { dealloc(old_status as *mut _, Layout::new::<ProcessingData>()) };
         }
 
-        println!("Max processing size: {}", max_processing_size);
+        println!(
+            "Nodes count: {}",
+            crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::Relaxed)
+        );
 
         let n = self.mem.get(self.root);
-        assert_eq!(n.status.load(Ordering::Acquire), status::CACHED);
+        assert_eq!(n.status.load(Ordering::Relaxed), status::CACHED);
         unsafe { *n.cache.get() }
     }
 

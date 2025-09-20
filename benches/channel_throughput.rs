@@ -5,7 +5,7 @@ use std::thread;
 // Let's model NodeIdx as a u32 for the benchmark.
 type NodeIdx = u32;
 
-const NUM_ITEMS: u64 = 100_000; // Total items to push/pop in one run.
+const NUM_ITEMS: u64 = 1_000; // Total items to push/pop in one run.
 
 /// The core logic for one benchmark run.
 /// Spawns a configurable number of producer and consumer threads.

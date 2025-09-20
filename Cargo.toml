@@ -28,9 +28,11 @@ name = "bench_dev"
 ahash = "0.8"
 anyhow = "1.0"
 flate2 = "1.1"
+mimalloc = "0.1"
 num-bigint = "0.4"
 rand = "0.9"
 rand_chacha = "0.9"
+smallvec = "1.15"
 tokio = { version = "1.44", features = ["rt-multi-thread", "sync"] }
 
 chrono = { version = "0.4", optional = true }
@@ -42,11 +44,13 @@ num-format = { version = "0.4", features = [
 [dev-dependencies]
 criterion = "0.7"
 crossbeam-channel = "0.5"
+libc = "0.2"
 serial_test = "3.2"
-
-[profile.release]
-debug = true
 
 [[bench]]
 name = "channel_throughput"
+harness = false
+
+[[bench]]
+name = "measure_duration"
 harness = false

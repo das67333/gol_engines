@@ -1,0 +1,26 @@
+target/release/gol_engines_cli update \
+    res/very_large_patterns/0e0p-metaglider.mc.gz \
+    --output=res/temp.mc.gz \
+    --population \
+    --engine=hashlife-st \
+    --mem-limit-gib=12 \
+    --gens-log2=12
+
+flamegraph --
+
+cargo instruments --release \
+    --bin gol_engines_cli \
+    --features=cli_deps \
+    --template "Time Profiler" \
+    -- update \
+    res/very_large_patterns/0e0p-metaglider.mc.gz \
+    --output=res/temp.mc.gz \
+    --population \
+    --mem-limit-gib=12 \
+    --workers=6 \
+    --engine=hashlife \
+    --gens-log2=10
+
+cargo instruments --template "Time Profiler" --attach 15365 --open
+
+xcrun xctrace record --template "Time Profiler" --attach $(pgrep gol_engines_cli) --output trace.trace && open trace.trace && rm trace.trace
