@@ -1,5 +1,6 @@
 mod blank;
 mod hashlife;
+mod hashlife_executor;
 mod memory;
 mod node;
 mod statistics;
