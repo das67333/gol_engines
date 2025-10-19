@@ -1,6 +1,6 @@
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize},
 };
 
 /// Location of a node is determined by its `idx`.
@@ -18,14 +18,16 @@ pub(super) struct QuadTreeNode<Extra> {
     pub(super) sw: NodeIdx,
     pub(super) se: NodeIdx,
 
-    // status for cache field: NOT_CACHED, CACHED or pointer to ProcessingData
-    pub(super) status: AtomicUsize,
-    /// valid only if `status` is `STATUS_CACHED`
+    /// pointer to additional information for processing
+    pub(super) ptr: AtomicUsize, // TODO: unite with cache
+    /// status for cache field (see `mod status` in mod.rs)
+    pub(super) status: AtomicU8,
+    /// valid only if `status` is `status::STATUS_CACHED`
     pub(super) cache: UnsafeCell<NodeIdx>,
-    // encodes `is_leaf` and `is_used`
+    /// encodes `is_leaf` and `is_used`
     pub(super) flags: u8,
-    // synchronization between hashtable insertions
-    pub(super) lock: AtomicBool,
+    /// synchronization between hashtable insertions
+    pub(super) lock_ht_slot: AtomicBool,
 
     // fields for streamlife
     // status for extra

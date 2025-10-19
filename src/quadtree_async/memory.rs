@@ -147,7 +147,7 @@ impl<Extra: Default> MemoryManagerRaw<Extra> {
 
         loop {
             // First check if we can acquire the lock for this index
-            let lock = &(*self.hashtable.as_mut_ptr().add(index)).lock;
+            let lock = &(*self.hashtable.as_mut_ptr().add(index)).lock_ht_slot;
 
             while lock
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)

@@ -1,25 +1,26 @@
 use super::{
-    hashlife::HashLifeEngineAsync, status, MemoryManager, NodeIdx, LEAF_SIZE, LEAF_SIZE_LOG2,
+    hashlife::HashLifeEngineAsync, status, MemoryManager, NodeIdx, QuadTreeNode, LEAF_SIZE,
+    LEAF_SIZE_LOG2,
 };
 use smallvec::{smallvec, SmallVec};
 use std::{
     alloc::{alloc, dealloc, Layout},
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 struct Task {
-    node: NodeIdx,
+    idx: NodeIdx,
     size_log2: u32,
 }
 
 type Dependents = SmallVec<[NodeIdx; 2]>;
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct ProcessingData {
     arr: [NodeIdx; 9],
     mask9_waiting: u32,
     mask4_waiting: u32,
-    waiting_cnt: u32,
+    waiting_cnt: AtomicU32,
     dependents: Dependents,
 }
 
@@ -42,19 +43,17 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
 
     pub(super) fn run(&self) -> NodeIdx {
         let mut queue = Vec::new();
-        {
-            // initialize first task
-            queue.push(Task {
-                node: self.root,
-                size_log2: self.size_log2,
-            });
-            let n = self.mem.get(self.root);
-            let status_processing = Self::build_status_processing(smallvec![]);
-            n.status.store(status_processing, Ordering::Relaxed);
-        }
+        Self::start_processing_node(
+            &mut queue,
+            self.root,
+            self.size_log2,
+            self.mem.get(self.root),
+            smallvec![],
+        );
 
         while let Some(task) = queue.pop() {
-            let n = self.mem.get(task.node);
+            let n = self.mem.get(task.idx);
+            let data = Self::get_mut_processing_data(n);
 
             let both_stages = self.generations_log2 + 2 >= task.size_log2;
             let result = if task.size_log2 == LEAF_SIZE_LOG2 + 1 {
@@ -66,9 +65,6 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                 };
                 self.update_leaves(n.nw, n.ne, n.sw, n.se, steps)
             } else {
-                let data =
-                    unsafe { &mut *(n.status.load(Ordering::Relaxed) as *mut ProcessingData) };
-
                 if data.mask4_waiting == 0 {
                     // arr4 is not ready
                     if !both_stages {
@@ -86,33 +82,32 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                                 continue;
                             }
 
-                            let node = self.mem.get(*x);
-                            let status = node.status.load(Ordering::Relaxed);
+                            let d = self.mem.get(*x);
+                            let status = d.status.load(Ordering::Relaxed); // Acquire?
                             if status == status::CACHED {
                                 data.mask9_waiting &= !(1 << i);
-                                *x = unsafe { *node.cache.get() };
+                                *x = unsafe { *d.cache.get() };
                                 continue;
                             }
 
                             waiting_cnt += 1;
                             if status == status::NOT_CACHED {
-                                queue.push(Task {
-                                    node: *x,
-                                    size_log2: task.size_log2 - 1,
-                                });
-                                let status_processing =
-                                    Self::build_status_processing(smallvec![task.node]);
-                                node.status.store(status_processing, Ordering::Relaxed);
+                                Self::start_processing_node(
+                                    &mut queue,
+                                    *x,
+                                    task.size_log2 - 1,
+                                    d,
+                                    smallvec![task.idx],
+                                );
                                 continue;
                             }
 
                             // node we need is already processing
-                            let pd = unsafe { &mut *(status as *mut ProcessingData) };
-                            pd.dependents.push(task.node);
+                            Self::append_dependent(d, &task);
                         }
 
                         if data.mask9_waiting != 0 {
-                            data.waiting_cnt = waiting_cnt;
+                            data.waiting_cnt.store(waiting_cnt, Ordering::Relaxed);
                             // node is waiting its dependencies
                             continue;
                         }
@@ -129,32 +124,32 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                         continue;
                     }
 
-                    let node = self.mem.get(*x);
-                    let status = node.status.load(Ordering::Relaxed);
+                    let d = self.mem.get(*x);
+                    let status = d.status.load(Ordering::Relaxed);
                     if status == status::CACHED {
                         data.mask4_waiting &= !(1 << i);
-                        *x = unsafe { *node.cache.get() };
+                        *x = unsafe { *d.cache.get() };
                         continue;
                     }
 
                     waiting_cnt += 1;
                     if status == status::NOT_CACHED {
-                        queue.push(Task {
-                            node: *x,
-                            size_log2: task.size_log2 - 1,
-                        });
-                        let status_processing = Self::build_status_processing(smallvec![task.node]);
-                        node.status.store(status_processing, Ordering::Relaxed);
+                        Self::start_processing_node(
+                            &mut queue,
+                            *x,
+                            task.size_log2 - 1,
+                            d,
+                            smallvec![task.idx],
+                        );
                         continue;
                     }
 
                     // node we need is already processing
-                    let pd = unsafe { &mut *(status as *mut ProcessingData) };
-                    pd.dependents.push(task.node);
+                    Self::append_dependent(d, &task);
                 }
 
                 if data.mask4_waiting != 0 {
-                    data.waiting_cnt = waiting_cnt;
+                    data.waiting_cnt.store(waiting_cnt, Ordering::Relaxed);
                     continue;
                 }
 
@@ -163,21 +158,25 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             };
 
             unsafe { *n.cache.get() = result };
-            let old_status = n.status.swap(status::CACHED, Ordering::Relaxed); // TODO: mem order?
-            let pd = unsafe { &mut *(old_status as *mut ProcessingData) };
-            for &dependent in pd.dependents.iter() {
+            n.status.store(status::FINISHING_PROCESSING, Ordering::Relaxed); // TODO: mem order?
+            for &dependent in data.dependents.iter() {
                 let n = self.mem.get(dependent);
-                let data_ref =
-                    unsafe { &mut *(n.status.load(Ordering::Relaxed) as *mut ProcessingData) };
-                data_ref.waiting_cnt -= 1;
-                if data_ref.waiting_cnt == 0 {
+                assert!(n.status.load(Ordering::Relaxed) == status::PROCESSING);
+                let dep_data = Self::get_mut_processing_data(n);
+                if dep_data.waiting_cnt.fetch_sub(1, Ordering::Relaxed) == 1 {
                     queue.push(Task {
-                        node: dependent,
+                        idx: dependent,
                         size_log2: task.size_log2 + 1,
                     });
                 }
             }
-            unsafe { dealloc(old_status as *mut _, Layout::new::<ProcessingData>()) };
+            unsafe {
+                dealloc(
+                    data as *mut ProcessingData as *mut u8,
+                    Layout::new::<ProcessingData>(),
+                )
+            };
+            n.status.store(status::CACHED, Ordering::Relaxed);
         }
 
         println!(
@@ -190,7 +189,8 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         unsafe { *n.cache.get() }
     }
 
-    fn build_status_processing(dependents: Dependents) -> usize {
+    #[inline]
+    fn build_processing_data(dependents: Dependents) -> usize {
         unsafe {
             let ptr = alloc(Layout::new::<ProcessingData>()) as *mut _;
             let pd = ProcessingData {
@@ -200,6 +200,56 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             std::ptr::write(ptr, pd);
             ptr as usize
         }
+    }
+
+    #[inline]
+    fn start_processing_node(
+        queue: &mut Vec<Task>,
+        idx: NodeIdx,
+        size_log2: u32,
+        node: &QuadTreeNode<Extra>,
+        dependents: Dependents,
+    ) {
+        if node
+            .status
+            .compare_exchange(
+                status::NOT_CACHED,
+                status::STARTING_PROCESSING,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        node.ptr
+            .store(Self::build_processing_data(dependents), Ordering::Relaxed);
+        node.status.store(status::PROCESSING, Ordering::Relaxed);
+        queue.push(Task { idx, size_log2 });
+    }
+
+    #[inline]
+    fn append_dependent(n: &QuadTreeNode<Extra>, task: &Task) {
+        while n
+            .status
+            .compare_exchange_weak(
+                status::PROCESSING,
+                status::UPDATING_DEPENDENTS,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            // wait
+        }
+        let pd = Self::get_mut_processing_data(n);
+        pd.dependents.push(task.idx);
+        n.status.store(status::PROCESSING, Ordering::Relaxed);
+    }
+
+    fn get_mut_processing_data(node: &QuadTreeNode<Extra>) -> &mut ProcessingData {
+        unsafe { &mut *(node.ptr.load(Ordering::Relaxed) as *mut _) }
     }
 
     fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {

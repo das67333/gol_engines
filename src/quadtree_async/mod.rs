@@ -8,9 +8,12 @@ mod statistics;
 // mod streamlife_cache;
 
 mod status {
-    pub(super) const NOT_CACHED: usize = 0;
-    pub(super) const CACHED: usize = 1;
-    pub(super) const PROCESSING: usize = 2;
+    pub(super) const NOT_CACHED: u8 = 0;
+    pub(super) const STARTING_PROCESSING: u8 = 1;
+    pub(super) const PROCESSING: u8 = 2;
+    pub(super) const UPDATING_DEPENDENTS: u8 = 3;
+    pub(super) const FINISHING_PROCESSING: u8 = 4;
+    pub(super) const CACHED: u8 = 5;
 }
 
 const LEAF_SIZE: u64 = 8;
