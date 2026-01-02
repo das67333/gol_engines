@@ -1,6 +1,6 @@
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize},
+    sync::atomic::{AtomicBool, AtomicU8},
 };
 
 /// Location of a node is determined by its `idx`.
@@ -19,11 +19,10 @@ pub(super) struct QuadTreeNode<Extra> {
     pub(super) se: NodeIdx,
 
     /// pointer to additional information for processing
-    pub(super) ptr: AtomicUsize, // TODO: unite with cache
+    /// or cached result of the update (if `status` is `status::STATUS_CACHED`)
+    pub(super) cache: PtrOrNodeIdxMut,
     /// status for cache field (see `mod status` in mod.rs)
     pub(super) status: AtomicU8,
-    /// valid only if `status` is `status::STATUS_CACHED`
-    pub(super) cache: UnsafeCell<NodeIdx>,
     /// encodes `is_leaf` and `is_used`
     pub(super) flags: u8,
     /// synchronization between hashtable insertions
@@ -34,6 +33,42 @@ pub(super) struct QuadTreeNode<Extra> {
     // pub(super) status_extra: AtomicUsize,
     // extra information for engine: () for hashlife and u64 for streamlife
     pub(super) extra: UnsafeCell<Extra>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct PtrOrNodeIdxMut(UnsafeCell<PtrOrNodeIdx>);
+
+impl PtrOrNodeIdxMut {
+    pub(super) fn new() -> Self {
+        PtrOrNodeIdxMut(UnsafeCell::new(PtrOrNodeIdx { ptr: 0 }))
+    }
+
+    pub(super) fn get_node_idx(&self) -> NodeIdx {
+        unsafe { (*self.0.get()).node }
+    }
+
+    pub(super) fn set_node_idx(&self, node: NodeIdx) {
+        unsafe { (*self.0.get()).node = node }
+    }
+
+    pub(super) fn get_ptr(&self) -> usize {
+        unsafe { (*self.0.get()).ptr }
+    }
+
+    pub(super) fn set_ptr(&self, ptr: usize) {
+        unsafe { (*self.0.get()).ptr = ptr }
+    }
+}
+
+union PtrOrNodeIdx {
+    ptr: usize,
+    node: NodeIdx,
+}
+
+impl Default for PtrOrNodeIdx {
+    fn default() -> Self {
+        PtrOrNodeIdx { ptr: 0 }
+    }
 }
 
 unsafe impl<Extra> Sync for QuadTreeNode<Extra> {}

@@ -86,7 +86,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                             let status = d.status.load(Ordering::Relaxed); // Acquire?
                             if status == status::CACHED {
                                 data.mask9_waiting &= !(1 << i);
-                                *x = unsafe { *d.cache.get() };
+                                *x = d.cache.get_node_idx();
                                 continue;
                             }
 
@@ -128,7 +128,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                     let status = d.status.load(Ordering::Relaxed);
                     if status == status::CACHED {
                         data.mask4_waiting &= !(1 << i);
-                        *x = unsafe { *d.cache.get() };
+                        *x = d.cache.get_node_idx();
                         continue;
                     }
 
@@ -157,7 +157,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                     .find_or_create_node(data.arr[0], data.arr[1], data.arr[2], data.arr[3])
             };
 
-            unsafe { *n.cache.get() = result };
+            n.cache.set_node_idx(result);
             n.status.store(status::FINISHING_PROCESSING, Ordering::Relaxed); // TODO: mem order?
             for &dependent in data.dependents.iter() {
                 let n = self.mem.get(dependent);
@@ -186,7 +186,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
 
         let n = self.mem.get(self.root);
         assert_eq!(n.status.load(Ordering::Relaxed), status::CACHED);
-        unsafe { *n.cache.get() }
+        n.cache.get_node_idx()
     }
 
     #[inline]
@@ -223,8 +223,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             return;
         }
 
-        node.ptr
-            .store(Self::build_processing_data(dependents), Ordering::Relaxed);
+        node.cache.set_ptr(Self::build_processing_data(dependents));
         node.status.store(status::PROCESSING, Ordering::Relaxed);
         queue.push(Task { idx, size_log2 });
     }
@@ -249,7 +248,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     }
 
     fn get_mut_processing_data(node: &QuadTreeNode<Extra>) -> &mut ProcessingData {
-        unsafe { &mut *(node.ptr.load(Ordering::Relaxed) as *mut _) }
+        unsafe { &mut *(node.cache.get_ptr() as *mut _) }
     }
 
     fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {

@@ -196,7 +196,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
         let n = self.mem.get(node);
         let status = n.status.load(Ordering::Acquire);
         if status == status::CACHED {
-            return unsafe { *n.cache.get() };
+            return n.cache.get_node_idx();
         }
 
         if status == status::NOT_CACHED
@@ -210,7 +210,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
                 .is_ok()
         {
             let cache = self.update_inner_sync(node, size_log2);
-            unsafe { *n.cache.get() = cache };
+            n.cache.set_node_idx(cache);
             n.status.store(status::CACHED, Ordering::Release);
             cache
         } else {
@@ -220,7 +220,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
                 }
                 spin_loop();
             }
-            unsafe { *n.cache.get() }
+            n.cache.get_node_idx()
         }
     }
 
@@ -300,7 +300,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
         let n = self.mem.get(node);
         let status = n.status.load(Ordering::Acquire);
         if status == status::CACHED {
-            return unsafe { *n.cache.get() };
+            return n.cache.get_node_idx();
         }
 
         if status == status::NOT_CACHED
@@ -318,7 +318,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
             } else {
                 self.update_inner_sync(node, size_log2)
             };
-            unsafe { *n.cache.get() = cache };
+            n.cache.set_node_idx(cache);
             n.status.store(status::CACHED, Ordering::Release);
             cache
         } else {
@@ -328,7 +328,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
                 }
                 tokio::task::yield_now().await;
             }
-            unsafe { *n.cache.get() }
+            n.cache.get_node_idx()
         }
     }
 
