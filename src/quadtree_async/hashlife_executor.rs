@@ -54,80 +54,65 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         while let Some(task) = queue.pop() {
             let n = self.mem.get(task.idx);
             let data = Self::get_mut_processing_data(n);
+            if let Some(result) = self.update_node(&task, n.parts(), data, &mut queue)
+            {
+                n.cache.set_node_idx(result);
+                n.status
+                    .store(status::FINISHING_PROCESSING, Ordering::Relaxed); // TODO: mem order?
+                self.notify_dependents_and_deallocate(&task, data, &mut queue);
+                n.status.store(status::CACHED, Ordering::Relaxed);
+            }
+        }
 
-            let both_stages = self.generations_log2 + 2 >= task.size_log2;
-            let result = if task.size_log2 == LEAF_SIZE_LOG2 + 1 {
-                // base case: node consists of leaves
-                let steps = if both_stages {
-                    LEAF_SIZE / 2
-                } else {
-                    1 << self.generations_log2
-                };
-                self.update_leaves(n.nw, n.ne, n.sw, n.se, steps)
+        println!(
+            "Nodes count: {}",
+            crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::Relaxed)
+        );
+
+        let n = self.mem.get(self.root);
+        assert_eq!(n.status.load(Ordering::Relaxed), status::CACHED);
+        n.cache.get_node_idx()
+    }
+
+    fn update_node(
+        &self,
+        task: &Task,
+        parts: [NodeIdx; 4],
+        data: &mut ProcessingData,
+        queue: &mut Vec<Task>,
+    ) -> Option<NodeIdx> {
+        let both_stages = self.generations_log2 + 2 >= task.size_log2;
+        let [nw, ne, sw, se] = parts;
+        if task.size_log2 == LEAF_SIZE_LOG2 + 1 {
+            // base case: node consists of leaves
+            let steps = if both_stages {
+                LEAF_SIZE / 2
             } else {
-                if data.mask4_waiting == 0 {
-                    // arr4 is not ready
-                    if !both_stages {
-                        data.arr =
-                            self.nine_children_disjoint(n.nw, n.ne, n.sw, n.se, task.size_log2 - 1);
-                    } else {
-                        if data.mask9_waiting == 0 {
-                            data.arr = self.nine_children_overlapping(n.nw, n.ne, n.sw, n.se);
-                            data.mask9_waiting = 0b1_1111_1111;
-                        }
+                1 << self.generations_log2
+            };
+            return Some(self.update_leaves(nw, ne, sw, se, steps));
+        }
 
-                        let mut waiting_cnt = 0;
-                        for (i, x) in data.arr.iter_mut().enumerate() {
-                            if data.mask9_waiting & (1 << i) == 0 {
-                                continue;
-                            }
-
-                            let d = self.mem.get(*x);
-                            let status = d.status.load(Ordering::Relaxed); // Acquire?
-                            if status == status::CACHED {
-                                data.mask9_waiting &= !(1 << i);
-                                *x = d.cache.get_node_idx();
-                                continue;
-                            }
-
-                            waiting_cnt += 1;
-                            if status == status::NOT_CACHED {
-                                Self::start_processing_node(
-                                    &mut queue,
-                                    *x,
-                                    task.size_log2 - 1,
-                                    d,
-                                    smallvec![task.idx],
-                                );
-                                continue;
-                            }
-
-                            // node we need is already processing
-                            Self::append_dependent(d, &task);
-                        }
-
-                        if data.mask9_waiting != 0 {
-                            data.waiting_cnt.store(waiting_cnt, Ordering::Relaxed);
-                            // node is waiting its dependencies
-                            continue;
-                        }
-                    }
-
-                    let arr4 = self.four_children_overlapping(&data.arr);
-                    data.arr[..4].copy_from_slice(&arr4);
-                    data.mask4_waiting = 0b1111;
+        if data.mask4_waiting == 0 {
+            // arr4 is not ready
+            if !both_stages {
+                data.arr = self.nine_children_disjoint(nw, ne, sw, se, task.size_log2 - 1);
+            } else {
+                if data.mask9_waiting == 0 {
+                    data.arr = self.nine_children_overlapping(nw, ne, sw, se);
+                    data.mask9_waiting = 0b1_1111_1111;
                 }
 
                 let mut waiting_cnt = 0;
-                for (i, x) in data.arr.iter_mut().take(4).enumerate() {
-                    if data.mask4_waiting & (1 << i) == 0 {
+                for (i, x) in data.arr.iter_mut().enumerate() {
+                    if data.mask9_waiting & (1 << i) == 0 {
                         continue;
                     }
 
                     let d = self.mem.get(*x);
-                    let status = d.status.load(Ordering::Relaxed);
+                    let status = d.status.load(Ordering::Relaxed); // Acquire?
                     if status == status::CACHED {
-                        data.mask4_waiting &= !(1 << i);
+                        data.mask9_waiting &= !(1 << i);
                         *x = d.cache.get_node_idx();
                         continue;
                     }
@@ -135,7 +120,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                     waiting_cnt += 1;
                     if status == status::NOT_CACHED {
                         Self::start_processing_node(
-                            &mut queue,
+                            queue,
                             *x,
                             task.size_log2 - 1,
                             d,
@@ -148,45 +133,76 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                     Self::append_dependent(d, &task);
                 }
 
-                if data.mask4_waiting != 0 {
+                if data.mask9_waiting != 0 {
                     data.waiting_cnt.store(waiting_cnt, Ordering::Relaxed);
-                    continue;
-                }
-
-                self.mem
-                    .find_or_create_node(data.arr[0], data.arr[1], data.arr[2], data.arr[3])
-            };
-
-            n.cache.set_node_idx(result);
-            n.status.store(status::FINISHING_PROCESSING, Ordering::Relaxed); // TODO: mem order?
-            for &dependent in data.dependents.iter() {
-                let n = self.mem.get(dependent);
-                assert!(n.status.load(Ordering::Relaxed) == status::PROCESSING);
-                let dep_data = Self::get_mut_processing_data(n);
-                if dep_data.waiting_cnt.fetch_sub(1, Ordering::Relaxed) == 1 {
-                    queue.push(Task {
-                        idx: dependent,
-                        size_log2: task.size_log2 + 1,
-                    });
+                    // node is waiting its dependencies
+                    return None;
                 }
             }
-            unsafe {
-                dealloc(
-                    data as *mut ProcessingData as *mut u8,
-                    Layout::new::<ProcessingData>(),
-                )
-            };
-            n.status.store(status::CACHED, Ordering::Relaxed);
+
+            let arr4 = self.four_children_overlapping(&data.arr);
+            data.arr[..4].copy_from_slice(&arr4);
+            data.mask4_waiting = 0b1111;
         }
 
-        println!(
-            "Nodes count: {}",
-            crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::Relaxed)
-        );
+        let mut waiting_cnt = 0;
+        for (i, x) in data.arr.iter_mut().take(4).enumerate() {
+            if data.mask4_waiting & (1 << i) == 0 {
+                continue;
+            }
 
-        let n = self.mem.get(self.root);
-        assert_eq!(n.status.load(Ordering::Relaxed), status::CACHED);
-        n.cache.get_node_idx()
+            let d = self.mem.get(*x);
+            let status = d.status.load(Ordering::Relaxed);
+            if status == status::CACHED {
+                data.mask4_waiting &= !(1 << i);
+                *x = d.cache.get_node_idx();
+                continue;
+            }
+
+            waiting_cnt += 1;
+            if status == status::NOT_CACHED {
+                Self::start_processing_node(queue, *x, task.size_log2 - 1, d, smallvec![task.idx]);
+                continue;
+            }
+
+            // node we need is already processing
+            Self::append_dependent(d, &task);
+        }
+
+        if data.mask4_waiting != 0 {
+            data.waiting_cnt.store(waiting_cnt, Ordering::Relaxed);
+            return None;
+        }
+
+        Some(
+            self.mem
+                .find_or_create_node(data.arr[0], data.arr[1], data.arr[2], data.arr[3]),
+        )
+    }
+
+    fn notify_dependents_and_deallocate(
+        &self,
+        task: &Task,
+        data: &mut ProcessingData,
+        queue: &mut Vec<Task>,
+    ) {
+        for &dependent in data.dependents.iter() {
+            let n = self.mem.get(dependent);
+            assert!(n.status.load(Ordering::Relaxed) == status::PROCESSING);
+            let dep_data = Self::get_mut_processing_data(n);
+            if dep_data.waiting_cnt.fetch_sub(1, Ordering::Relaxed) == 1 {
+                queue.push(Task {
+                    idx: dependent,
+                    size_log2: task.size_log2 + 1,
+                });
+            }
+        }
+        unsafe {
+            dealloc(
+                data as *mut ProcessingData as *mut u8,
+                Layout::new::<ProcessingData>(),
+            )
+        };
     }
 
     #[inline]
