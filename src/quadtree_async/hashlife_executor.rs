@@ -54,13 +54,12 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         while let Some(task) = queue.pop() {
             let n = self.mem.get(task.idx);
             let data = Self::get_mut_processing_data(n);
-            if let Some(result) = self.update_node(&task, n.parts(), data, &mut queue)
-            {
+            if let Some(result) = self.update_node(&task, n.parts(), data, &mut queue) {
                 n.cache.set_node_idx(result);
                 n.status
                     .store(status::FINISHING_PROCESSING, Ordering::Relaxed); // TODO: mem order?
                 self.notify_dependents_and_deallocate(&task, data, &mut queue);
-                n.status.store(status::CACHED, Ordering::Relaxed);
+                n.status.store(status::CACHED, Ordering::Relaxed); // TODO: mem order?
             }
         }
 
@@ -93,6 +92,12 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             return Some(self.update_leaves(nw, ne, sw, se, steps));
         }
 
+        fn spin_until<F: Fn() -> bool>(f: F) {
+            while !f() {
+                std::hint::spin_loop();
+            }
+        }
+
         if data.mask4_waiting == 0 {
             // arr4 is not ready
             if !both_stages {
@@ -110,7 +115,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                     }
 
                     let d = self.mem.get(*x);
-                    let status = d.status.load(Ordering::Relaxed); // Acquire?
+                    let status = d.status.load(Ordering::Relaxed); // TODO: mem order?
                     if status == status::CACHED {
                         data.mask9_waiting &= !(1 << i);
                         *x = d.cache.get_node_idx();
@@ -118,16 +123,19 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                     }
 
                     waiting_cnt += 1;
-                    if status == status::NOT_CACHED {
-                        Self::start_processing_node(
+                    if status == status::NOT_CACHED
+                        && Self::start_processing_node(
                             queue,
                             *x,
                             task.size_log2 - 1,
                             d,
                             smallvec![task.idx],
-                        );
+                        )
+                    {
                         continue;
                     }
+
+                    spin_until(|| d.status.load(Ordering::Relaxed) == status::PROCESSING);
 
                     // node we need is already processing
                     Self::append_dependent(d, &task);
@@ -160,10 +168,19 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             }
 
             waiting_cnt += 1;
-            if status == status::NOT_CACHED {
-                Self::start_processing_node(queue, *x, task.size_log2 - 1, d, smallvec![task.idx]);
+            if status == status::NOT_CACHED
+                && Self::start_processing_node(
+                    queue,
+                    *x,
+                    task.size_log2 - 1,
+                    d,
+                    smallvec![task.idx],
+                )
+            {
                 continue;
             }
+
+            spin_until(|| d.status.load(Ordering::Relaxed) == status::PROCESSING);
 
             // node we need is already processing
             Self::append_dependent(d, &task);
@@ -225,7 +242,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         size_log2: u32,
         node: &QuadTreeNode<Extra>,
         dependents: Dependents,
-    ) {
+    ) -> bool {
         if node
             .status
             .compare_exchange(
@@ -236,12 +253,13 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             )
             .is_err()
         {
-            return;
+            return false;
         }
 
         node.cache.set_ptr(Self::build_processing_data(dependents));
         node.status.store(status::PROCESSING, Ordering::Relaxed);
         queue.push(Task { idx, size_log2 });
+        true
     }
 
     #[inline]

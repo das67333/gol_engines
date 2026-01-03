@@ -5,7 +5,7 @@ use std::thread;
 // Let's model NodeIdx as a u32 for the benchmark.
 type NodeIdx = u32;
 
-const NUM_ITEMS: u64 = 1_000; // Total items to push/pop in one run.
+const NUM_ITEMS: u64 = 1_000_000; // Total items to push/pop in one run.
 
 /// The core logic for one benchmark run.
 /// Spawns a configurable number of producer and consumer threads.
@@ -64,7 +64,7 @@ fn mpmc_throughput_benchmark(c: &mut Criterion) {
         let num_consumers = threads;
 
         group.bench_with_input(
-            BenchmarkId::new("Producers = Consumers", format!("{} Threads", threads)),
+            BenchmarkId::new("channel", format!("{} Threads", threads)),
             &(num_producers, num_consumers),
             |b, &(p, c)| {
                 b.iter(|| run_mpmc_test(p, c));

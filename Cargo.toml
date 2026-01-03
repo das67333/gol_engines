@@ -56,3 +56,7 @@ harness = false
 [[bench]]
 name = "measure_duration"
 harness = false
+
+[[bench]]
+name = "atomic_operations"
+harness = false
