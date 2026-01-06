@@ -6,7 +6,7 @@ use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use smallvec::{smallvec, SmallVec};
 use std::{
     hint,
-    sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
     thread,
     time::Duration,
 };
@@ -54,10 +54,6 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         }
     }
 
-    pub(super) fn is_finished(&self) -> bool {
-        self.mem.get(self.root).status.load(Ordering::Relaxed) == status::FINISHED
-    }
-
     pub(super) fn run(&self) -> NodeIdx {
         // Get number of threads
         let num_threads = 4; //thread::available_parallelism().map(|n| n.get()).unwrap();
@@ -76,7 +72,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             stealers.push(stealer);
         }
 
-        Self::start_processing_node(self.mem.get(self.root), smallvec![]);
+        start_processing_node(self.mem.get(self.root), smallvec![]);
         injector.push(Task::new(self.root, self.size_log2));
 
         thread::scope(|scope| {
@@ -92,7 +88,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::SeqCst)
         );
         println!("Max queue len: {}", MAX_LEN.load(Ordering::SeqCst));
-        assert!(self.is_finished());
+        assert!(is_finished(&self.mem.get(self.root).status));
 
         let n = self.mem.get(self.root);
         n.cache.get_node_idx()
@@ -105,6 +101,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         injector: &Injector<Task>,
         stealers: &[Stealer<Task>],
     ) {
+        let root_status = &self.mem.get(self.root).status;
         loop {
             while let Some(task) = Self::fetch_task(thread_id, worker, injector, stealers) {
                 // MAX_LEN.store(
@@ -115,7 +112,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                 self.process_task(task, injector);
             }
 
-            if self.is_finished() {
+            if is_finished(root_status) {
                 return;
             }
             println!("No tasks found for thread {}", thread_id);
@@ -162,15 +159,13 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
 
     fn process_task(&self, task: Task, queue: &Queue<Task>) {
         let n = self.mem.get(task.idx);
-        atomic_transition(&n.status, status::PENDING, status::PROCESSING, &[status::PROCESSING]);
-        let data = Self::get_mut_processing_data(n);
+        let mut guard = ProcessingGuard::new(&n.status);
+        let data = get_mut_processing_data(n);
         if let Some(result) = self.update_node(&task, n.parts(), data, queue) {
             n.cache.set_node_idx(result);
             self.notify_dependents(&task, data, queue);
             unsafe { drop(Box::from_raw(data)) }
-            n.status.store(status::FINISHED, Ordering::SeqCst); // TODO: mem order?
-        } else {
-            n.status.store(status::PENDING, Ordering::SeqCst);
+            guard.set_finished();
         }
     }
 
@@ -208,30 +203,19 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                     if data.mask9_waiting & (1 << i) == 0 {
                         continue;
                     }
-
                     let d = self.mem.get(*x);
-                    let status = d.status.load(Ordering::SeqCst); // TODO: mem order?
-                    if status == status::FINISHED {
-                        data.mask9_waiting &= !(1 << i);
-                        *x = d.cache.get_node_idx();
-                        continue;
-                    }
-
-                    if status == status::NOT_STARTED
-                        && Self::start_processing_node(d, smallvec![task.idx])
-                    {
-                        queue.push(Task::new(*x, task.size_log2 - 1));
-                        waiting_cnt += 1;
-                        continue;
-                    }
-
-                    // node we need is already processing
-                    if Self::append_dependent(d, &task) {
-                        waiting_cnt += 1;
-                    } else {
-                        // the node has just finished processing
-                        data.mask9_waiting &= !(1 << i);
-                        *x = d.cache.get_node_idx();
+                    match handle_dependency(d, task) {
+                        DependencyHandlingResult::DependencyIsReady => {
+                            data.mask9_waiting &= !(1 << i);
+                            *x = d.cache.get_node_idx();
+                        }
+                        DependencyHandlingResult::StartedByThisThread => {
+                            queue.push(Task::new(*x, task.size_log2 - 1));
+                            waiting_cnt += 1;
+                        }
+                        DependencyHandlingResult::StartedByOtherThread => {
+                            waiting_cnt += 1;
+                        }
                     }
                 }
 
@@ -251,29 +235,19 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             if data.mask4_waiting & (1 << i) == 0 {
                 continue;
             }
-
             let d = self.mem.get(*x);
-            let status = d.status.load(Ordering::SeqCst);
-            if status == status::FINISHED {
-                data.mask4_waiting &= !(1 << i);
-                *x = d.cache.get_node_idx();
-                continue;
-            }
-
-            if status == status::NOT_STARTED && Self::start_processing_node(d, smallvec![task.idx])
-            {
-                queue.push(Task::new(*x, task.size_log2 - 1));
-                waiting_cnt += 1;
-                continue;
-            }
-
-            // node we need is already processing
-            if Self::append_dependent(d, &task) {
-                waiting_cnt += 1;
-            } else {
-                // the node has just finished processing
-                data.mask4_waiting &= !(1 << i);
-                *x = d.cache.get_node_idx();
+            match handle_dependency(d, task) {
+                DependencyHandlingResult::DependencyIsReady => {
+                    data.mask4_waiting &= !(1 << i);
+                    *x = d.cache.get_node_idx();
+                }
+                DependencyHandlingResult::StartedByThisThread => {
+                    queue.push(Task::new(*x, task.size_log2 - 1));
+                    waiting_cnt += 1;
+                }
+                DependencyHandlingResult::StartedByOtherThread => {
+                    waiting_cnt += 1;
+                }
             }
         }
 
@@ -291,68 +265,13 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     fn notify_dependents(&self, task: &Task, data: &mut ProcessingData, queue: &Queue<Task>) {
         for &dependent in data.dependents.iter() {
             let n = self.mem.get(dependent);
-            atomic_transition(&n.status, status::PENDING, status::PROCESSING, &[status::PROCESSING]);
-            let dep_data = Self::get_mut_processing_data(n);
+            let _guard = ProcessingGuard::new(&n.status);
+            let dep_data = get_mut_processing_data(n);
             dep_data.waiting_cnt -= 1;
             if dep_data.waiting_cnt == 0 {
                 queue.push(Task::new(dependent, task.size_log2 + 1));
             }
-            n.status.store(status::PENDING, Ordering::SeqCst);
         }
-    }
-
-    #[inline]
-    fn build_processing_data(dependents: Dependents) -> usize {
-        let pd = ProcessingData {
-            dependents,
-            ..Default::default()
-        };
-        Box::into_raw(Box::new(pd)) as usize
-    }
-
-    #[inline]
-    fn start_processing_node(node: &QuadTreeNode<Extra>, dependents: Dependents) -> bool {
-        if node
-            .status
-            .compare_exchange(
-                status::NOT_STARTED,
-                status::PROCESSING,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_err()
-        {
-            return false;
-        }
-
-        node.cache.set_ptr(Self::build_processing_data(dependents));
-        node.status.store(status::PENDING, Ordering::SeqCst);
-        true
-    }
-
-    #[inline]
-    fn append_dependent(n: &QuadTreeNode<Extra>, task: &Task) -> bool {
-        loop {
-            match n.status.compare_exchange_weak(
-                status::PENDING,
-                status::PROCESSING,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(status::NOT_STARTED) | Err(status::PROCESSING) => hint::spin_loop(),
-                Err(status::FINISHED) => return false,
-                Err(value) => panic!("Unexpected status in append_dependent: {}", value),
-            }
-        }
-        let pd = Self::get_mut_processing_data(n);
-        pd.dependents.push(task.idx);
-        n.status.store(status::PENDING, Ordering::SeqCst);
-        true
-    }
-
-    fn get_mut_processing_data(node: &QuadTreeNode<Extra>) -> &mut ProcessingData {
-        unsafe { &mut *(node.cache.get_ptr() as *mut _) }
     }
 
     fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {
@@ -492,6 +411,40 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     }
 }
 
+fn get_mut_processing_data<Extra: Default + Sync>(node: &QuadTreeNode<Extra>) -> &mut ProcessingData {
+    unsafe { &mut *(node.cache.get_ptr() as *mut _) }
+}
+
+fn is_finished(status: &AtomicU8) -> bool {
+    status.load(Ordering::Relaxed) == status::FINISHED
+}
+
+fn start_processing_node<Extra: Default + Sync>(
+    node: &QuadTreeNode<Extra>,
+    dependents: Dependents,
+) -> bool {
+    if node
+        .status
+        .compare_exchange(
+            status::NOT_STARTED,
+            status::PROCESSING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return false;
+    }
+
+    let pd = ProcessingData {
+        dependents,
+        ..Default::default()
+    };
+    node.cache.set_ptr(Box::into_raw(Box::new(pd)) as usize);
+    node.status.store(status::PENDING, Ordering::SeqCst);
+    true
+}
+
 fn atomic_transition(atomic: &AtomicU8, from: u8, to: u8, valid_states: &[u8]) {
     let mut current = atomic.load(Ordering::Relaxed);
     loop {
@@ -512,17 +465,77 @@ fn atomic_transition(atomic: &AtomicU8, from: u8, to: u8, valid_states: &[u8]) {
 
 struct ProcessingGuard<'a> {
     status: &'a AtomicU8,
+    is_finished: bool,
 }
 
 impl<'a> ProcessingGuard<'a> {
     fn new(status: &'a AtomicU8) -> Self {
-        atomic_transition(status, status::PENDING, status::PROCESSING, &[status::PROCESSING]);
-        Self { status }
+        atomic_transition(
+            status,
+            status::PENDING,
+            status::PROCESSING,
+            &[status::PROCESSING],
+        );
+        Self {
+            status,
+            is_finished: false,
+        }
+    }
+}
+
+impl<'a> ProcessingGuard<'a> {
+    fn set_finished(&mut self) {
+        self.is_finished = true;
     }
 }
 
 impl<'a> Drop for ProcessingGuard<'a> {
     fn drop(&mut self) {
-        self.status.store(status::PENDING, Ordering::Relaxed);
+        let final_status = if self.is_finished {
+            status::FINISHED
+        } else {
+            status::PENDING
+        };
+        self.status.store(final_status, Ordering::SeqCst);
+    }
+}
+
+enum DependencyHandlingResult {
+    DependencyIsReady,
+    StartedByThisThread,
+    StartedByOtherThread,
+}
+
+fn handle_dependency<Extra: Default + Sync>(
+    n: &QuadTreeNode<Extra>,
+    task: &Task,
+) -> DependencyHandlingResult {
+    let status = n.status.load(Ordering::SeqCst);
+    if status == status::FINISHED {
+        return DependencyHandlingResult::DependencyIsReady;
+    }
+
+    if status == status::NOT_STARTED && start_processing_node(n, smallvec![task.idx]) {
+        return DependencyHandlingResult::StartedByThisThread;
+    }
+
+    // node we need is already processing
+    loop {
+        match n.status.compare_exchange_weak(
+            status::PENDING,
+            status::PROCESSING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                let pd = get_mut_processing_data(n);
+                pd.dependents.push(task.idx);
+                n.status.store(status::PENDING, Ordering::SeqCst);
+                return DependencyHandlingResult::StartedByOtherThread;
+            }
+            Err(status::FINISHED) => return DependencyHandlingResult::DependencyIsReady,
+            Err(status::PROCESSING) => hint::spin_loop(),
+            Err(value) => panic!("Unexpected status in append_dependent: {}", value),
+        }
     }
 }
