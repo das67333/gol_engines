@@ -8,8 +8,8 @@ mod simd;
 mod topology;
 mod traits;
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// #[global_allocator]
+// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub use num_bigint::BigInt;
 pub use pattern::{Pattern, PatternFormat, PatternNode};

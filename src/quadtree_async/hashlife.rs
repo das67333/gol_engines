@@ -195,14 +195,14 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
     fn update_node_sync(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
         let n = self.mem.get(node);
         let status = n.status.load(Ordering::Acquire);
-        if status == status::CACHED {
+        if status == status::FINISHED {
             return n.cache.get_node_idx();
         }
 
-        if status == status::NOT_CACHED
+        if status == status::NOT_STARTED
             && n.status
                 .compare_exchange(
-                    status::NOT_CACHED,
+                    status::NOT_STARTED,
                     status::PROCESSING,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
@@ -211,10 +211,10 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
         {
             let cache = self.update_inner_sync(node, size_log2);
             n.cache.set_node_idx(cache);
-            n.status.store(status::CACHED, Ordering::Release);
+            n.status.store(status::FINISHED, Ordering::Release);
             cache
         } else {
-            while n.status.load(Ordering::Acquire) != status::CACHED {
+            while n.status.load(Ordering::Acquire) != status::FINISHED {
                 if ExecutionStatistics::is_poisoned() {
                     return NodeIdx::default();
                 }
@@ -299,14 +299,14 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
     pub(super) async fn update_node_async(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
         let n = self.mem.get(node);
         let status = n.status.load(Ordering::Acquire);
-        if status == status::CACHED {
+        if status == status::FINISHED {
             return n.cache.get_node_idx();
         }
 
-        if status == status::NOT_CACHED
+        if status == status::NOT_STARTED
             && n.status
                 .compare_exchange(
-                    status::NOT_CACHED,
+                    status::NOT_STARTED,
                     status::PROCESSING,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
@@ -319,10 +319,10 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
                 self.update_inner_sync(node, size_log2)
             };
             n.cache.set_node_idx(cache);
-            n.status.store(status::CACHED, Ordering::Release);
+            n.status.store(status::FINISHED, Ordering::Release);
             cache
         } else {
-            while n.status.load(Ordering::Acquire) != status::CACHED {
+            while n.status.load(Ordering::Acquire) != status::FINISHED {
                 if ExecutionStatistics::is_poisoned() {
                     return NodeIdx::default();
                 }

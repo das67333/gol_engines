@@ -11,9 +11,18 @@ fn bench_atomics(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("cmpxchg", |b| {
+    group.bench_function("cmpxchg_fail", |b| {
         b.iter(|| {
-            let _ = a.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
+            a.compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed).unwrap_err();
+        });
+    });
+
+    group.bench_function("cmpxchg_success", |b| {
+        let mut value = 0;
+        a.store(value, Ordering::Relaxed);
+        b.iter(|| {
+            a.compare_exchange(value, value + 1, Ordering::Relaxed, Ordering::Relaxed).unwrap();
+            value += 1;
         });
     });
 

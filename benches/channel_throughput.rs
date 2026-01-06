@@ -1,4 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use crossbeam_deque::Worker;
+use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
 
@@ -75,5 +77,35 @@ fn mpmc_throughput_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, mpmc_throughput_benchmark);
+fn push_pop_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("push_pop");
+
+    let mut v = Vec::new();
+    group.bench_function("vec", |b| {
+        b.iter(|| {
+            black_box(v.push(1));
+            black_box(v.pop().unwrap())
+        })
+    });
+
+    let worker_fifo = Worker::new_fifo();
+    group.bench_function("worker_fifo", |b| {
+        b.iter(|| {
+            black_box(worker_fifo.push(1));
+            black_box(worker_fifo.pop().unwrap())
+        })
+    });
+
+    let worker_lifo = Worker::new_lifo();
+    group.bench_function("worker_lifo", |b| {
+        b.iter(|| {
+            black_box(worker_lifo.push(1));
+            black_box(worker_lifo.pop().unwrap())
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, mpmc_throughput_benchmark, push_pop_benchmark);
 criterion_main!(benches);
