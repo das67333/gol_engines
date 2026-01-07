@@ -6,7 +6,7 @@ use super::{
     statistics::{ExecutionStatistics, TasksCountGuard},
     LEAF_SIZE, LEAF_SIZE_LOG2,
 };
-use crate::{GoLEngine, Pattern, PatternNode, Topology};
+use crate::{GoLEngine, Pattern, PatternNode, Topology, WORKER_THREADS};
 use ahash::AHashMap as HashMap;
 use anyhow::{anyhow, Result};
 use num_bigint::BigInt;
@@ -513,16 +513,16 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
 
         self.root = {
             // let mut builder = tokio::runtime::Builder::new_multi_thread();
-            // let threads = WORKER_THREADS.load(Ordering::Relaxed);
-            // if threads > 0 {
-            //     builder.worker_threads(WORKER_THREADS.load(Ordering::Relaxed) as usize);
+            let num_threads = WORKER_THREADS.load(Ordering::Relaxed);
+            // if num_threads > 0 {
+            //     builder.worker_threads(num_threads as usize);
             // }
 
             // builder
             //     .build()
             //     .unwrap()
             //     .block_on(async { self.update_node_async(self.root, self.size_log2).await })
-            HashLifeExecutor::new(self).run()
+            HashLifeExecutor::new(self).run(num_threads)
             // self.update_node_sync(self.root, self.size_log2)
         };
         if ExecutionStatistics::is_poisoned() {
