@@ -1,11 +1,12 @@
 use super::{
-    hashlife::HashLifeEngineAsync, status, MemoryManager, NodeIdx, QuadTreeNode, LEAF_SIZE,
-    LEAF_SIZE_LOG2,
+    hashlife::HashLifeEngineAsync,
+    node::{Dependents, ProcessingData},
+    status, MemoryManager, NodeIdx, QuadTreeNode, LEAF_SIZE, LEAF_SIZE_LOG2,
 };
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use smallvec::{smallvec, SmallVec};
 use std::{
-    hint,
+    hint, mem,
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
     thread,
     time::Duration,
@@ -22,17 +23,6 @@ impl Task {
     }
 }
 
-type Dependents = SmallVec<[NodeIdx; 2]>;
-
-#[derive(Default)]
-struct ProcessingData {
-    arr: [NodeIdx; 9],
-    mask9_waiting: u32,
-    mask4_waiting: u32,
-    waiting_cnt: u32,
-    dependents: Dependents,
-}
-
 pub(super) struct HashLifeExecutor<'a, Extra: Default + Sync> {
     root: NodeIdx,
     size_log2: u32,
@@ -41,8 +31,6 @@ pub(super) struct HashLifeExecutor<'a, Extra: Default + Sync> {
 }
 
 static MAX_LEN: AtomicUsize = AtomicUsize::new(0);
-
-type Queue<T> = Injector<T>;
 
 impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     pub(super) fn new(base: &'a HashLifeEngineAsync<Extra>) -> Self {
@@ -58,9 +46,6 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         // Get number of threads
         let num_threads = 4; //thread::available_parallelism().map(|n| n.get()).unwrap();
 
-        // Create global injector queue
-        let injector = Injector::new();
-
         // Create worker queues and stealers
         let mut workers = Vec::with_capacity(num_threads);
         let mut stealers = Vec::with_capacity(num_threads);
@@ -73,43 +58,31 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         }
 
         start_processing_node(self.mem.get(self.root), smallvec![]);
-        injector.push(Task::new(self.root, self.size_log2));
+        workers[0].push(Task::new(self.root, self.size_log2));
 
         thread::scope(|scope| {
             for (thread_id, mut worker) in workers.into_iter().enumerate() {
-                let injector = &injector;
                 let stealers = &stealers;
-                scope.spawn(move || self.worker_thread(thread_id, &mut worker, injector, stealers));
+                scope.spawn(move || self.worker_thread(thread_id, &mut worker, stealers));
             }
         });
 
+        assert!(is_finished(&self.mem.get(self.root).status));
         println!(
             "Nodes count: {}",
-            crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::SeqCst)
+            crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::Relaxed)
         );
-        println!("Max queue len: {}", MAX_LEN.load(Ordering::SeqCst));
-        assert!(is_finished(&self.mem.get(self.root).status));
+        println!("Max queue len: {}", MAX_LEN.load(Ordering::Relaxed));
 
         let n = self.mem.get(self.root);
         n.cache.get_node_idx()
     }
 
-    fn worker_thread(
-        &self,
-        thread_id: usize,
-        worker: &Worker<Task>,
-        injector: &Injector<Task>,
-        stealers: &[Stealer<Task>],
-    ) {
+    fn worker_thread(&self, thread_id: usize, worker: &Worker<Task>, stealers: &[Stealer<Task>]) {
         let root_status = &self.mem.get(self.root).status;
         loop {
-            while let Some(task) = Self::fetch_task(thread_id, worker, injector, stealers) {
-                // MAX_LEN.store(
-                //     MAX_LEN.load(Ordering::SeqCst).max(injector.len()),
-                //     Ordering::SeqCst,
-                // );
-
-                self.process_task(task, injector);
+            while let Some(task) = Self::fetch_task(thread_id, worker, stealers) {
+                self.process_task(task, worker);
             }
 
             if is_finished(root_status) {
@@ -123,29 +96,15 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     fn fetch_task(
         thread_id: usize,
         worker: &Worker<Task>,
-        injector: &Injector<Task>,
         stealers: &[Stealer<Task>],
     ) -> Option<Task> {
         // Try to get a task from local queue first
         worker.pop().or_else(|| {
-            // Try to steal from global injector
-            loop {
-                match injector.steal_batch_and_pop(worker) {
-                    Steal::Success(task) => return Some(task),
-                    Steal::Empty => break,
-                    Steal::Retry => continue,
-                }
-            }
-
-            // TODO: randomize here?
             // Try to steal from other workers
-            for (i, stealer) in stealers.iter().enumerate() {
-                if i == thread_id {
-                    continue;
-                }
-
+            // TODO for GPT: replace with comment about order
+            for i in (thread_id + 1..stealers.len()).chain(0..thread_id) {
                 loop {
-                    match stealer.steal_batch_and_pop(worker) {
+                    match stealers[i].steal_batch_and_pop(worker) {
                         Steal::Success(task) => return Some(task),
                         Steal::Empty => break,
                         Steal::Retry => continue,
@@ -157,24 +116,41 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         })
     }
 
-    fn process_task(&self, task: Task, queue: &Queue<Task>) {
+    /// Process a task.
+    ///
+    /// # Queue Strategy
+    /// - `local_queue`: Used for child tasks we start ourselves (good cache locality)
+    /// - `global_queue`: Used for notifying dependents (better load balancing)
+    fn process_task(&self, task: Task, queue: &Worker<Task>) {
         let n = self.mem.get(task.idx);
         let mut guard = ProcessingGuard::new(&n.status);
-        let data = get_mut_processing_data(n);
+        let data = n.cache.get_ref();
         if let Some(result) = self.update_node(&task, n.parts(), data, queue) {
             n.cache.set_node_idx(result);
-            self.notify_dependents(&task, data, queue);
+            let mut dependents = SmallVec::new();
+            mem::swap(&mut data.dependents, &mut dependents);
+            guard.finish();
             unsafe { drop(Box::from_raw(data)) }
-            guard.set_finished();
+            // Use global queue for dependents - they may be "cold" (not in cache)
+            // and distributing them helps with load balancing
+            self.notify_dependents(&task, dependents, queue);
         }
     }
 
+    /// Update a node by processing its dependencies.
+    ///
+    /// # Queue Strategy for Child Tasks
+    /// When we start processing a dependency ourselves (`StartedByThisThread`),
+    /// we push it to the **local queue** because:
+    /// 1. The child node data is likely still in L1/L2 cache (we just accessed it)
+    /// 2. LIFO order means we'll process it next → depth-first traversal
+    /// 3. Good cache locality leads to better performance
     fn update_node(
         &self,
         task: &Task,
         parts: [NodeIdx; 4],
         data: &mut ProcessingData,
-        queue: &Queue<Task>,
+        queue: &Worker<Task>,
     ) -> Option<NodeIdx> {
         let both_stages = self.generations_log2 + 2 >= task.size_log2;
         let [nw, ne, sw, se] = parts;
@@ -210,6 +186,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                             *x = d.cache.get_node_idx();
                         }
                         DependencyHandlingResult::StartedByThisThread => {
+                            // Use local queue - child data is hot in cache
                             queue.push(Task::new(*x, task.size_log2 - 1));
                             waiting_cnt += 1;
                         }
@@ -242,6 +219,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                     *x = d.cache.get_node_idx();
                 }
                 DependencyHandlingResult::StartedByThisThread => {
+                    // Use local queue - child data is hot in cache
                     queue.push(Task::new(*x, task.size_log2 - 1));
                     waiting_cnt += 1;
                 }
@@ -262,13 +240,24 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         )
     }
 
-    fn notify_dependents(&self, task: &Task, data: &mut ProcessingData, queue: &Queue<Task>) {
-        for &dependent in data.dependents.iter() {
+    /// Notify dependent nodes that a dependency has completed.
+    ///
+    /// # Queue Strategy
+    /// We use the **global queue** for awakened dependents because:
+    /// 1. Dependent nodes are at a higher level (size_log2 + 1), so their data
+    ///    may have been evicted from cache since we last touched them
+    /// 2. Multiple threads may be waking up the same dependent concurrently
+    /// 3. Global queue provides better load balancing across all workers
+    /// 4. Allows other idle threads to pick up work immediately
+    fn notify_dependents(&self, task: &Task, dependents: Dependents, queue: &Worker<Task>) {
+        for &dependent in dependents.iter() {
             let n = self.mem.get(dependent);
             let _guard = ProcessingGuard::new(&n.status);
-            let dep_data = get_mut_processing_data(n);
+            let dep_data = n.cache.get_ref();
             dep_data.waiting_cnt -= 1;
             if dep_data.waiting_cnt == 0 {
+                // Use global queue - dependent data may be cold, and this
+                // helps distribute work to potentially idle threads
                 queue.push(Task::new(dependent, task.size_log2 + 1));
             }
         }
@@ -411,12 +400,8 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     }
 }
 
-fn get_mut_processing_data<Extra: Default + Sync>(node: &QuadTreeNode<Extra>) -> &mut ProcessingData {
-    unsafe { &mut *(node.cache.get_ptr() as *mut _) }
-}
-
 fn is_finished(status: &AtomicU8) -> bool {
-    status.load(Ordering::Relaxed) == status::FINISHED
+    status.load(Ordering::Acquire) == status::FINISHED
 }
 
 fn start_processing_node<Extra: Default + Sync>(
@@ -428,8 +413,8 @@ fn start_processing_node<Extra: Default + Sync>(
         .compare_exchange(
             status::NOT_STARTED,
             status::PROCESSING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
         )
         .is_err()
     {
@@ -440,8 +425,8 @@ fn start_processing_node<Extra: Default + Sync>(
         dependents,
         ..Default::default()
     };
-    node.cache.set_ptr(Box::into_raw(Box::new(pd)) as usize);
-    node.status.store(status::PENDING, Ordering::SeqCst);
+    node.cache.set_ptr(Box::into_raw(Box::new(pd)));
+    node.status.store(status::PENDING, Ordering::Release);
     true
 }
 
@@ -456,7 +441,7 @@ fn atomic_transition(atomic: &AtomicU8, from: u8, to: u8, valid_states: &[u8]) {
             current = atomic.load(Ordering::Relaxed);
         }
 
-        match atomic.compare_exchange_weak(from, to, Ordering::AcqRel, Ordering::Relaxed) {
+        match atomic.compare_exchange_weak(from, to, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => return,
             Err(actual) => current = actual,
         }
@@ -465,7 +450,7 @@ fn atomic_transition(atomic: &AtomicU8, from: u8, to: u8, valid_states: &[u8]) {
 
 struct ProcessingGuard<'a> {
     status: &'a AtomicU8,
-    is_finished: bool,
+    released: bool,
 }
 
 impl<'a> ProcessingGuard<'a> {
@@ -478,25 +463,23 @@ impl<'a> ProcessingGuard<'a> {
         );
         Self {
             status,
-            is_finished: false,
+            released: false,
         }
     }
 }
 
 impl<'a> ProcessingGuard<'a> {
-    fn set_finished(&mut self) {
-        self.is_finished = true;
+    fn finish(&mut self) {
+        self.status.store(status::FINISHED, Ordering::Release);
+        self.released = true;
     }
 }
 
 impl<'a> Drop for ProcessingGuard<'a> {
     fn drop(&mut self) {
-        let final_status = if self.is_finished {
-            status::FINISHED
-        } else {
-            status::PENDING
-        };
-        self.status.store(final_status, Ordering::SeqCst);
+        if !self.released {
+            self.status.store(status::PENDING, Ordering::Release);
+        }
     }
 }
 
@@ -510,7 +493,7 @@ fn handle_dependency<Extra: Default + Sync>(
     n: &QuadTreeNode<Extra>,
     task: &Task,
 ) -> DependencyHandlingResult {
-    let status = n.status.load(Ordering::SeqCst);
+    let status = n.status.load(Ordering::Acquire);
     if status == status::FINISHED {
         return DependencyHandlingResult::DependencyIsReady;
     }
@@ -519,23 +502,21 @@ fn handle_dependency<Extra: Default + Sync>(
         return DependencyHandlingResult::StartedByThisThread;
     }
 
-    // node we need is already processing
     loop {
         match n.status.compare_exchange_weak(
             status::PENDING,
             status::PROCESSING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+            Ordering::Acquire,
+            Ordering::Acquire,
         ) {
             Ok(_) => {
-                let pd = get_mut_processing_data(n);
-                pd.dependents.push(task.idx);
-                n.status.store(status::PENDING, Ordering::SeqCst);
+                n.cache.get_ref().dependents.push(task.idx);
+                n.status.store(status::PENDING, Ordering::Release);
                 return DependencyHandlingResult::StartedByOtherThread;
             }
             Err(status::FINISHED) => return DependencyHandlingResult::DependencyIsReady,
             Err(status::PROCESSING) => hint::spin_loop(),
-            Err(value) => panic!("Unexpected status in append_dependent: {}", value),
+            Err(value) => panic!("Unexpected status in handle_dependency: {}", value),
         }
     }
 }
