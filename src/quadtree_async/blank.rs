@@ -1,4 +1,4 @@
-use super::{MemoryManager, NodeIdx, LEAF_SIZE_LOG2};
+use super::{memory::MemoryManager, node::NodeIdx, LEAF_SIZE_LOG2};
 
 pub(super) struct BlankNodes {
     data: Vec<NodeIdx>,

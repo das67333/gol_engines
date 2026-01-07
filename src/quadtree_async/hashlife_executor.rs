@@ -1,9 +1,55 @@
+//! # Parallel Hashlife Executor
+//!
+//! This module implements a work-stealing parallel executor for the Hashlife algorithm.
+//!
+//! ## Architecture
+//!
+//! The executor uses thread-local LIFO queues with work-stealing for load balancing:
+//! - Each thread has its own `Worker<Task>` queue
+//! - When a thread runs out of work, it steals from other threads via `Stealer`
+//! - No global queue is used - all tasks go directly to thread-local queues
+//!
+//! ## Status State Machine
+//!
+//! Each node progresses through these states during parallel processing:
+//!
+//! ```text
+//!     ┌──────────────────────┐
+//!     │    NOT_STARTED (0)   │ ◄── Initial state
+//!     └──────────┬───────────┘
+//!                │
+//!                │ CAS(NOT_STARTED → PROCESSING)
+//!                │ First thread claims the node
+//!                ▼
+//!     ┌──────────────────────┐                      ┌──────────────────────┐
+//!     │    PROCESSING (1)    │ ◄─┐                  │    FINISHED (3)      │
+//!     └──────────┬───────────┘   │                  └──────────────────────┘
+//!                │               │                            ▲
+//!                ├───────────────┼────────────────────────────┘
+//!                │               │  store(FINISHED) when computation completes
+//!                │               │
+//!                │ store(PENDING)│ CAS(PENDING → PROCESSING)
+//!                │ when waiting  │ when all dependencies ready
+//!                │ for deps      │
+//!                ▼               │
+//!     ┌──────────────────────┐   │
+//!     │     PENDING (2)      │ ──┘
+//!     └──────────────────────┘
+//! ```
+//!
+//! Key transitions:
+//! - `NOT_STARTED → PROCESSING`: Thread claims node for processing
+//! - `PROCESSING → PENDING`: Node needs to wait for dependencies
+//! - `PENDING → PROCESSING`: All dependencies ready, resume processing
+//! - `PROCESSING → FINISHED`: Computation complete, result cached
+
 use super::{
     hashlife::HashLifeEngineAsync,
-    node::{Dependents, ProcessingData},
-    status, MemoryManager, NodeIdx, QuadTreeNode, LEAF_SIZE, LEAF_SIZE_LOG2,
+    memory::MemoryManager,
+    node::{Dependents, NodeIdx, ProcessingData, QuadTreeNode, Status},
+    LEAF_SIZE, LEAF_SIZE_LOG2,
 };
-use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use crossbeam_deque::{Steal, Stealer, Worker};
 use smallvec::{smallvec, SmallVec};
 use std::{
     hint, mem,
@@ -12,6 +58,7 @@ use std::{
     time::Duration,
 };
 
+/// A unit of work representing a node to be processed.
 struct Task {
     idx: NodeIdx,
     size_log2: u32,
@@ -23,6 +70,7 @@ impl Task {
     }
 }
 
+/// Parallel executor for Hashlife algorithm using work-stealing.
 pub(super) struct HashLifeExecutor<'a, Extra: Default + Sync> {
     root: NodeIdx,
     size_log2: u32,
@@ -47,23 +95,23 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         let num_threads = 4; //thread::available_parallelism().map(|n| n.get()).unwrap();
 
         // Create worker queues and stealers
-        let mut workers = Vec::with_capacity(num_threads);
+        let mut queues = Vec::with_capacity(num_threads);
         let mut stealers = Vec::with_capacity(num_threads);
 
         for _ in 0..num_threads {
-            let worker = Worker::new_lifo();
-            let stealer = worker.stealer();
-            workers.push(worker);
+            let queue = Worker::new_lifo();
+            let stealer = queue.stealer();
+            queues.push(queue);
             stealers.push(stealer);
         }
 
         start_processing_node(self.mem.get(self.root), smallvec![]);
-        workers[0].push(Task::new(self.root, self.size_log2));
+        queues[0].push(Task::new(self.root, self.size_log2));
 
         thread::scope(|scope| {
-            for (thread_id, mut worker) in workers.into_iter().enumerate() {
+            for (thread_id, mut queue) in queues.into_iter().enumerate() {
                 let stealers = &stealers;
-                scope.spawn(move || self.worker_thread(thread_id, &mut worker, stealers));
+                scope.spawn(move || self.worker_thread(thread_id, &mut queue, stealers));
             }
         });
 
@@ -78,11 +126,11 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         n.cache.get_node_idx()
     }
 
-    fn worker_thread(&self, thread_id: usize, worker: &Worker<Task>, stealers: &[Stealer<Task>]) {
+    fn worker_thread(&self, thread_id: usize, queue: &Worker<Task>, stealers: &[Stealer<Task>]) {
         let root_status = &self.mem.get(self.root).status;
         loop {
-            while let Some(task) = Self::fetch_task(thread_id, worker, stealers) {
-                self.process_task(task, worker);
+            while let Some(task) = Self::fetch_task(thread_id, queue, stealers) {
+                self.process_task(task, queue);
             }
 
             if is_finished(root_status) {
@@ -93,34 +141,40 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         }
     }
 
+    /// Fetch a task from local queue or steal from other threads.
+    ///
+    /// Strategy:
+    /// 1. Try local queue first (LIFO, best cache locality)
+    /// 2. If empty, steal from other threads in round-robin order
+    ///
+    /// Stealing order starts from `thread_id + 1` to distribute load evenly.
     fn fetch_task(
         thread_id: usize,
-        worker: &Worker<Task>,
+        queue: &Worker<Task>,
         stealers: &[Stealer<Task>],
     ) -> Option<Task> {
-        // Try to get a task from local queue first
-        worker.pop().or_else(|| {
-            // Try to steal from other workers
-            // TODO for GPT: replace with comment about order
+        queue.pop().or_else(|| {
+            // Steal from other threads in round-robin order starting from next thread
             for i in (thread_id + 1..stealers.len()).chain(0..thread_id) {
                 loop {
-                    match stealers[i].steal_batch_and_pop(worker) {
+                    match stealers[i].steal_batch_and_pop(queue) {
                         Steal::Success(task) => return Some(task),
                         Steal::Empty => break,
                         Steal::Retry => continue,
                     }
                 }
             }
-
             None
         })
     }
 
-    /// Process a task.
+    /// Process a single task: compute the node's result or wait for dependencies.
     ///
-    /// # Queue Strategy
-    /// - `local_queue`: Used for child tasks we start ourselves (good cache locality)
-    /// - `global_queue`: Used for notifying dependents (better load balancing)
+    /// Flow:
+    /// 1. Acquire PROCESSING status via `ProcessingGuard`
+    /// 2. Call `update_node` to compute result or identify dependencies
+    /// 3. If result ready: cache it, notify dependents, mark FINISHED
+    /// 4. If dependencies needed: guard drops, status returns to PENDING
     fn process_task(&self, task: Task, queue: &Worker<Task>) {
         let n = self.mem.get(task.idx);
         let mut guard = ProcessingGuard::new(&n.status);
@@ -129,22 +183,29 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             n.cache.set_node_idx(result);
             let mut dependents = SmallVec::new();
             mem::swap(&mut data.dependents, &mut dependents);
-            guard.finish();
-            unsafe { drop(Box::from_raw(data)) }
-            // Use global queue for dependents - they may be "cold" (not in cache)
-            // and distributing them helps with load balancing
+            guard.finish(); // Mark as FINISHED
+            unsafe { drop(Box::from_raw(data)) } // Free ProcessingData
             self.notify_dependents(&task, dependents, queue);
         }
     }
 
-    /// Update a node by processing its dependencies.
+    /// Compute node result by processing its children/dependencies.
     ///
-    /// # Queue Strategy for Child Tasks
-    /// When we start processing a dependency ourselves (`StartedByThisThread`),
-    /// we push it to the **local queue** because:
-    /// 1. The child node data is likely still in L1/L2 cache (we just accessed it)
-    /// 2. LIFO order means we'll process it next → depth-first traversal
-    /// 3. Good cache locality leads to better performance
+    /// Returns `Some(result)` if computation completes, `None` if waiting for dependencies.
+    ///
+    /// ## Hashlife Algorithm
+    ///
+    /// For non-leaf nodes, computation happens in stages:
+    /// 1. **Stage 1** (if `both_stages`): Compute 9 overlapping children
+    /// 2. **Stage 2**: Compute 4 final children from the 9 (or directly if single-stage)
+    /// 3. Combine the 4 children into final result
+    ///
+    /// ## Dependency Handling
+    ///
+    /// When a child is not ready:
+    /// - `DependencyIsReady`: Child already computed, use cached result
+    /// - `StartedByThisThread`: We claimed the child, push to local queue (LIFO → depth-first)
+    /// - `StartedByOtherThread`: Another thread processing it, register as dependent
     fn update_node(
         &self,
         task: &Task,
@@ -186,7 +247,6 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                             *x = d.cache.get_node_idx();
                         }
                         DependencyHandlingResult::StartedByThisThread => {
-                            // Use local queue - child data is hot in cache
                             queue.push(Task::new(*x, task.size_log2 - 1));
                             waiting_cnt += 1;
                         }
@@ -219,7 +279,6 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                     *x = d.cache.get_node_idx();
                 }
                 DependencyHandlingResult::StartedByThisThread => {
-                    // Use local queue - child data is hot in cache
                     queue.push(Task::new(*x, task.size_log2 - 1));
                     waiting_cnt += 1;
                 }
@@ -240,15 +299,12 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         )
     }
 
-    /// Notify dependent nodes that a dependency has completed.
+    /// Notify dependent nodes that this dependency has completed.
     ///
-    /// # Queue Strategy
-    /// We use the **global queue** for awakened dependents because:
-    /// 1. Dependent nodes are at a higher level (size_log2 + 1), so their data
-    ///    may have been evicted from cache since we last touched them
-    /// 2. Multiple threads may be waking up the same dependent concurrently
-    /// 3. Global queue provides better load balancing across all workers
-    /// 4. Allows other idle threads to pick up work immediately
+    /// For each dependent:
+    /// 1. Acquire PROCESSING status
+    /// 2. Decrement its `waiting_cnt`
+    /// 3. If `waiting_cnt` reaches 0, re-queue for processing
     fn notify_dependents(&self, task: &Task, dependents: Dependents, queue: &Worker<Task>) {
         for &dependent in dependents.iter() {
             let n = self.mem.get(dependent);
@@ -256,13 +312,15 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             let dep_data = n.cache.get_ref();
             dep_data.waiting_cnt -= 1;
             if dep_data.waiting_cnt == 0 {
-                // Use global queue - dependent data may be cold, and this
-                // helps distribute work to potentially idle threads
                 queue.push(Task::new(dependent, task.size_log2 + 1));
             }
         }
     }
 
+    /// Apply Conway's Game of Life rules to a row of cells.
+    ///
+    /// Uses bit-parallel computation to update 16 cells simultaneously.
+    /// Implements the standard B3/S23 rule (born with 3 neighbors, survive with 2-3).
     fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {
         let b = row_prev;
         let a = b << 1;
@@ -303,8 +361,11 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         (i & i2) | i3
     }
 
-    /// `nw`, `ne`, `sw`, `se` must be leaves
-    pub(super) fn update_leaves(
+    /// Update a 2x2 block of leaf nodes by simulating `steps` generations.
+    ///
+    /// This is the base case of Hashlife recursion. Combines 4 leaf nodes (8x8 each)
+    /// into a 16x16 grid, simulates forward, and extracts the center 8x8 result.
+    fn update_leaves(
         &self,
         nw: NodeIdx,
         ne: NodeIdx,
@@ -333,7 +394,26 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             .find_or_create_leaf_from_u64(u64::from_le_bytes(arr.map(|x| (x >> 4) as u8)))
     }
 
-    pub(super) fn nine_children_overlapping(
+    /// Create 9 overlapping children from a 2×2 block of nodes.
+    ///
+    /// ```text
+    /// Input: 2×2 block         Output: 9 overlapping children
+    /// ┌─────┬─────┐            ┌─────┬─────┬─────┐
+    /// │ NW  │ NE  │            │  0  │  1  │  2  │
+    /// │     │     │            │(NW) │(mid)│(NE) │
+    /// ├─────┼─────┤            ├─────┼─────┼─────┤
+    /// │ SW  │ SE  │            │  3  │  4  │  5  │
+    /// │     │     │            │(mid)│(ctr)│(mid)│
+    /// └─────┴─────┘            ├─────┼─────┼─────┤
+    ///                          │  6  │  7  │  8  │
+    ///                          │(SW) │(mid)│(SE) │
+    ///                          └─────┴─────┴─────┘
+    ///
+    /// Children 0,2,6,8 are the original input nodes.
+    /// Children 1,3,5,7 are formed from overlapping edges.
+    /// Child 4 is formed from the center where all four inputs meet.
+    /// ```
+    fn nine_children_overlapping(
         &self,
         nw: NodeIdx,
         ne: NodeIdx,
@@ -354,7 +434,30 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         ]
     }
 
-    pub(super) fn nine_children_disjoint(
+    /// Create 9 non-overlapping children from a 2×2 block of nodes.
+    ///
+    /// ```text
+    /// Input: 2×2 block          Each input node has 4 children:
+    /// ┌──────┬──────┐           ┌───┬───┐
+    /// │  NW  │  NE  │           │nw │ne │
+    /// │      │      │           ├───┼───┤
+    /// ├──────┼──────┤           │sw │se │
+    /// │  SW  │  SE  │           └───┴───┘
+    /// │      │      │
+    /// └──────┴──────┘
+    ///
+    /// Output: 9 non-overlapping children formed from centers:
+    /// ┌─────┬─────┬─────┐
+    /// │  0  │  1  │  2  │  ← 0: from NW's children, 1: from NW+NE, 2: from NE's children
+    /// ├─────┼─────┼─────┤
+    /// │  3  │  4  │  5  │  ← 3: from NW+SW, 4: from all four, 5: from NE+SE
+    /// ├─────┼─────┼─────┤
+    /// │  6  │  7  │  8  │  ← 6: from SW's children, 7: from SW+SE, 8: from SE's children
+    /// └─────┴─────┴─────┘
+    ///
+    /// Each output is formed by taking center regions from the input nodes' children.
+    /// ```
+    fn nine_children_disjoint(
         &self,
         nw: NodeIdx,
         ne: NodeIdx,
@@ -390,7 +493,24 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         })
     }
 
-    pub(super) fn four_children_overlapping(&self, arr: &[NodeIdx; 9]) -> [NodeIdx; 4] {
+    /// Combine 9 overlapping children into 4 final children.
+    ///
+    /// ```text
+    /// Input:           Output:
+    /// ┌───┬───┬───┐    ┌─────┬─────┐
+    /// │ 0 │ 1 │ 2 │    │  A  │  B  │
+    /// ├───┼───┼───┤    │     │     │
+    /// │ 3 │ 4 │ 5 │    ├─────┼─────┤
+    /// ├───┼───┼───┤    │  C  │  D  │
+    /// │ 6 │ 7 │ 8 │    │     │     │
+    /// └───┴───┴───┘    └─────┴─────┘
+    ///
+    /// A = combine(0,1,3,4)
+    /// B = combine(1,2,4,5)
+    /// C = combine(3,4,6,7)
+    /// D = combine(4,5,7,8)
+    /// ```
+    fn four_children_overlapping(&self, arr: &[NodeIdx; 9]) -> [NodeIdx; 4] {
         [
             self.mem.find_or_create_node(arr[0], arr[1], arr[3], arr[4]),
             self.mem.find_or_create_node(arr[1], arr[2], arr[4], arr[5]),
@@ -400,10 +520,19 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     }
 }
 
+/// Check if a node has finished processing.
 fn is_finished(status: &AtomicU8) -> bool {
-    status.load(Ordering::Acquire) == status::FINISHED
+    status.load(Ordering::Acquire) == Status::FINISHED
 }
 
+/// Initialize a node for processing by transitioning NOT_STARTED → PROCESSING → PENDING.
+///
+/// Returns `true` if this thread successfully claimed the node, `false` if another thread did.
+///
+/// Steps:
+/// 1. CAS(NOT_STARTED → PROCESSING) to claim the node
+/// 2. Allocate and store ProcessingData
+/// 3. Store PENDING status (node ready to be processed)
 fn start_processing_node<Extra: Default + Sync>(
     node: &QuadTreeNode<Extra>,
     dependents: Dependents,
@@ -411,8 +540,8 @@ fn start_processing_node<Extra: Default + Sync>(
     if node
         .status
         .compare_exchange(
-            status::NOT_STARTED,
-            status::PROCESSING,
+            Status::NOT_STARTED,
+            Status::PROCESSING,
             Ordering::Relaxed,
             Ordering::Relaxed,
         )
@@ -426,10 +555,14 @@ fn start_processing_node<Extra: Default + Sync>(
         ..Default::default()
     };
     node.cache.set_ptr(Box::into_raw(Box::new(pd)));
-    node.status.store(status::PENDING, Ordering::Release);
+    node.status.store(Status::PENDING, Ordering::Release);
     true
 }
 
+/// Atomically transition status from `from` to `to`, spinning until successful.
+///
+/// Panics if status is not in `valid_states` while waiting.
+/// Uses weak CAS in a loop for better performance on contended atomics.
 fn atomic_transition(atomic: &AtomicU8, from: u8, to: u8, valid_states: &[u8]) {
     let mut current = atomic.load(Ordering::Relaxed);
     loop {
@@ -448,18 +581,24 @@ fn atomic_transition(atomic: &AtomicU8, from: u8, to: u8, valid_states: &[u8]) {
     }
 }
 
+/// RAII guard for PROCESSING status.
+///
+/// Acquires PROCESSING status on creation, releases it on drop.
+/// - If `finish()` called: transitions to FINISHED
+/// - If dropped without `finish()`: transitions back to PENDING
 struct ProcessingGuard<'a> {
     status: &'a AtomicU8,
     released: bool,
 }
 
 impl<'a> ProcessingGuard<'a> {
+    /// Acquire PROCESSING status, spinning until PENDING.
     fn new(status: &'a AtomicU8) -> Self {
         atomic_transition(
             status,
-            status::PENDING,
-            status::PROCESSING,
-            &[status::PROCESSING],
+            Status::PENDING,
+            Status::PROCESSING,
+            &[Status::PROCESSING],
         );
         Self {
             status,
@@ -469,8 +608,9 @@ impl<'a> ProcessingGuard<'a> {
 }
 
 impl<'a> ProcessingGuard<'a> {
+    /// Mark node as FINISHED and prevent drop from reverting to PENDING.
     fn finish(&mut self) {
-        self.status.store(status::FINISHED, Ordering::Release);
+        self.status.store(Status::FINISHED, Ordering::Release);
         self.released = true;
     }
 }
@@ -478,44 +618,54 @@ impl<'a> ProcessingGuard<'a> {
 impl<'a> Drop for ProcessingGuard<'a> {
     fn drop(&mut self) {
         if !self.released {
-            self.status.store(status::PENDING, Ordering::Release);
+            self.status.store(Status::PENDING, Ordering::Release);
         }
     }
 }
 
+/// Result of attempting to handle a dependency.
 enum DependencyHandlingResult {
+    /// Dependency already computed, result available in cache
     DependencyIsReady,
+    /// This thread successfully claimed the dependency for processing
     StartedByThisThread,
+    /// Another thread is processing the dependency, we registered as dependent
     StartedByOtherThread,
 }
 
+/// Handle a dependency: check if ready, start processing, or register as dependent.
+///
+/// Flow:
+/// 1. If FINISHED: return DependencyIsReady
+/// 2. If NOT_STARTED: try to claim it (return StartedByThisThread if successful)
+/// 3. If PENDING/PROCESSING: register as dependent (return StartedByOtherThread)
 fn handle_dependency<Extra: Default + Sync>(
     n: &QuadTreeNode<Extra>,
     task: &Task,
 ) -> DependencyHandlingResult {
     let status = n.status.load(Ordering::Acquire);
-    if status == status::FINISHED {
+    if status == Status::FINISHED {
         return DependencyHandlingResult::DependencyIsReady;
     }
 
-    if status == status::NOT_STARTED && start_processing_node(n, smallvec![task.idx]) {
+    if status == Status::NOT_STARTED && start_processing_node(n, smallvec![task.idx]) {
         return DependencyHandlingResult::StartedByThisThread;
     }
 
     loop {
         match n.status.compare_exchange_weak(
-            status::PENDING,
-            status::PROCESSING,
+            Status::PENDING,
+            Status::PROCESSING,
             Ordering::Acquire,
             Ordering::Acquire,
         ) {
             Ok(_) => {
                 n.cache.get_ref().dependents.push(task.idx);
-                n.status.store(status::PENDING, Ordering::Release);
+                n.status.store(Status::PENDING, Ordering::Release);
                 return DependencyHandlingResult::StartedByOtherThread;
             }
-            Err(status::FINISHED) => return DependencyHandlingResult::DependencyIsReady,
-            Err(status::PROCESSING) => hint::spin_loop(),
+            Err(Status::FINISHED) => return DependencyHandlingResult::DependencyIsReady,
+            Err(Status::PROCESSING) => hint::spin_loop(),
             Err(value) => panic!("Unexpected status in handle_dependency: {}", value),
         }
     }

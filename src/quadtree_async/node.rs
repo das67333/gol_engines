@@ -1,43 +1,25 @@
-//! # QuadTree Node Module
+//! # QuadTree Node Data Structures
 //!
-//! This module defines the core data structures for the parallel Hashlife algorithm.
+//! Core data structures for representing nodes in the parallel Hashlife quadtree.
 //!
-//! ## Architecture Overview
+//! ## Node Structure
 //!
-//! The parallel Hashlife uses a work-stealing approach where multiple threads
-//! process nodes concurrently. Each node has a status that tracks its processing state.
+//! Each [`QuadTreeNode`] represents either:
+//! - **Internal node**: 4 children (nw, ne, sw, se) forming a 2×2 block
+//! - **Leaf node**: 8×8 grid of cells encoded in `nw` and `ne` fields
 //!
-//! ## Status State Machine
+//! ## Processing State
 //!
-//! ```text
-//!     ┌──────────────────────┐
-//!     │    NOT_STARTED (0)   │ ◄── Initial state
-//!     └──────────┬───────────┘
-//!                │
-//!                │ CAS(NOT_STARTED → PROCESSING)
-//!                │ by first thread to claim this node
-//!                ▼
-//!     ┌──────────────────────┐                      ┌──────────────────────┐
-//!     │    PROCESSING (1)    │ ◄─┐                  │    FINISHED (3)      │
-//!     └──────────┬───────────┘   │                  └──────────────────────┘
-//!                │               │                            ▲
-//!                ├───────────────┼────────────────────────────┘
-//!                │               │  store(FINISHED) when done
-//!                │ store(PENDING)│
-//!                │ when waiting  │ CAS(PENDING → PROCESSING)
-//!                │ for deps      │ when dependency notifies us
-//!                ▼               │
-//!     ┌──────────────────────┐   │
-//!     │     PENDING (2)      │ ──┘ Waiting for dependencies
-//!     └──────────────────────┘
-//! ```
+//! Nodes track their computation state via the `status` field.
+//! See `hashlife_executor` module for the complete state machine diagram.
 //!
-//! ## Thread Safety
+//! ## Cache Field
 //!
-//! - `status` is `AtomicU8` - safe for concurrent access
-//! - `cache` is protected by the status state machine:
-//!   - Only the thread that successfully CAS'd to PROCESSING can write
-//!   - Other threads must wait for FINISHED before reading the result
+//! The `cache` field is a union that serves dual purposes:
+//! - During processing: pointer to [`ProcessingData`]
+//! - After completion: cached result [`NodeIdx`]
+//!
+//! This space optimization reuses the same memory for both purposes.
 
 use smallvec::SmallVec;
 use std::{
@@ -46,58 +28,52 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU8},
 };
 
-/// Index of a node in the memory pool.
-///
-/// Each node has a unique `NodeIdx`.
+/// Node processing status constants.
+pub(super) struct Status;
+
+impl Status {
+    pub(super) const NOT_STARTED: u8 = 0;
+    pub(super) const PROCESSING: u8 = 1;
+    pub(super) const PENDING: u8 = 2;
+    pub(super) const FINISHED: u8 = 3;
+}
+
+/// Index uniquely identifying a node in the memory manager.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(super) struct NodeIdx(pub(super) u32);
 
-/// List of nodes that depend on this node's result.
+/// List of nodes waiting for this node's result.
 ///
-/// Uses `SmallVec` with inline capacity of 2 because:
-/// - Most nodes have 0-2 dependents (parent nodes in the quadtree)
-/// - Avoids heap allocation in the common case
-/// - Falls back to heap for rare cases with more dependents
+/// Optimized with `SmallVec<[_; 2]>` to avoid heap allocation in the common case,
+/// since almost every node (>>99.99%) has 1 dependent. A capacity of 2 is used
+/// because it does not increase the struct size compared to a capacity of 1.
 pub(super) type Dependents = SmallVec<[NodeIdx; 2]>;
 
-/// Temporary data used while processing a node.
+/// Temporary data allocated during node processing.
 ///
-/// This struct is heap-allocated when processing starts and freed when
-/// the node transitions to FINISHED. It's stored via pointer in `cache`.
+/// Heap-allocated when processing starts, freed when node reaches FINISHED state.
+/// Stored via pointer in the node's `cache` field.
 #[derive(Default)]
 pub(super) struct ProcessingData {
-    /// Intermediate child results.
-    /// - Indices 0-8: used for 9 overlapping children in stage 1
-    /// - Indices 0-3: used for 4 children in stage 2
+    /// Intermediate child node results (up to 9 for overlapping, 4 for final stage).
     pub(super) arr: [NodeIdx; 9],
-
-    /// Bitmask tracking which of the 9 children are not yet ready.
-    /// Bit i is set if `arr[i]` is still being computed.
+    /// Bitmask: bit `i` set if `arr[i]` (among first 9) is not yet computed.
     pub(super) mask9_waiting: u32,
-
-    /// Bitmask tracking which of the 4 children are not yet ready.
-    /// Bit i is set if `arr[i]` is still being computed.
+    /// Bitmask: bit `i` set if `arr[i]` (among first 4) is not yet computed.
     pub(super) mask4_waiting: u32,
-
-    /// Number of dependencies we're waiting for.
-    /// When this reaches 0, the node can be re-queued for processing.
+    /// Count of dependencies still being computed. Node can resume when this reaches 0.
     pub(super) waiting_cnt: u32,
-
-    /// Nodes that depend on this node's result.
-    /// When this node finishes, we decrement their `waiting_cnt`
-    /// and re-queue them if they're ready.
+    /// Nodes that registered as dependents of this node.
+    /// Notified when this node finishes.
     pub(super) dependents: Dependents,
 }
 
-/// Union type for the cache field.
+/// Union for cache field: either processing data pointer or result node.
 ///
-/// This is a space optimization: we reuse the same memory for:
-/// - A pointer to `ProcessingData` during computation
-/// - The final `NodeIdx` result after computation
+/// Space optimization that reuses the same memory for both purposes.
+/// The active variant depends on the node's processing state.
 union PtrOrNodeIdx {
-    /// Pointer to processing data
     ptr: *mut ProcessingData,
-    /// Cached result node index
     node: NodeIdx,
 }
 
@@ -109,53 +85,36 @@ impl Default for PtrOrNodeIdx {
     }
 }
 
-/// Thread-safe wrapper for `PtrOrNodeIdx`.
+/// Thread-safe wrapper for the cache union.
 ///
-/// Uses `UnsafeCell` because the status state machine guarantees
-/// that only one thread accesses this at a time:
-/// - The thread holding PROCESSING status has exclusive access
-/// - After FINISHED, the value is immutable
-///
-/// # Safety
-///
-/// Callers must ensure they only access this when they have the right
-/// to do so according to the processing flow.
+/// Safety is guaranteed by the status state machine:
+/// only the thread holding PROCESSING status can mutate this.
 #[derive(Debug, Default)]
 pub(super) struct PtrOrNodeIdxMut(UnsafeCell<PtrOrNodeIdx>);
 
 impl PtrOrNodeIdxMut {
-    pub(super) fn new() -> Self {
-        PtrOrNodeIdxMut(UnsafeCell::new(PtrOrNodeIdx {
-            ptr: std::ptr::null_mut(),
-        }))
-    }
-
-    /// Get the cached result node index.
     pub(super) fn get_node_idx(&self) -> NodeIdx {
         unsafe { (*self.0.get()).node }
     }
 
-    /// Set the cached result node index.
     pub(super) fn set_node_idx(&self, node: NodeIdx) {
         unsafe { (*self.0.get()).node = node }
     }
 
-    /// Get a mutable reference to the processing data.
     pub(super) fn get_ref(&self) -> &mut ProcessingData {
         unsafe { &mut *(*self.0.get()).ptr }
     }
 
-    /// Set the pointer to processing data.
     pub(super) fn set_ptr(&self, ptr: *mut ProcessingData) {
         unsafe { (*self.0.get()).ptr = ptr }
     }
 }
 
-/// A node of the quadtree.
+/// A node in the Hashlife quadtree.
 ///
-/// # Structure
+/// ## Structure
 ///
-/// For internal nodes (non-leaf):
+/// **Internal nodes** (non-leaf):
 /// ```text
 ///     ┌────┬────┐
 ///     │ nw │ ne │
@@ -164,82 +123,47 @@ impl PtrOrNodeIdxMut {
 ///     └────┴────┘
 /// ```
 ///
-/// For leaf nodes (8x8 cells):
-/// - `nw` and `ne` together encode 64 cells as bits
+/// **Leaf nodes** (8×8 cells):
+/// - `nw` and `ne` encode 64 cells as bits (32 bits each)
 /// - `sw` and `se` are unused
 ///
-/// # Thread Safety
+/// ## Thread Safety
 ///
-/// - `nw`, `ne`, `sw`, `se`: immutable after creation (no synchronization needed)
-/// - `status`: `AtomicU8` for concurrent access
+/// - `nw`, `ne`, `sw`, `se`, `flags`: immutable after creation
+/// - `status`: atomic for concurrent state transitions
 /// - `cache`: protected by status state machine
-/// - `flags`: immutable after creation
-/// - `lock_ht_slot`: `AtomicBool` for hashtable insertion synchronization
+/// - `lock_ht_slot`: atomic for hashtable synchronization
 #[derive(Debug, Default)]
 pub(super) struct QuadTreeNode<Extra> {
-    // === Immutable after creation ===
-
-    /// Northwest child (or lower 32 bits of leaf cells)
+    /// Northwest child or lower 32 bits of leaf cells
     pub(super) nw: NodeIdx,
-    /// Northeast child (or upper 32 bits of leaf cells)
+    /// Northeast child or upper 32 bits of leaf cells
     pub(super) ne: NodeIdx,
-    /// Southwest child
+    /// Southwest child (unused for leaves)
     pub(super) sw: NodeIdx,
-    /// Southeast child
+    /// Southeast child (unused for leaves)
     pub(super) se: NodeIdx,
-
-    // === Mutable, protected by status state machine ===
-
-    /// Cache field with dual purpose:
-    /// - During processing: pointer to `ProcessingData`
-    /// - After computation completes: the computed result `NodeIdx`
+    /// Cache: either ProcessingData pointer or result NodeIdx
     pub(super) cache: PtrOrNodeIdxMut,
-
-    /// Processing status. See module docs for the state machine.
-    ///
-    /// Values: NOT_STARTED(0), PROCESSING(1), PENDING(2), FINISHED(3)
+    /// Processing status (see hashlife_executor for state machine)
     pub(super) status: AtomicU8,
-
-    // === Immutable after creation ===
-
-    /// Flags encoding node properties:
-    /// - Bit 0: is_leaf (1 = leaf node with cells, 0 = internal node)
-    /// - Bit 1: is_used (1 = node is in use, 0 = node is free for reuse)
+    /// Bit 0: is_leaf, Bit 1: is_used
     pub(super) flags: u8,
-
-    /// Lock for hashtable slot during concurrent insertions.
-    ///
-    /// When multiple threads try to insert the same node, this lock
-    /// ensures only one succeeds and others find the existing node.
+    /// Lock for hashtable slot synchronization during concurrent insertions
     pub(super) lock_ht_slot: AtomicBool,
-
-    // === StreamLife extension (currently unused) ===
-
-    /// Extra data for StreamLife algorithm.
-    /// For Hashlife, this is `()` (zero-sized).
-    pub(super) extra: UnsafeCell<Extra>,
+    /// Extra data for StreamLife (unused in Hashlife, zero-sized)
+    pub(super) _extra: UnsafeCell<Extra>,
 }
 
-// SAFETY: QuadTreeNode is Sync because:
-// 1. Immutable fields (nw, ne, sw, se, flags) are safe to share
-// 2. AtomicU8 (status) and AtomicBool (lock_ht_slot) are inherently Sync
-// 3. cache (UnsafeCell) is protected by the status state machine
-// 4. extra (UnsafeCell) is only accessed by StreamLife with proper synchronization
+// SAFETY: Sync because atomics handle synchronization and cache is protected by status state machine
 unsafe impl<Extra> Sync for QuadTreeNode<Extra> {}
 
 impl<Extra> QuadTreeNode<Extra> {
-    /// Check if this node slot is unused (available for allocation).
     pub(super) fn not_used(&self) -> bool {
         self.flags & 1 << 1 == 0
     }
 
-    /// Build the flags byte from boolean properties.
-    ///
-    /// # Flag Layout
-    /// ```text
-    /// Bit 0: is_leaf  (1 = leaf with 8x8 cells, 0 = internal node)
-    /// Bit 1: is_used  (1 = allocated, 0 = free slot)
-    /// ```
+    /// Build flags byte: bit 0 = is_leaf, bit 1 = is_used
     pub(super) fn build_flags(is_leaf: bool, is_used: bool) -> u8 {
         let mut flags = 0;
         if is_leaf {
@@ -251,10 +175,7 @@ impl<Extra> QuadTreeNode<Extra> {
         flags
     }
 
-    /// Compute hash for hashtable lookup.
-    ///
-    /// Uses a simple polynomial hash with prime-like multipliers.
-    /// The final mixing step (h + h>>11) improves distribution.
+    /// Hash function for hashtable lookup (polynomial hash with mixing).
     pub(super) fn hash(nw: NodeIdx, ne: NodeIdx, sw: NodeIdx, se: NodeIdx) -> usize {
         let h = 0u32
             .wrapping_add((nw.0).wrapping_mul(5))
@@ -264,81 +185,49 @@ impl<Extra> QuadTreeNode<Extra> {
         h.wrapping_add(h >> 11) as usize
     }
 
-    /// Get the four children as an array [nw, ne, sw, se].
+    /// Return children as array [nw, ne, sw, se].
     pub(super) fn parts(&self) -> [NodeIdx; 4] {
         [self.nw, self.ne, self.sw, self.se]
     }
 
-    /// Returns the cells of a leaf node row by row (8 rows of 8 bits each).
+    /// Extract leaf cells as 8 bytes (one byte per row).
     ///
-    /// # Leaf Cell Layout
-    ///
-    /// For a leaf node, `nw` and `ne` together encode 64 cells:
-    /// ```text
-    /// nw (32 bits) = rows 0-3, columns 0-7
-    /// ne (32 bits) = rows 4-7, columns 0-7
-    ///
-    /// Interpreted as [u8; 8]: each byte is one row
-    /// ```
+    /// Layout: `nw` = rows 0-3, `ne` = rows 4-7
     pub(super) fn leaf_cells(&self) -> [u8; 8] {
         (self.nw.0 as u64 | ((self.ne.0 as u64) << 32)).to_le_bytes()
     }
 
-    /// Extract the northwest 4x4 quadrant from an 8x8 leaf.
-    ///
-    /// # Layout
-    /// ```text
-    /// 8x8 leaf:           4x4 NW quadrant:
-    /// ┌───────┬───────┐   ┌───────┐
-    /// │ NW    │ NE    │   │ NW    │
-    /// │ (4x4) │ (4x4) │   │ (4x4) │
-    /// ├───────┼───────┤   └───────┘
-    /// │ SW    │ SE    │
-    /// │ (4x4) │ (4x4) │
-    /// └───────┴───────┘
-    /// ```
-    ///
-    /// Returns 16 bits representing a 4x4 grid (4 rows × 4 columns).
+    /// Extract northwest 4×4 quadrant from 8×8 leaf.
     pub(super) fn leaf_nw(&self) -> u16 {
         let mut result = 0;
         for i in 0..4 {
-            // Extract lower 4 bits of each of the first 4 rows
             result |= ((self.nw.0 >> (i * 8)) & 0xF) << (i * 4);
         }
         result as u16
     }
 
-    /// Extract the northeast 4x4 quadrant from an 8x8 leaf.
-    ///
-    /// Returns 16 bits representing a 4x4 grid (4 rows × 4 columns).
+    /// Extract northeast 4×4 quadrant from 8×8 leaf.
     pub(super) fn leaf_ne(&self) -> u16 {
         let mut result = 0;
         for i in 0..4 {
-            // Extract upper 4 bits of each of the first 4 rows
             result |= ((self.nw.0 >> (i * 8 + 4)) & 0xF) << (i * 4);
         }
         result as u16
     }
 
-    /// Extract the southwest 4x4 quadrant from an 8x8 leaf.
-    ///
-    /// Returns 16 bits representing a 4x4 grid (4 rows × 4 columns).
+    /// Extract southwest 4×4 quadrant from 8×8 leaf.
     pub(super) fn leaf_sw(&self) -> u16 {
         let mut result = 0;
         for i in 0..4 {
-            // Extract lower 4 bits of each of the last 4 rows
             result |= ((self.ne.0 >> (i * 8)) & 0xF) << (i * 4);
         }
         result as u16
     }
 
-    /// Extract the southeast 4x4 quadrant from an 8x8 leaf.
-    ///
-    /// Returns 16 bits representing a 4x4 grid (4 rows × 4 columns).
+    /// Extract southeast 4×4 quadrant from 8×8 leaf.
     pub(super) fn leaf_se(&self) -> u16 {
         let mut result = 0;
         for i in 0..4 {
-            // Extract upper 4 bits of each of the last 4 rows
             result |= ((self.ne.0 >> (i * 8 + 4)) & 0xF) << (i * 4);
         }
         result as u16

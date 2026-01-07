@@ -1,5 +1,8 @@
-use super::{ExecutionStatistics, NodeIdx, QuadTreeNode};
-use std::{cell::UnsafeCell, hint::spin_loop, sync::atomic::Ordering};
+use super::{
+    node::{NodeIdx, QuadTreeNode},
+    statistics::ExecutionStatistics,
+};
+use std::{cell::UnsafeCell, hint, sync::atomic::Ordering};
 
 /// Stores the nodes of the quadtree.
 pub(super) struct MemoryManager<Extra> {
@@ -154,7 +157,7 @@ impl<Extra: Default> MemoryManagerRaw<Extra> {
                 .is_err()
             {
                 while lock.load(Ordering::Relaxed) {
-                    spin_loop();
+                    hint::spin_loop();
                 }
             }
 

@@ -1,9 +1,12 @@
 use super::{
-    status, BlankNodes, ExecutionStatistics, MemoryManager, NodeIdx, QuadTreeNode, LEAF_SIZE,
-    LEAF_SIZE_LOG2,
+    blank::BlankNodes,
     hashlife_executor::HashLifeExecutor,
+    memory::MemoryManager,
+    node::{NodeIdx, QuadTreeNode, Status},
+    statistics::{ExecutionStatistics, TasksCountGuard},
+    LEAF_SIZE, LEAF_SIZE_LOG2,
 };
-use crate::{quadtree_async::TasksCountGuard, GoLEngine, Pattern, PatternNode, Topology};
+use crate::{GoLEngine, Pattern, PatternNode, Topology};
 use ahash::AHashMap as HashMap;
 use anyhow::{anyhow, Result};
 use num_bigint::BigInt;
@@ -195,15 +198,15 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
     fn update_node_sync(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
         let n = self.mem.get(node);
         let status = n.status.load(Ordering::Acquire);
-        if status == status::FINISHED {
+        if status == Status::FINISHED {
             return n.cache.get_node_idx();
         }
 
-        if status == status::NOT_STARTED
+        if status == Status::NOT_STARTED
             && n.status
                 .compare_exchange(
-                    status::NOT_STARTED,
-                    status::PROCESSING,
+                    Status::NOT_STARTED,
+                    Status::PROCESSING,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 )
@@ -211,10 +214,10 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
         {
             let cache = self.update_inner_sync(node, size_log2);
             n.cache.set_node_idx(cache);
-            n.status.store(status::FINISHED, Ordering::Release);
+            n.status.store(Status::FINISHED, Ordering::Release);
             cache
         } else {
-            while n.status.load(Ordering::Acquire) != status::FINISHED {
+            while n.status.load(Ordering::Acquire) != Status::FINISHED {
                 if ExecutionStatistics::is_poisoned() {
                     return NodeIdx::default();
                 }
@@ -299,15 +302,15 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
     pub(super) async fn update_node_async(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
         let n = self.mem.get(node);
         let status = n.status.load(Ordering::Acquire);
-        if status == status::FINISHED {
+        if status == Status::FINISHED {
             return n.cache.get_node_idx();
         }
 
-        if status == status::NOT_STARTED
+        if status == Status::NOT_STARTED
             && n.status
                 .compare_exchange(
-                    status::NOT_STARTED,
-                    status::PROCESSING,
+                    Status::NOT_STARTED,
+                    Status::PROCESSING,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 )
@@ -319,10 +322,10 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
                 self.update_inner_sync(node, size_log2)
             };
             n.cache.set_node_idx(cache);
-            n.status.store(status::FINISHED, Ordering::Release);
+            n.status.store(Status::FINISHED, Ordering::Release);
             cache
         } else {
-            while n.status.load(Ordering::Acquire) != status::FINISHED {
+            while n.status.load(Ordering::Acquire) != Status::FINISHED {
                 if ExecutionStatistics::is_poisoned() {
                     return NodeIdx::default();
                 }
