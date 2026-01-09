@@ -25,8 +25,8 @@ pub type DefaultEngine = HashLifeEngineAsync;
 
 pub const VERSION: &str = "0.2.1";
 
-use std::sync::atomic::{AtomicU32, AtomicU64};
-pub static WORKER_THREADS: AtomicU32 = AtomicU32::new(0);
+use std::sync::atomic::{AtomicU64, AtomicUsize};
+pub static WORKER_THREADS: AtomicUsize = AtomicUsize::new(0);
 pub const MIN_TASK_SPAWN_SHIFT: u32 = 5;
 pub const MAX_TASKS_COUNT: u64 = 1024;
 pub static TASKS_SPAWNED_COUNT: AtomicU64 = AtomicU64::new(0);

@@ -1,7 +1,7 @@
 #![feature(asm_experimental_arch)] // нужно для inline-asm
-use std::time::Duration;
-use libc::{clock_gettime, timespec, CLOCK_MONOTONIC_RAW};
 use criterion::{criterion_group, criterion_main, Criterion};
+use libc::{clock_gettime, timespec, CLOCK_MONOTONIC_RAW};
+use std::time::Duration;
 
 // -------------------------------
 // Вариант 1: clock_gettime

@@ -78,10 +78,11 @@ pub(super) struct HashLifeExecutor<'a, Extra: Default + Sync> {
     mem: &'a MemoryManager<Extra>,
 }
 
-static MAX_LEN: AtomicUsize = AtomicUsize::new(0);
+static C: AtomicUsize = AtomicUsize::new(0);
 
 impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     const THREAD_THROTTLE_DURATION: Duration = Duration::from_millis(10);
+    const STEAL_BATCH_SIZE: usize = 2;
 
     pub(super) fn new(base: &'a HashLifeEngineAsync<Extra>) -> Self {
         Self {
@@ -92,10 +93,10 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         }
     }
 
-    pub(super) fn run(&self, num_threads: u32) -> NodeIdx {
+    pub(super) fn run(&self, num_threads: usize) -> NodeIdx {
         // Create worker queues and stealers
-        let mut queues = Vec::with_capacity(num_threads as usize);
-        let mut stealers = Vec::with_capacity(num_threads as usize);
+        let mut queues = Vec::with_capacity(num_threads);
+        let mut stealers = Vec::with_capacity(num_threads);
 
         for _ in 0..num_threads {
             let queue = Worker::new_lifo();
@@ -119,7 +120,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             "Nodes count: {}",
             crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::Relaxed)
         );
-        println!("Max queue len: {}", MAX_LEN.load(Ordering::Relaxed));
+        println!("C: {}", C.load(Ordering::Relaxed));
 
         let n = self.mem.get(self.root);
         n.cache.get_node_idx()
@@ -155,8 +156,12 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             // Steal from other threads in round-robin order starting from next thread
             for i in (thread_id + 1..stealers.len()).chain(0..thread_id) {
                 loop {
-                    match stealers[i].steal_batch_and_pop(queue) {
-                        Steal::Success(task) => return Some(task),
+                    match stealers[i].steal_batch_with_limit_and_pop(queue, Self::STEAL_BATCH_SIZE)
+                    {
+                        Steal::Success(task) => {
+                            C.fetch_add(1, Ordering::Relaxed);
+                            return Some(task);
+                        }
                         Steal::Empty => break,
                         Steal::Retry => continue,
                     }

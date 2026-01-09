@@ -552,7 +552,7 @@ impl GoLEngine for StreamLifeEngineAsync {
             let mut builder = tokio::runtime::Builder::new_multi_thread();
             let threads = WORKER_THREADS.load(Ordering::Relaxed);
             if threads > 0 {
-                builder.worker_threads(WORKER_THREADS.load(Ordering::Relaxed) as usize);
+                builder.worker_threads(WORKER_THREADS.load(Ordering::Relaxed));
             }
 
             builder

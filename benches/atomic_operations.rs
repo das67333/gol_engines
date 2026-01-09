@@ -13,7 +13,8 @@ fn bench_atomics(c: &mut Criterion) {
 
     group.bench_function("cmpxchg_fail", |b| {
         b.iter(|| {
-            a.compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed).unwrap_err();
+            a.compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed)
+                .unwrap_err();
         });
     });
 
@@ -21,7 +22,8 @@ fn bench_atomics(c: &mut Criterion) {
         let mut value = 0;
         a.store(value, Ordering::Relaxed);
         b.iter(|| {
-            a.compare_exchange(value, value + 1, Ordering::Relaxed, Ordering::Relaxed).unwrap();
+            a.compare_exchange(value, value + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .unwrap();
             value += 1;
         });
     });

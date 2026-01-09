@@ -10,7 +10,7 @@ use crate::{GoLEngine, Pattern, PatternNode, Topology, WORKER_THREADS};
 use ahash::AHashMap as HashMap;
 use anyhow::{anyhow, Result};
 use num_bigint::BigInt;
-use std::{future::Future, hint::spin_loop, pin::Pin, sync::atomic::Ordering};
+use std::{future::Future, hint::spin_loop, pin::Pin, sync::atomic::Ordering, thread};
 
 /// Parallel implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife).
 ///
@@ -512,7 +512,12 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         }
 
         self.root = {
-            let num_threads = WORKER_THREADS.load(Ordering::Relaxed);
+            let mut num_threads = WORKER_THREADS.load(Ordering::Relaxed);
+            if num_threads == 0 {
+                num_threads = thread::available_parallelism()
+                    .map(|n| n.get())
+                    .expect("Failed to request available parallelism");
+            }
             // let mut builder = tokio::runtime::Builder::new_multi_thread();
             // if num_threads > 0 {
             //     builder.worker_threads(num_threads as usize);
