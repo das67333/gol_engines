@@ -1,4 +1,4 @@
-use super::{ExecutionStatistics, NodeIdx};
+use super::{node::NodeIdx, statistics::ExecutionStatistics};
 use std::{
     cell::UnsafeCell,
     hash::{Hash, Hasher},

@@ -1,13 +1,16 @@
 use super::{
-    hashlife::HashLifeEngineAsync, status, CacheEntry, ExecutionStatistics, NodeIdx, QuadTreeNode,
-    StreamLifeCache, TasksCountGuard, LEAF_SIZE_LOG2,
+    hashlife::HashLifeEngineAsync,
+    node::{NodeIdx, QuadTreeNode, Status},
+    statistics::{ExecutionStatistics, TasksCountGuard},
+    streamlife_cache::{CacheEntry, StreamLifeCache},
+    LEAF_SIZE_LOG2,
 };
 use crate::{GoLEngine, Pattern, Topology, WORKER_THREADS};
 use anyhow::{anyhow, Result};
 use num_bigint::BigInt;
 use std::{future::Future, hint::spin_loop, pin::Pin, sync::atomic::Ordering};
 
-type MemoryManager = super::MemoryManager<u64>;
+type MemoryManager = super::memory::MemoryManager<u64>;
 
 /// Implementation of [StreamLife algorithm](https://conwaylife.com/wiki/StreamLife).
 ///
@@ -86,21 +89,21 @@ impl StreamLifeEngineAsync {
 
         let n = self.base.mem.get(idx);
         let status = n.status_extra.load(Ordering::Acquire);
-        if status == status::CACHED {
+        if status == Status::FINISHED {
             return unsafe { *n.extra.get() };
         }
 
-        if !(status == status::NOT_CACHED
+        if !(status == Status::NOT_STARTED
             && n.status_extra
                 .compare_exchange(
-                    status::NOT_CACHED,
-                    status::PROCESSING,
+                    Status::NOT_STARTED,
+                    Status::PROCESSING,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 )
                 .is_ok())
         {
-            while n.status_extra.load(Ordering::Acquire) != status::CACHED {
+            while n.status_extra.load(Ordering::Acquire) != Status::FINISHED {
                 if ExecutionStatistics::is_poisoned() {
                     return 0;
                 }
@@ -113,7 +116,7 @@ impl StreamLifeEngineAsync {
         if size_log2 == LEAF_SIZE_LOG2 + 1 {
             let extra = self.determine_direction(n.nw, n.ne, n.sw, n.se);
             unsafe { *n.extra.get() = extra };
-            n.status_extra.store(status::CACHED, Ordering::Release);
+            n.status_extra.store(Status::FINISHED, Ordering::Release);
             return extra;
         }
 
@@ -146,7 +149,7 @@ impl StreamLifeEngineAsync {
         }
         if adml == 0 {
             unsafe { *n.extra.get() = 0 };
-            n.status_extra.store(status::CACHED, Ordering::Release);
+            n.status_extra.store(Status::FINISHED, Ordering::Release);
             return 0;
         }
 
@@ -261,7 +264,7 @@ impl StreamLifeEngineAsync {
 
         let extra = adml | (lanes << 32);
         unsafe { *n.extra.get() = extra };
-        n.status_extra.store(status::CACHED, Ordering::Release);
+        n.status_extra.store(Status::FINISHED, Ordering::Release);
         extra
     }
 
@@ -397,22 +400,22 @@ impl StreamLifeEngineAsync {
         let entry = self.bicache.entry(idx);
         let status = unsafe { &(*entry).status };
         let status_value = status.load(Ordering::Acquire);
-        if status_value == status::CACHED {
+        if status_value == Status::FINISHED {
             return unsafe { (*entry).value };
         }
 
         let entry_usize = entry as usize;
-        if !(status_value == status::NOT_CACHED
+        if !(status_value == Status::NOT_STARTED
             && status
                 .compare_exchange(
-                    status::NOT_CACHED,
-                    status::PROCESSING,
+                    Status::NOT_STARTED,
+                    Status::PROCESSING,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 )
                 .is_ok())
         {
-            while status.load(Ordering::Acquire) != status::CACHED {
+            while status.load(Ordering::Acquire) != Status::FINISHED {
                 if ExecutionStatistics::is_poisoned() {
                     return (NodeIdx::default(), NodeIdx::default());
                 }
@@ -443,7 +446,7 @@ impl StreamLifeEngineAsync {
                 (i1, i2)
             };
             unsafe { (*(entry_usize as *mut CacheEntry)).value = res };
-            status.store(status::CACHED, Ordering::Release);
+            status.store(Status::FINISHED, Ordering::Release);
             return res;
         }
 
@@ -467,7 +470,7 @@ impl StreamLifeEngineAsync {
         };
 
         unsafe { (*(entry_usize as *mut CacheEntry)).value = result };
-        status.store(status::CACHED, Ordering::Release);
+        status.store(Status::FINISHED, Ordering::Release);
         result
     }
 

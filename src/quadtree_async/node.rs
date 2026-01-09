@@ -152,7 +152,8 @@ pub(super) struct QuadTreeNode<Extra> {
     /// Lock for hashtable slot synchronization during concurrent insertions
     pub(super) lock_ht_slot: AtomicBool,
     /// Extra data for StreamLife (unused in Hashlife, zero-sized)
-    pub(super) _extra: UnsafeCell<Extra>,
+    pub(super) extra: UnsafeCell<Extra>,
+    pub(super) status_extra: AtomicU8,
 }
 
 // SAFETY: Sync because atomics handle synchronization and cache is protected by status state machine

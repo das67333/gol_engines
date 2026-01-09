@@ -512,8 +512,8 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         }
 
         self.root = {
-            // let mut builder = tokio::runtime::Builder::new_multi_thread();
             let num_threads = WORKER_THREADS.load(Ordering::Relaxed);
+            // let mut builder = tokio::runtime::Builder::new_multi_thread();
             // if num_threads > 0 {
             //     builder.worker_threads(num_threads as usize);
             // }
