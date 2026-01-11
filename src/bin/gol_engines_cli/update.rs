@@ -27,7 +27,7 @@ pub(super) struct UpdateArgs {
     /// The number of worker threads to use for the update;
     /// ignored for single-threaded engines
     #[arg(short, long, default_value_t = 1)]
-    workers: u32,
+    workers: usize,
 
     /// The pattern will be updated by 2^gens_log2 generations
     #[arg(short, long)]
