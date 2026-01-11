@@ -46,14 +46,14 @@
 use super::{
     hashlife::HashLifeEngineAsync,
     memory::MemoryManager,
-    node::{Dependents, NodeIdx, ProcessingData, QuadTreeNode, Status},
-    LEAF_SIZE, LEAF_SIZE_LOG2,
+    node::{Dependents, NodeIdx, ProcessingData, QuadTreeNode},
+    status, LEAF_SIZE, LEAF_SIZE_LOG2,
 };
 use crossbeam_deque::{Steal, Stealer, Worker};
 use smallvec::{smallvec, SmallVec};
 use std::{
     hint, mem,
-    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
     thread,
     time::Duration,
 };
@@ -78,10 +78,13 @@ pub(super) struct HashLifeExecutor<'a, Extra: Default + Sync> {
     mem: &'a MemoryManager<Extra>,
 }
 
-static C: AtomicUsize = AtomicUsize::new(0);
-
 impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
+    /// The duration to sleep when no tasks are available.
     const THREAD_THROTTLE_DURATION: Duration = Duration::from_millis(10);
+    /// Number of tasks to steal at once when work-stealing.
+    /// The value should be chosen to minimize work-stealing events. However, typically
+    /// only about 10^-6 of tasks are stolen relative to those taken from the local queue.
+    /// Since this occurs so rarely, the exact value has minimal impact on performance.
     const STEAL_BATCH_SIZE: usize = 2;
 
     pub(super) fn new(base: &'a HashLifeEngineAsync<Extra>) -> Self {
@@ -120,7 +123,6 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             "Nodes count: {}",
             crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::Relaxed)
         );
-        println!("C: {}", C.load(Ordering::Relaxed));
 
         let n = self.mem.get(self.root);
         n.cache.get_node_idx()
@@ -158,10 +160,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                 loop {
                     match stealers[i].steal_batch_with_limit_and_pop(queue, Self::STEAL_BATCH_SIZE)
                     {
-                        Steal::Success(task) => {
-                            C.fetch_add(1, Ordering::Relaxed);
-                            return Some(task);
-                        }
+                        Steal::Success(task) => return Some(task),
                         Steal::Empty => break,
                         Steal::Retry => continue,
                     }
@@ -207,7 +206,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     ///
     /// When a child is not ready:
     /// - `DependencyIsReady`: Child already computed, use cached result
-    /// - `StartedByThisThread`: We claimed the child, push to local queue (LIFO → depth-first)
+    /// - `StartedByThisThread`: We claimed the child, push to local queue
     /// - `StartedByOtherThread`: Another thread processing it, register as dependent
     fn update_node(
         &self,
@@ -311,10 +310,13 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     fn notify_dependents(&self, task: &Task, dependents: Dependents, queue: &Worker<Task>) {
         for &dependent in dependents.iter() {
             let n = self.mem.get(dependent);
-            let _guard = ProcessingGuard::new(&n.status);
-            let dep_data = n.cache.get_ref();
-            dep_data.waiting_cnt -= 1;
-            if dep_data.waiting_cnt == 0 {
+            let waiting_cnt = {
+                let _guard = ProcessingGuard::new(&n.status);
+                let dep_data = n.cache.get_ref();
+                dep_data.waiting_cnt -= 1;
+                dep_data.waiting_cnt
+            };
+            if waiting_cnt == 0 {
                 queue.push(Task::new(dependent, task.size_log2 + 1));
             }
         }
@@ -525,7 +527,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
 
 /// Check if a node has finished processing.
 fn is_finished(status: &AtomicU8) -> bool {
-    status.load(Ordering::Acquire) == Status::FINISHED
+    status.load(Ordering::Acquire) == status::FINISHED
 }
 
 /// Initialize a node for processing by transitioning NOT_STARTED → PROCESSING → PENDING.
@@ -543,8 +545,8 @@ fn start_processing_node<Extra: Default + Sync>(
     if node
         .status
         .compare_exchange(
-            Status::NOT_STARTED,
-            Status::PROCESSING,
+            status::NOT_STARTED,
+            status::PROCESSING,
             Ordering::Relaxed,
             Ordering::Relaxed,
         )
@@ -558,7 +560,7 @@ fn start_processing_node<Extra: Default + Sync>(
         ..Default::default()
     };
     node.cache.set_ptr(Box::into_raw(Box::new(pd)));
-    node.status.store(Status::PENDING, Ordering::Release);
+    node.status.store(status::PENDING, Ordering::Release);
     true
 }
 
@@ -566,20 +568,13 @@ fn start_processing_node<Extra: Default + Sync>(
 ///
 /// Panics if status is not in `valid_states` while waiting.
 /// Uses weak CAS in a loop for better performance on contended atomics.
-fn atomic_transition(atomic: &AtomicU8, from: u8, to: u8, valid_states: &[u8]) {
-    let mut current = atomic.load(Ordering::Relaxed);
-    loop {
-        while current != from {
-            if !valid_states.contains(&current) {
-                panic!("Invalid state: {}", current)
-            }
+fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8) {
+    while a
+        .compare_exchange_weak(from, to, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        while a.load(Ordering::Relaxed) != from {
             hint::spin_loop();
-            current = atomic.load(Ordering::Relaxed);
-        }
-
-        match atomic.compare_exchange_weak(from, to, Ordering::Acquire, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(actual) => current = actual,
         }
     }
 }
@@ -597,12 +592,7 @@ struct ProcessingGuard<'a> {
 impl<'a> ProcessingGuard<'a> {
     /// Acquire PROCESSING status, spinning until PENDING.
     fn new(status: &'a AtomicU8) -> Self {
-        atomic_transition(
-            status,
-            Status::PENDING,
-            Status::PROCESSING,
-            &[Status::PROCESSING],
-        );
+        atomic_transition_loop(status, status::PENDING, status::PROCESSING);
         Self {
             status,
             released: false,
@@ -613,7 +603,7 @@ impl<'a> ProcessingGuard<'a> {
 impl<'a> ProcessingGuard<'a> {
     /// Mark node as FINISHED and prevent drop from reverting to PENDING.
     fn finish(&mut self) {
-        self.status.store(Status::FINISHED, Ordering::Release);
+        self.status.store(status::FINISHED, Ordering::Release);
         self.released = true;
     }
 }
@@ -621,7 +611,7 @@ impl<'a> ProcessingGuard<'a> {
 impl<'a> Drop for ProcessingGuard<'a> {
     fn drop(&mut self) {
         if !self.released {
-            self.status.store(Status::PENDING, Ordering::Release);
+            self.status.store(status::PENDING, Ordering::Release);
         }
     }
 }
@@ -647,28 +637,32 @@ fn handle_dependency<Extra: Default + Sync>(
     task: &Task,
 ) -> DependencyHandlingResult {
     let status = n.status.load(Ordering::Acquire);
-    if status == Status::FINISHED {
+    if status == status::FINISHED {
         return DependencyHandlingResult::DependencyIsReady;
     }
 
-    if status == Status::NOT_STARTED && start_processing_node(n, smallvec![task.idx]) {
+    if status == status::NOT_STARTED && start_processing_node(n, smallvec![task.idx]) {
         return DependencyHandlingResult::StartedByThisThread;
     }
 
     loop {
         match n.status.compare_exchange_weak(
-            Status::PENDING,
-            Status::PROCESSING,
+            status::PENDING,
+            status::PROCESSING,
             Ordering::Acquire,
             Ordering::Acquire,
         ) {
             Ok(_) => {
                 n.cache.get_ref().dependents.push(task.idx);
-                n.status.store(Status::PENDING, Ordering::Release);
+                n.status.store(status::PENDING, Ordering::Release);
                 return DependencyHandlingResult::StartedByOtherThread;
             }
-            Err(Status::FINISHED) => return DependencyHandlingResult::DependencyIsReady,
-            Err(Status::PROCESSING) => hint::spin_loop(),
+            Err(status::FINISHED) => return DependencyHandlingResult::DependencyIsReady,
+            Err(status::PROCESSING) => {
+                while n.status.load(Ordering::Relaxed) == status::PROCESSING {
+                    hint::spin_loop()
+                }
+            }
             Err(value) => panic!("Unexpected status in handle_dependency: {}", value),
         }
     }

@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 
 fn main() {
     let timer = std::time::Instant::now();
-    let mut engine = HashLifeEngineAsync::new(5 << 10);
+    let mut engine = HashLifeEngineAsync::new(18 << 10);
     println!("Time spent on initializing engine: {:?}", timer.elapsed());
 
     let timer = std::time::Instant::now();
@@ -16,7 +16,7 @@ fn main() {
 
     WORKER_THREADS.store(4, Ordering::Relaxed);
     let timer = std::time::Instant::now();
-    let gens_log2 = 10;
+    let gens_log2 = 12;
     engine.update(gens_log2).unwrap();
     println!(
         "Time on updating pattern by 2^{} generations: {:?}",
@@ -31,5 +31,5 @@ fn main() {
     // );
     println!("Population: {}", updated.population());
     println!("Hash: 0x{:016x}", updated.hash());
-    assert_eq!(updated.hash(), 0x5e1805e773c45a65);
+    assert_eq!(updated.hash(), 0x02dda802a893049e);
 }

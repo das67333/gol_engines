@@ -22,21 +22,7 @@
 //! This space optimization reuses the same memory for both purposes.
 
 use smallvec::SmallVec;
-use std::{
-    cell::UnsafeCell,
-    ptr,
-    sync::atomic::{AtomicBool, AtomicU8},
-};
-
-/// Node processing status constants.
-pub(super) struct Status;
-
-impl Status {
-    pub(super) const NOT_STARTED: u8 = 0;
-    pub(super) const PROCESSING: u8 = 1;
-    pub(super) const PENDING: u8 = 2;
-    pub(super) const FINISHED: u8 = 3;
-}
+use std::{cell::UnsafeCell, ptr, sync::atomic::AtomicU8};
 
 /// Index uniquely identifying a node in the memory manager.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -129,10 +115,11 @@ impl PtrOrNodeIdxMut {
 ///
 /// ## Thread Safety
 ///
-/// - `nw`, `ne`, `sw`, `se`, `flags`: immutable after creation
+/// DO NOT CREATE A MUTABLE REFERENCE AFTER CREATION!
+/// - `nw`, `ne`, `sw`, `se`: immutable after creation
+/// - `cache`: protected by status state machine, wraps [`UnsafeCell`]
 /// - `status`: atomic for concurrent state transitions
-/// - `cache`: protected by status state machine
-/// - `lock_ht_slot`: atomic for hashtable synchronization
+/// - `flags`: atomic, combines node metadata and hashtable slot lock
 #[derive(Debug, Default)]
 pub(super) struct QuadTreeNode<Extra> {
     /// Northwest child or lower 32 bits of leaf cells
@@ -147,11 +134,9 @@ pub(super) struct QuadTreeNode<Extra> {
     pub(super) cache: PtrOrNodeIdxMut,
     /// Processing status (see hashlife_executor for state machine)
     pub(super) status: AtomicU8,
-    /// Bit 0: is_leaf, Bit 1: is_used
-    pub(super) flags: u8,
-    /// Lock for hashtable slot synchronization during concurrent insertions
-    pub(super) lock_ht_slot: AtomicBool,
-    /// Extra data for StreamLife (unused in Hashlife, zero-sized)
+    /// Flags are used in [`MemoryManager::find_or_create_inner`]
+    pub(super) flags: AtomicU8,
+    /// Extra data for StreamLife (unused in Hashlife)
     pub(super) extra: UnsafeCell<Extra>,
     pub(super) status_extra: AtomicU8,
 }
@@ -160,32 +145,6 @@ pub(super) struct QuadTreeNode<Extra> {
 unsafe impl<Extra> Sync for QuadTreeNode<Extra> {}
 
 impl<Extra> QuadTreeNode<Extra> {
-    pub(super) fn not_used(&self) -> bool {
-        self.flags & 1 << 1 == 0
-    }
-
-    /// Build flags byte: bit 0 = is_leaf, bit 1 = is_used
-    pub(super) fn build_flags(is_leaf: bool, is_used: bool) -> u8 {
-        let mut flags = 0;
-        if is_leaf {
-            flags |= 1 << 0;
-        }
-        if is_used {
-            flags |= 1 << 1;
-        }
-        flags
-    }
-
-    /// Hash function for hashtable lookup (polynomial hash with mixing).
-    pub(super) fn hash(nw: NodeIdx, ne: NodeIdx, sw: NodeIdx, se: NodeIdx) -> usize {
-        let h = 0u32
-            .wrapping_add((nw.0).wrapping_mul(5))
-            .wrapping_add((ne.0).wrapping_mul(17))
-            .wrapping_add((sw.0).wrapping_mul(257))
-            .wrapping_add((se.0).wrapping_mul(65537));
-        h.wrapping_add(h >> 11) as usize
-    }
-
     /// Return children as array [nw, ne, sw, se].
     pub(super) fn parts(&self) -> [NodeIdx; 4] {
         [self.nw, self.ne, self.sw, self.se]
