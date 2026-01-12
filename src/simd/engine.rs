@@ -1,5 +1,5 @@
 use crate::{GoLEngine, Pattern, PatternFormat, Topology};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
 
 /// A fast, SIMD-optimized engine for Conway's Game of Life that uses bitwise operations

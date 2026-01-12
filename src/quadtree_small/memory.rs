@@ -1,4 +1,4 @@
-use super::{ChunkVec, NodeIdx, QuadTreeNode, LEAF_SIZE_LOG2};
+use super::{ChunkVec, LEAF_SIZE_LOG2, NodeIdx, QuadTreeNode};
 
 const CHUNK_SIZE: usize = 1 << 13;
 
@@ -76,21 +76,23 @@ impl<Extra: Clone + Default> KIVMap<Extra> {
     }
 
     unsafe fn rehash(&mut self) {
-        let new_size = self.hashtable.len() << 1;
-        assert!(u32::try_from(new_size).is_ok(), "u32 is insufficient");
-        let mut new_buf = vec![NodeIdx(0); new_size];
-        for mut node in std::mem::take(&mut self.hashtable) {
-            while node != NodeIdx(0) {
-                let n = &self.storage[node];
-                let hash = QuadTreeNode::<Extra>::hash(n.nw, n.ne, n.sw, n.se);
-                let next = n.next;
-                let index = hash & (new_size - 1);
-                self.storage[node].next = *new_buf.get_unchecked(index);
-                *new_buf.get_unchecked_mut(index) = node;
-                node = next;
+        unsafe {
+            let new_size = self.hashtable.len() << 1;
+            assert!(u32::try_from(new_size).is_ok(), "u32 is insufficient");
+            let mut new_buf = vec![NodeIdx(0); new_size];
+            for mut node in std::mem::take(&mut self.hashtable) {
+                while node != NodeIdx(0) {
+                    let n = &self.storage[node];
+                    let hash = QuadTreeNode::<Extra>::hash(n.nw, n.ne, n.sw, n.se);
+                    let next = n.next;
+                    let index = hash & (new_size - 1);
+                    self.storage[node].next = *new_buf.get_unchecked(index);
+                    *new_buf.get_unchecked_mut(index) = node;
+                    node = next;
+                }
             }
+            self.hashtable = new_buf;
         }
-        self.hashtable = new_buf;
     }
 
     fn invalidate_cache(&mut self) {
@@ -109,44 +111,46 @@ impl<Extra: Clone + Default> KIVMap<Extra> {
         se: NodeIdx,
         hash: usize,
     ) -> NodeIdx {
-        if nw == NodeIdx(0) && ne == NodeIdx(0) && sw == NodeIdx(0) && se == NodeIdx(0) {
-            return NodeIdx(0);
-        }
-
-        let i = hash & (self.hashtable.len() - 1);
-        let mut node = *self.hashtable.get_unchecked(i);
-        let mut prev = NodeIdx(0);
-        // search for the node in the linked list
-        while node != NodeIdx(0) {
-            let n = &self.storage[node];
-            if n.nw == nw && n.ne == ne && n.sw == sw && n.se == se {
-                // move the node to the front of the list
-                if prev != NodeIdx(0) {
-                    self.storage[prev].next = n.next;
-                    self.storage[node].next = *self.hashtable.get_unchecked(i);
-                    *self.hashtable.get_unchecked_mut(i) = node;
-                }
-                return node;
+        unsafe {
+            if nw == NodeIdx(0) && ne == NodeIdx(0) && sw == NodeIdx(0) && se == NodeIdx(0) {
+                return NodeIdx(0);
             }
-            prev = node;
-            node = n.next;
-        }
 
-        let idx = self.storage.allocate();
-        self.storage[idx] = QuadTreeNode {
-            nw,
-            ne,
-            sw,
-            se,
-            next: *self.hashtable.get_unchecked(i),
-            ..Default::default()
-        };
-        *self.hashtable.get_unchecked_mut(i) = idx;
-        // double the number of buckets if the load factor is higher than 0.5
-        if self.storage.len() * 2 > self.hashtable.len() {
-            self.rehash();
+            let i = hash & (self.hashtable.len() - 1);
+            let mut node = *self.hashtable.get_unchecked(i);
+            let mut prev = NodeIdx(0);
+            // search for the node in the linked list
+            while node != NodeIdx(0) {
+                let n = &self.storage[node];
+                if n.nw == nw && n.ne == ne && n.sw == sw && n.se == se {
+                    // move the node to the front of the list
+                    if prev != NodeIdx(0) {
+                        self.storage[prev].next = n.next;
+                        self.storage[node].next = *self.hashtable.get_unchecked(i);
+                        *self.hashtable.get_unchecked_mut(i) = node;
+                    }
+                    return node;
+                }
+                prev = node;
+                node = n.next;
+            }
+
+            let idx = self.storage.allocate();
+            self.storage[idx] = QuadTreeNode {
+                nw,
+                ne,
+                sw,
+                se,
+                next: *self.hashtable.get_unchecked(i),
+                ..Default::default()
+            };
+            *self.hashtable.get_unchecked_mut(i) = idx;
+            // double the number of buckets if the load factor is higher than 0.5
+            if self.storage.len() * 2 > self.hashtable.len() {
+                self.rehash();
+            }
+            idx
         }
-        idx
     }
 
     fn filter_unmarked_from_hashtable(&mut self) {

@@ -68,7 +68,7 @@ impl StreamLifeCacheRaw {
     unsafe fn find_or_create_entry(&mut self, key: (NodeIdx, NodeIdx)) -> (bool, *mut CacheEntry) {
         let hash = {
             let mut hasher = self.hasher.clone();
-            (key.0 .0, key.1 .0).hash(&mut hasher);
+            (key.0.0, key.1.0).hash(&mut hasher);
             hasher.finish() as usize
         };
         let mask = self.hashtable.len() - 1;

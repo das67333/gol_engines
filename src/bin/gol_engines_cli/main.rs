@@ -4,9 +4,9 @@ mod update;
 mod util;
 
 use clap::{Parser, Subcommand};
-use metafy::{run_metafy, MetafyArgs};
-use stats::{run_stats, StatsArgs};
-use update::{run_update, UpdateArgs};
+use metafy::{MetafyArgs, run_metafy};
+use stats::{StatsArgs, run_stats};
+use update::{UpdateArgs, run_update};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]

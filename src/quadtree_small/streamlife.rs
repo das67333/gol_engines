@@ -1,4 +1,4 @@
-use super::{hashlife::HashLifeEngineSmall, NodeIdx, LEAF_SIZE_LOG2};
+use super::{LEAF_SIZE_LOG2, NodeIdx, hashlife::HashLifeEngineSmall};
 use crate::{GoLEngine, Pattern, Topology};
 use ahash::AHashMap as HashMap;
 use anyhow::Result;
@@ -301,7 +301,7 @@ impl StreamLifeEngineSmall {
 
             return if idx.0 == NodeIdx(0) || idx.1 == NodeIdx(0) {
                 let i3 = NodeIdx(i1.0 | i2.0);
-                let ind3 = NodeIdx(idx.0 .0 | idx.1 .0);
+                let ind3 = NodeIdx(idx.0.0 | idx.1.0);
                 let lanes = self.node2lanes(ind3, size_log2);
                 if lanes & 0xf0 != 0 {
                     (NodeIdx(0), i3)

@@ -78,7 +78,7 @@ impl<Extra: Default> MemoryManager<Extra> {
         let nw = NodeIdx(u32::from_le_bytes(rows[0..4].try_into().unwrap()));
         let ne = NodeIdx(u32::from_le_bytes(rows[4..8].try_into().unwrap()));
         let (sw, se) = (NodeIdx::default(), NodeIdx::default());
-        unsafe { self.find_or_create_inner::<true>(nw, ne, sw, se, compute_hash(nw, ne, sw, se)) }
+        self.find_or_create_inner::<true>(nw, ne, sw, se, compute_hash(nw, ne, sw, se))
     }
 
     /// Find a node with the given parts.
@@ -90,7 +90,7 @@ impl<Extra: Default> MemoryManager<Extra> {
         sw: NodeIdx,
         se: NodeIdx,
     ) -> NodeIdx {
-        unsafe { self.find_or_create_inner::<false>(nw, ne, sw, se, compute_hash(nw, ne, sw, se)) }
+        self.find_or_create_inner::<false>(nw, ne, sw, se, compute_hash(nw, ne, sw, se))
     }
 
     pub(super) fn clear(&mut self) {
@@ -114,7 +114,7 @@ impl<Extra: Default> MemoryManager<Extra> {
     /// 1. Acquire slot lock via `flags`
     /// 2. Double-check node doesn't exist
     /// 3. Write data fields, then set flags with Release ordering
-    unsafe fn find_or_create_inner<const IS_LEAF: bool>(
+    fn find_or_create_inner<const IS_LEAF: bool>(
         &self,
         nw: NodeIdx,
         ne: NodeIdx,
@@ -135,14 +135,14 @@ impl<Extra: Default> MemoryManager<Extra> {
         let target_flags = (FLAG_LEAF * IS_LEAF as u8) | FLAG_USED;
 
         loop {
-            let n = UnsafeCell::raw_get(self.hashtable.as_ptr().add(index));
-            let flags = &(*n).flags;
+            let n = unsafe { UnsafeCell::raw_get(self.hashtable.as_ptr().add(index)) };
+            let flags = unsafe { &(*n).flags };
 
             // STEP 1: Optimistic read WITHOUT lock
             // Read flags with Acquire ordering - this synchronizes with Release store in creation
             let mut current_flags = flags.load(Ordering::Acquire);
             if current_flags == target_flags
-                && ((*n).nw, (*n).ne, (*n).sw, (*n).se) == (nw, ne, sw, se)
+                && unsafe { ((*n).nw, (*n).ne, (*n).sw, (*n).se) == (nw, ne, sw, se) }
             {
                 return NodeIdx(index as u32);
             }
@@ -166,7 +166,7 @@ impl<Extra: Default> MemoryManager<Extra> {
 
             // STEP 3: Double-check under lock (another thread may have created the node)
             if current_flags == target_flags
-                && ((*n).nw, (*n).ne, (*n).sw, (*n).se) == (nw, ne, sw, se)
+                && unsafe { ((*n).nw, (*n).ne, (*n).sw, (*n).se) == (nw, ne, sw, se) }
             {
                 flags.store(target_flags, Ordering::Release);
                 return NodeIdx(index as u32);
@@ -175,7 +175,9 @@ impl<Extra: Default> MemoryManager<Extra> {
             // STEP 4: Slot is free - create node
             if !current_flags & FLAG_USED != 0 {
                 // Write data fields first
-                ((*n).nw, (*n).ne, (*n).sw, (*n).se) = (nw, ne, sw, se);
+                unsafe {
+                    ((*n).nw, (*n).ne, (*n).sw, (*n).se) = (nw, ne, sw, se);
+                }
 
                 // CRITICAL: Write flags with Release ordering!
                 flags.store(target_flags, Ordering::Release);

@@ -62,50 +62,52 @@ impl StreamLifeCacheRaw {
     }
 
     unsafe fn find_or_create_entry(&mut self, key: (NodeIdx, NodeIdx)) -> *mut CacheEntry {
-        let hash = {
-            let mut hasher = self.hasher.clone();
-            (key.0 .0, key.1 .0).hash(&mut hasher);
-            hasher.finish() as usize
-        };
-        let mask = self.hashtable.len() - 1;
-        let mut index = hash & mask;
+        unsafe {
+            let hash = {
+                let mut hasher = self.hasher.clone();
+                (key.0.0, key.1.0).hash(&mut hasher);
+                hasher.finish() as usize
+            };
+            let mask = self.hashtable.len() - 1;
+            let mut index = hash & mask;
 
-        loop {
-            // First check if we can acquire the lock for this index
-            let lock = &(*self.hashtable.as_mut_ptr().add(index)).lock;
+            loop {
+                // First check if we can acquire the lock for this index
+                let lock = &(*self.hashtable.as_mut_ptr().add(index)).lock;
 
-            while lock
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                while lock.load(Ordering::Relaxed) {
-                    spin_loop();
+                while lock
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_err()
+                {
+                    while lock.load(Ordering::Relaxed) {
+                        spin_loop();
+                    }
                 }
-            }
 
-            // Now safely get the mutable reference after acquiring the lock
-            let c = self.hashtable.get_unchecked_mut(index);
+                // Now safely get the mutable reference after acquiring the lock
+                let c = self.hashtable.get_unchecked_mut(index);
 
-            if c.key == key && c.is_used {
+                if c.key == key && c.is_used {
+                    lock.store(false, Ordering::Release);
+                    break;
+                }
+
+                if !c.is_used {
+                    c.key = key;
+                    c.value = (NodeIdx::default(), NodeIdx::default());
+                    c.is_used = true;
+
+                    ExecutionStatistics::on_insertion::<1>();
+                    lock.store(false, Ordering::Release);
+                    break;
+                }
+
                 lock.store(false, Ordering::Release);
-                break;
+                index = index.wrapping_add(1) & mask;
             }
 
-            if !c.is_used {
-                c.key = key;
-                c.value = (NodeIdx::default(), NodeIdx::default());
-                c.is_used = true;
-
-                ExecutionStatistics::on_insertion::<1>();
-                lock.store(false, Ordering::Release);
-                break;
-            }
-
-            lock.store(false, Ordering::Release);
-            index = index.wrapping_add(1) & mask;
+            self.hashtable.get_unchecked_mut(index)
         }
-
-        self.hashtable.get_unchecked_mut(index)
     }
 
     fn bytes_total(&self) -> usize {

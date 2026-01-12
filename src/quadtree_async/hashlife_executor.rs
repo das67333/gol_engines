@@ -44,13 +44,14 @@
 //! - `PROCESSING → FINISHED`: Computation complete, result cached
 
 use super::{
+    LEAF_SIZE, LEAF_SIZE_LOG2,
     hashlife::HashLifeEngineAsync,
     memory::MemoryManager,
     node::{Dependents, NodeIdx, ProcessingData, QuadTreeNode},
-    status, LEAF_SIZE, LEAF_SIZE_LOG2,
+    status,
 };
 use crossbeam_deque::{Steal, Stealer, Worker};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::{
     hint, mem,
     sync::atomic::{AtomicU8, Ordering},
@@ -470,8 +471,12 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         se: NodeIdx,
         size_log2: u32,
     ) -> [NodeIdx; 9] {
-        let [[nwnw, nwne, nwsw, nwse], [nenw, nene, nesw, nese], [swnw, swne, swsw, swse], [senw, sene, sesw, sese]] =
-            [nw, ne, sw, se].map(|x| self.mem.get(x).parts().map(|y| self.mem.get(y)));
+        let [
+            [nwnw, nwne, nwsw, nwse],
+            [nenw, nene, nesw, nese],
+            [swnw, swne, swsw, swse],
+            [senw, sene, sesw, sese],
+        ] = [nw, ne, sw, se].map(|x| self.mem.get(x).parts().map(|y| self.mem.get(y)));
 
         [
             [nwnw, nwne, nwsw, nwse],

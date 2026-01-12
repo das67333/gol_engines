@@ -159,47 +159,49 @@ impl<Extra: Clone + Default> MemoryManagerRaw<Extra> {
         hash: usize,
         is_leaf: bool,
     ) -> NodeIdx {
-        if self.poisoned {
-            return NodeIdx::default();
-        }
-
-        let mask = self.hashtable.len() - 1;
-        let mut index = hash & mask;
-
-        loop {
-            let n = self.hashtable.get_unchecked(index);
-            if n.nw == nw
-                && n.ne == ne
-                && n.sw == sw
-                && n.se == se
-                && n.is_leaf == is_leaf
-                && n.is_used
-            {
-                break;
+        unsafe {
+            if self.poisoned {
+                return NodeIdx::default();
             }
 
-            if !n.is_used {
-                *self.hashtable.get_unchecked_mut(index) = QuadTreeNode {
-                    nw,
-                    ne,
-                    sw,
-                    se,
-                    is_leaf,
-                    is_used: true,
-                    ..Default::default()
-                };
-                self.len += 1;
-                if self.len > self.hashtable.len() * 3 / 4 {
-                    self.poisoned = true;
-                    return NodeIdx::default();
+            let mask = self.hashtable.len() - 1;
+            let mut index = hash & mask;
+
+            loop {
+                let n = self.hashtable.get_unchecked(index);
+                if n.nw == nw
+                    && n.ne == ne
+                    && n.sw == sw
+                    && n.se == se
+                    && n.is_leaf == is_leaf
+                    && n.is_used
+                {
+                    break;
                 }
-                break;
+
+                if !n.is_used {
+                    *self.hashtable.get_unchecked_mut(index) = QuadTreeNode {
+                        nw,
+                        ne,
+                        sw,
+                        se,
+                        is_leaf,
+                        is_used: true,
+                        ..Default::default()
+                    };
+                    self.len += 1;
+                    if self.len > self.hashtable.len() * 3 / 4 {
+                        self.poisoned = true;
+                        return NodeIdx::default();
+                    }
+                    break;
+                }
+
+                index = index.wrapping_add(1) & mask;
             }
 
-            index = index.wrapping_add(1) & mask;
+            NodeIdx(index as u32)
         }
-
-        NodeIdx(index as u32)
     }
 
     fn bytes_total(&self) -> usize {

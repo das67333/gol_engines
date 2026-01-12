@@ -1,14 +1,15 @@
 use super::{
+    LEAF_SIZE, LEAF_SIZE_LOG2,
     blank::BlankNodes,
     hashlife_executor::HashLifeExecutor,
     memory::MemoryManager,
     node::{NodeIdx, QuadTreeNode},
     statistics::{ExecutionStatistics, TasksCountGuard},
-    status, LEAF_SIZE, LEAF_SIZE_LOG2,
+    status,
 };
 use crate::{GoLEngine, Pattern, PatternNode, Topology, WORKER_THREADS};
 use ahash::AHashMap as HashMap;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
 use std::{future::Future, hint::spin_loop, pin::Pin, sync::atomic::Ordering, thread};
 
@@ -126,8 +127,12 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
         se: NodeIdx,
         size_log2: u32,
     ) -> [NodeIdx; 9] {
-        let [[nwnw, nwne, nwsw, nwse], [nenw, nene, nesw, nese], [swnw, swne, swsw, swse], [senw, sene, sesw, sese]] =
-            [nw, ne, sw, se].map(|x| self.mem.get(x).parts().map(|y| self.mem.get(y)));
+        let [
+            [nwnw, nwne, nwsw, nwse],
+            [nenw, nene, nesw, nese],
+            [swnw, swne, swsw, swse],
+            [senw, sene, sesw, sese],
+        ] = [nw, ne, sw, se].map(|x| self.mem.get(x).parts().map(|y| self.mem.get(y)));
 
         [
             [nwnw, nwne, nwsw, nwse],

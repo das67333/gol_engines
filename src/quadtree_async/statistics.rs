@@ -1,7 +1,7 @@
 //! A thread-local statistics collector for quadtree operations.
 use crate::{MAX_TASKS_COUNT, MIN_TASK_SPAWN_SHIFT, TASKS_SPAWNED_COUNT};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 // Enforce singleton: only one ExecutionStatistics may be instantiated.
 static INSTANCE_COUNT: AtomicU8 = AtomicU8::new(0);

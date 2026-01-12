@@ -1,13 +1,13 @@
 use super::{
-    status,
+    LEAF_SIZE_LOG2,
     hashlife::HashLifeEngineAsync,
     node::{NodeIdx, QuadTreeNode},
     statistics::{ExecutionStatistics, TasksCountGuard},
+    status,
     streamlife_cache::{CacheEntry, StreamLifeCache},
-    LEAF_SIZE_LOG2,
 };
 use crate::{GoLEngine, Pattern, Topology, WORKER_THREADS};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
 use std::{future::Future, hint::spin_loop, pin::Pin, sync::atomic::Ordering};
 
@@ -432,17 +432,13 @@ impl StreamLifeEngineAsync {
             let b = self.base.blank_nodes.get(size_log2);
             let res = if idx.0 == b || idx.1 == b {
                 let (i3, ind3) = if idx.0 == b {
-                    (NodeIdx(i2.0), NodeIdx(idx.1 .0))
+                    (NodeIdx(i2.0), NodeIdx(idx.1.0))
                 } else {
-                    (NodeIdx(i1.0), NodeIdx(idx.0 .0))
+                    (NodeIdx(i1.0), NodeIdx(idx.0.0))
                 };
                 let lanes = self.node2lanes(ind3, size_log2);
                 let b = self.base.blank_nodes.get(size_log2 - 1);
-                if lanes & 0xf0 != 0 {
-                    (b, i3)
-                } else {
-                    (i3, b)
-                }
+                if lanes & 0xf0 != 0 { (b, i3) } else { (i3, b) }
             } else {
                 (i1, i2)
             };
@@ -458,11 +454,7 @@ impl StreamLifeEngineAsync {
 
             if i3 != b {
                 let lanes = self.node2lanes(hnode2, size_log2);
-                if lanes & 0xf0 != 0 {
-                    (b, i3)
-                } else {
-                    (i3, b)
-                }
+                if lanes & 0xf0 != 0 { (b, i3) } else { (i3, b) }
             } else {
                 (b, b)
             }

@@ -1,5 +1,8 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use std::sync::{self, atomic::{AtomicU64, Ordering}};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::sync::{
+    self,
+    atomic::{AtomicU64, Ordering},
+};
 
 fn bench_atomics(c: &mut Criterion) {
     let mut group = c.benchmark_group("atomics");
@@ -15,8 +18,7 @@ fn bench_atomics(c: &mut Criterion) {
     group.bench_function("cmpxchg_fail", |b| {
         let a = AtomicU64::new(0);
         b.iter(|| {
-            a.compare_exchange(1, 2, ORDERING, ORDERING)
-                .unwrap_err();
+            a.compare_exchange(1, 2, ORDERING, ORDERING).unwrap_err();
         });
     });
 

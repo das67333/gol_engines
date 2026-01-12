@@ -1,7 +1,7 @@
-use super::{BlankNodes, MemoryManager, NodeIdx, QuadTreeNode, LEAF_SIZE, LEAF_SIZE_LOG2};
+use super::{BlankNodes, LEAF_SIZE, LEAF_SIZE_LOG2, MemoryManager, NodeIdx, QuadTreeNode};
 use crate::{GoLEngine, Pattern, PatternNode, Topology};
 use ahash::AHashMap as HashMap;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
 
 /// Implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife).
@@ -117,8 +117,12 @@ impl<Extra: Clone + Default> HashLifeEngineSync<Extra> {
         se: NodeIdx,
         size_log2: u32,
     ) -> [NodeIdx; 9] {
-        let [[nwnw, nwne, nwsw, nwse], [nenw, nene, nesw, nese], [swnw, swne, swsw, swse], [senw, sene, sesw, sese]] =
-            [nw, ne, sw, se].map(|x| self.mem.get(x).parts().map(|y| self.mem.get(y)));
+        let [
+            [nwnw, nwne, nwsw, nwse],
+            [nenw, nene, nesw, nese],
+            [swnw, swne, swsw, swse],
+            [senw, sene, sesw, sese],
+        ] = [nw, ne, sw, se].map(|x| self.mem.get(x).parts().map(|y| self.mem.get(y)));
 
         [
             [nwnw, nwne, nwsw, nwse],

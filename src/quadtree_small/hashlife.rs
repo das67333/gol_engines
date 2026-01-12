@@ -1,7 +1,7 @@
-use super::{MemoryManager, NodeIdx, PrefetchedNode, LEAF_SIZE, LEAF_SIZE_LOG2};
+use super::{LEAF_SIZE, LEAF_SIZE_LOG2, MemoryManager, NodeIdx, PrefetchedNode};
 use crate::{GoLEngine, Pattern, PatternNode, Topology};
 use ahash::AHashMap as HashMap;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
 
 /// Implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife).

@@ -1,9 +1,9 @@
 use crate::VERSION;
 use ahash::AHashMap as HashMap;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use flate2::{
-    read::{GzDecoder, GzEncoder},
     Compression,
+    read::{GzDecoder, GzEncoder},
 };
 use num_bigint::BigInt;
 use rand::{Rng, SeedableRng};
@@ -888,7 +888,7 @@ impl Pattern {
                                 "Invalid symbol '{}' in leaf {}",
                                 c as char,
                                 String::from_utf8_lossy(s)
-                            ))
+                            ));
                         }
                     }
                 }
