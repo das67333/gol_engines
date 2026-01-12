@@ -54,7 +54,7 @@ use crossbeam_deque::{Steal, Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
 use std::{
     hint, mem,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, AtomicU64, Ordering},
     thread,
     time::Duration,
 };
@@ -71,6 +71,102 @@ impl Task {
     }
 }
 
+static S: AtomicU64 = AtomicU64::new(0);
+
+struct TaskFetcher<'a> {
+    thread_id: usize,
+    queue: &'a Worker<Task>,
+    stealers: &'a [Stealer<Task>],
+    last_victim: Option<usize>,
+    rng: rand_chacha::ChaCha8Rng,
+    rng_buffer: Vec<u32>,
+}
+
+impl<'a> TaskFetcher<'a> {
+    /// Number of tasks to steal at once when work-stealing.
+    const STEAL_BATCH_SIZE: usize = 4;
+    const RNG_BUFFER_SIZE: usize = 256;
+    const MAX_SLEEP_DURATION: Duration = Duration::from_millis(1);
+
+    fn new(thread_id: usize, queue: &'a Worker<Task>, stealers: &'a [Stealer<Task>]) -> Self {
+        Self {
+            thread_id,
+            queue,
+            stealers,
+            last_victim: None,
+            rng: <rand_chacha::ChaCha8Rng as rand::SeedableRng>::from_os_rng(),
+            rng_buffer: Vec::with_capacity(Self::RNG_BUFFER_SIZE),
+        }
+    }
+
+    /// Fetch a task from local queue or steal from other threads.
+    fn fetch_task(&mut self) -> Option<Task> {
+        // local queue
+        if let Some(task) = self.queue.pop() {
+            return Some(task);
+        }
+
+        // repeat last successful steal
+        if let Some(victim_id) = self.last_victim
+            && let Some(task) = self.try_steal(victim_id)
+        {
+            return Some(task);
+        }
+
+        if self.stealers.len() < 2 {
+            return None;
+        }
+
+        // power of two choices - choosing a longer queue
+        let mut duration = Duration::from_micros(1);
+        loop {
+            let (i, j) = (self.generate_index(), self.generate_index());
+            let victim_id = if self.stealers[i].len() > self.stealers[j].len() {
+                i
+            } else {
+                j
+            };
+            if victim_id > 0
+                && let Some(task) = self.try_steal(victim_id)
+            {
+                return Some(task);
+            }
+            duration *= 2;
+            duration = duration.max(Self::MAX_SLEEP_DURATION);
+        }
+    }
+
+    fn generate_index(&mut self) -> usize {
+        if let Some(x) = self.rng_buffer.pop() {
+            return x as usize;
+        }
+        self.rng_buffer.resize(Self::RNG_BUFFER_SIZE, 0);
+        rand::Rng::fill(&mut self.rng, &mut self.rng_buffer[..]);
+        for i in self.rng_buffer.iter_mut() {
+            *i %= self.stealers.len() as u32 - 1;
+            if *i >= self.thread_id as u32 {
+                *i += 1;
+            }
+        }
+        self.rng_buffer.pop().unwrap() as usize
+    }
+
+    fn try_steal(&self, victim_id: usize) -> Option<Task> {
+        loop {
+            match self.stealers[victim_id]
+                .steal_batch_with_limit_and_pop(self.queue, Self::STEAL_BATCH_SIZE)
+            {
+                Steal::Success(task) => {
+                    S.fetch_add(1, Ordering::Relaxed);
+                    return Some(task);
+                }
+                Steal::Empty => return None,
+                Steal::Retry => continue,
+            }
+        }
+    }
+}
+
 /// Parallel executor for Hashlife algorithm using work-stealing.
 pub(super) struct HashLifeExecutor<'a, Extra: Default + Sync> {
     root: NodeIdx,
@@ -80,14 +176,6 @@ pub(super) struct HashLifeExecutor<'a, Extra: Default + Sync> {
 }
 
 impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
-    /// The duration to sleep when no tasks are available.
-    const THREAD_THROTTLE_DURATION: Duration = Duration::from_millis(10);
-    /// Number of tasks to steal at once when work-stealing.
-    /// The value should be chosen to minimize work-stealing events. However, typically
-    /// only about 10^-6 of tasks are stolen relative to those taken from the local queue.
-    /// Since this occurs so rarely, the exact value has minimal impact on performance.
-    const STEAL_BATCH_SIZE: usize = 2;
-
     pub(super) fn new(base: &'a HashLifeEngineAsync<Extra>) -> Self {
         Self {
             root: base.root,
@@ -131,44 +219,12 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
 
     fn worker_thread(&self, thread_id: usize, queue: &Worker<Task>, stealers: &[Stealer<Task>]) {
         let root_status = &self.mem.get(self.root).status;
-        loop {
-            while let Some(task) = Self::fetch_task(thread_id, queue, stealers) {
+        let mut fetcher = TaskFetcher::new(thread_id, queue, stealers);
+        while !is_finished(root_status) {
+            while let Some(task) = fetcher.fetch_task() {
                 self.process_task(task, queue);
             }
-
-            if is_finished(root_status) {
-                return;
-            }
-            thread::sleep(Self::THREAD_THROTTLE_DURATION);
         }
-    }
-
-    /// Fetch a task from local queue or steal from other threads.
-    ///
-    /// Strategy:
-    /// 1. Try local queue first (LIFO, best cache locality)
-    /// 2. If empty, steal from other threads in round-robin order
-    ///
-    /// Stealing order starts from `thread_id + 1` to distribute load evenly.
-    fn fetch_task(
-        thread_id: usize,
-        queue: &Worker<Task>,
-        stealers: &[Stealer<Task>],
-    ) -> Option<Task> {
-        queue.pop().or_else(|| {
-            // Steal from other threads in round-robin order starting from next thread
-            for i in (thread_id + 1..stealers.len()).chain(0..thread_id) {
-                loop {
-                    match stealers[i].steal_batch_with_limit_and_pop(queue, Self::STEAL_BATCH_SIZE)
-                    {
-                        Steal::Success(task) => return Some(task),
-                        Steal::Empty => break,
-                        Steal::Retry => continue,
-                    }
-                }
-            }
-            None
-        })
     }
 
     /// Process a single task: compute the node's result or wait for dependencies.
