@@ -24,3 +24,5 @@ cargo instruments --release \
 cargo instruments --template "Time Profiler" --attach 15365 --open
 
 xcrun xctrace record --template "Time Profiler" --attach $(pgrep gol_engines_cli) --output trace.trace && open trace.trace && rm trace.trace
+
+target/release/gol_engines_cli update res/very_large_patterns/0e0p-metaglider.mc.gz --output=res/temp.mc.gz --mem-limit-gib=130 --gens-log2=15 --population --workers=288

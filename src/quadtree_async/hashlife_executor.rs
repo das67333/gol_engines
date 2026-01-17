@@ -309,7 +309,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     ///
     /// When a child is not ready:
     /// - `DependencyIsReady`: Child already computed, use cached result
-    /// - `StartedByThisThread`: We claimed the child, push to local queue
+    /// - `StartedByThisThread`: We claimed the child, register as dependent, push to local queue
     /// - `StartedByOtherThread`: Another thread processing it, register as dependent
     fn update_node(
         &self,
@@ -672,9 +672,6 @@ fn start_processing_node<Extra: Default + Sync>(
 }
 
 /// Atomically transition status from `from` to `to`, spinning until successful.
-///
-/// Panics if status is not in `valid_states` while waiting.
-/// Uses weak CAS in a loop for better performance on contended atomics.
 fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8) {
     while a
         .compare_exchange_weak(from, to, Ordering::Acquire, Ordering::Relaxed)
@@ -734,11 +731,6 @@ enum DependencyHandlingResult {
 }
 
 /// Handle a dependency: check if ready, start processing, or register as dependent.
-///
-/// Flow:
-/// 1. If FINISHED: return DependencyIsReady
-/// 2. If NOT_STARTED: try to claim it (return StartedByThisThread if successful)
-/// 3. If PENDING/PROCESSING: register as dependent (return StartedByOtherThread)
 fn handle_dependency<Extra: Default + Sync>(
     n: &QuadTreeNode<Extra>,
     task: &Task,
