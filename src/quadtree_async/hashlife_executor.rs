@@ -71,29 +71,42 @@ impl Task {
     }
 }
 
-static S: AtomicU64 = AtomicU64::new(0);
+static STEAL_ATTEMPTS_SUCCESS: AtomicU64 = AtomicU64::new(0);
+static STEAL_ATTEMPTS_EMPTY: AtomicU64 = AtomicU64::new(0);
+static STEAL_ATTEMPTS_RETRY: AtomicU64 = AtomicU64::new(0);
 
-struct TaskFetcher<'a> {
+static STEAL_FROM_LAST_VICTIM_SUCCESS: AtomicU64 = AtomicU64::new(0);
+static STEAL_FROM_LAST_VICTIM_FAIL: AtomicU64 = AtomicU64::new(0);
+
+struct TaskFetcher<'a, F: Fn() -> bool> {
     thread_id: usize,
     queue: &'a Worker<Task>,
     stealers: &'a [Stealer<Task>],
-    last_victim: Option<usize>,
+    stop_condition: F,
+    last_victim: usize,
     rng: rand_chacha::ChaCha8Rng,
     rng_buffer: Vec<u32>,
 }
 
-impl<'a> TaskFetcher<'a> {
+impl<'a, F: Fn() -> bool> TaskFetcher<'a, F> {
     /// Number of tasks to steal at once when work-stealing.
-    const STEAL_BATCH_SIZE: usize = 4;
+    const STEAL_BATCH_SIZE: usize = 1;
     const RNG_BUFFER_SIZE: usize = 256;
-    const MAX_SLEEP_DURATION: Duration = Duration::from_millis(1);
+    const INITIAL_WAIT_DURATION: Duration = Duration::from_micros(100);
+    const MAX_WAIT_DURATION: Duration = Duration::from_millis(100);
 
-    fn new(thread_id: usize, queue: &'a Worker<Task>, stealers: &'a [Stealer<Task>]) -> Self {
+    fn new(
+        thread_id: usize,
+        queue: &'a Worker<Task>,
+        stealers: &'a [Stealer<Task>],
+        stop_condition: F,
+    ) -> Self {
         Self {
             thread_id,
             queue,
             stealers,
-            last_victim: None,
+            stop_condition,
+            last_victim: 0,
             rng: <rand_chacha::ChaCha8Rng as rand::SeedableRng>::from_os_rng(),
             rng_buffer: Vec::with_capacity(Self::RNG_BUFFER_SIZE),
         }
@@ -106,37 +119,44 @@ impl<'a> TaskFetcher<'a> {
             return Some(task);
         }
 
-        // repeat last successful steal
-        if let Some(victim_id) = self.last_victim
-            && let Some(task) = self.try_steal(victim_id)
-        {
-            return Some(task);
-        }
-
-        if self.stealers.len() < 2 {
+        if self.stealers.len() <= 1 {
             return None;
         }
 
-        // power of two choices - choosing a longer queue
-        let mut duration = Duration::from_micros(1);
+        // repeat last successful steal
+        if let Some(task) = self.try_steal(self.last_victim) {
+            STEAL_FROM_LAST_VICTIM_SUCCESS.fetch_add(1, Ordering::Relaxed);
+            return Some(task);
+        }
+        STEAL_FROM_LAST_VICTIM_FAIL.fetch_add(1, Ordering::Relaxed);
+
+        let mut duration = Self::INITIAL_WAIT_DURATION;
         loop {
-            let (i, j) = (self.generate_index(), self.generate_index());
-            let victim_id = if self.stealers[i].len() > self.stealers[j].len() {
-                i
+            // power of two choices - choosing a longer queue
+            let (i, j) = (self.generate_random_index(), self.generate_random_index());
+            let (len_i, len_j) = (self.stealers[i].len(), self.stealers[j].len());
+            let (victim_id, victim_len) = if len_i > len_j {
+                (i, len_i)
             } else {
-                j
+                (j, len_j)
             };
-            if victim_id > 0
+            if victim_len > 0
                 && let Some(task) = self.try_steal(victim_id)
             {
+                self.last_victim = victim_id;
                 return Some(task);
             }
-            duration *= 2;
-            duration = duration.max(Self::MAX_SLEEP_DURATION);
+
+            thread::sleep(duration);
+            duration = Self::MAX_WAIT_DURATION.min(duration * 2);
+
+            if (self.stop_condition)() {
+                return None;
+            }
         }
     }
 
-    fn generate_index(&mut self) -> usize {
+    fn generate_random_index(&mut self) -> usize {
         if let Some(x) = self.rng_buffer.pop() {
             return x as usize;
         }
@@ -144,6 +164,7 @@ impl<'a> TaskFetcher<'a> {
         rand::Rng::fill(&mut self.rng, &mut self.rng_buffer[..]);
         for i in self.rng_buffer.iter_mut() {
             *i %= self.stealers.len() as u32 - 1;
+            // skip current index
             if *i >= self.thread_id as u32 {
                 *i += 1;
             }
@@ -157,11 +178,17 @@ impl<'a> TaskFetcher<'a> {
                 .steal_batch_with_limit_and_pop(self.queue, Self::STEAL_BATCH_SIZE)
             {
                 Steal::Success(task) => {
-                    S.fetch_add(1, Ordering::Relaxed);
+                    STEAL_ATTEMPTS_SUCCESS.fetch_add(1, Ordering::Relaxed);
                     return Some(task);
                 }
-                Steal::Empty => return None,
-                Steal::Retry => continue,
+                Steal::Empty => {
+                    STEAL_ATTEMPTS_EMPTY.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                Steal::Retry => {
+                    STEAL_ATTEMPTS_RETRY.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
             }
         }
     }
@@ -212,18 +239,37 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             "Nodes count: {}",
             crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::Relaxed)
         );
+        println!(
+            "STEAL_ATTEMPTS_SUCCESS: {}",
+            STEAL_ATTEMPTS_SUCCESS.load(Ordering::Relaxed)
+        );
+        println!(
+            "STEAL_ATTEMPTS_EMPTY: {}",
+            STEAL_ATTEMPTS_EMPTY.load(Ordering::Relaxed)
+        );
+        println!(
+            "STEAL_ATTEMPTS_RETRY: {}",
+            STEAL_ATTEMPTS_RETRY.load(Ordering::Relaxed)
+        );
+
+        println!(
+            "STEAL_FROM_LAST_VICTIM_SUCCESS: {}",
+            STEAL_FROM_LAST_VICTIM_SUCCESS.load(Ordering::Relaxed)
+        );
+        println!(
+            "STEAL_FROM_LAST_VICTIM_FAIL: {}",
+            STEAL_FROM_LAST_VICTIM_FAIL.load(Ordering::Relaxed)
+        );
 
         let n = self.mem.get(self.root);
         n.cache.get_node_idx()
     }
 
     fn worker_thread(&self, thread_id: usize, queue: &Worker<Task>, stealers: &[Stealer<Task>]) {
-        let root_status = &self.mem.get(self.root).status;
-        let mut fetcher = TaskFetcher::new(thread_id, queue, stealers);
-        while !is_finished(root_status) {
-            while let Some(task) = fetcher.fetch_task() {
-                self.process_task(task, queue);
-            }
+        let stop_condition = || is_finished(&self.mem.get(self.root).status);
+        let mut fetcher = TaskFetcher::new(thread_id, queue, stealers, stop_condition);
+        while let Some(task) = fetcher.fetch_task() {
+            self.process_task(task, queue);
         }
     }
 
