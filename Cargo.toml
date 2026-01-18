@@ -27,7 +27,7 @@ name = "bench_dev"
 [dependencies]
 ahash = "0.8"
 anyhow = "1.0"
-crossbeam-deque = "0.8"
+crossbeam = "0.8"
 flate2 = "1.1"
 mimalloc = "0.1"
 num-bigint = "0.4"
@@ -45,7 +45,6 @@ num-format = { version = "0.4", features = [
 
 [dev-dependencies]
 criterion = "0.7"
-crossbeam-channel = "0.5"
 libc = "0.2"
 serial_test = "3.2"
 

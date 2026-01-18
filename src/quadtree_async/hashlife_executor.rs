@@ -50,7 +50,7 @@ use super::{
     node::{Dependents, NodeIdx, ProcessingData, QuadTreeNode},
     status,
 };
-use crossbeam_deque::{Steal, Stealer, Worker};
+use crossbeam::deque::{Steal, Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
 use std::{
     hint, mem,
@@ -237,7 +237,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         assert!(is_finished(&self.mem.get(self.root).status));
         println!(
             "Nodes count: {}",
-            crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::Relaxed)
+            0 // crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::Relaxed)
         );
         println!(
             "STEAL_ATTEMPTS_SUCCESS: {}",

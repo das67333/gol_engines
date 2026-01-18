@@ -1,17 +1,15 @@
 use super::{
-    LEAF_SIZE, LEAF_SIZE_LOG2,
+    LEAF_SIZE_LOG2,
     blank::BlankNodes,
     hashlife_executor::HashLifeExecutor,
     memory::MemoryManager,
     node::{NodeIdx, QuadTreeNode},
-    statistics::{ExecutionStatistics, TasksCountGuard},
-    status,
 };
 use crate::{GoLEngine, Pattern, PatternNode, Topology, WORKER_THREADS};
 use ahash::AHashMap as HashMap;
 use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
-use std::{future::Future, hint::spin_loop, pin::Pin, sync::atomic::Ordering, thread};
+use std::{sync::atomic::Ordering, thread};
 
 /// Parallel implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife).
 ///
@@ -24,321 +22,320 @@ pub struct HashLifeEngineAsync<Extra> {
     pub(super) generations_per_update_log2: Option<u32>,
     pub(super) topology: Topology,
     pub(super) blank_nodes: BlankNodes,
-    pub(super) _stats: ExecutionStatistics,
 }
 
 impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
-    fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {
-        let b = row_prev;
-        let a = b << 1;
-        let c = b >> 1;
-        let i = row_curr;
-        let h = i << 1;
-        let d = i >> 1;
-        let f = row_next;
-        let g = f << 1;
-        let e = f >> 1;
+    // fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {
+    //     let b = row_prev;
+    //     let a = b << 1;
+    //     let c = b >> 1;
+    //     let i = row_curr;
+    //     let h = i << 1;
+    //     let d = i >> 1;
+    //     let f = row_next;
+    //     let g = f << 1;
+    //     let e = f >> 1;
 
-        let ab0 = a ^ b;
-        let ab1 = a & b;
-        let cd0 = c ^ d;
-        let cd1 = c & d;
+    //     let ab0 = a ^ b;
+    //     let ab1 = a & b;
+    //     let cd0 = c ^ d;
+    //     let cd1 = c & d;
 
-        let ef0 = e ^ f;
-        let ef1 = e & f;
-        let gh0 = g ^ h;
-        let gh1 = g & h;
+    //     let ef0 = e ^ f;
+    //     let ef1 = e & f;
+    //     let gh0 = g ^ h;
+    //     let gh1 = g & h;
 
-        let ad0 = ab0 ^ cd0;
-        let ad1 = (ab1 ^ cd1) ^ (ab0 & cd0);
-        let ad2 = ab1 & cd1;
+    //     let ad0 = ab0 ^ cd0;
+    //     let ad1 = (ab1 ^ cd1) ^ (ab0 & cd0);
+    //     let ad2 = ab1 & cd1;
 
-        let eh0 = ef0 ^ gh0;
-        let eh1 = (ef1 ^ gh1) ^ (ef0 & gh0);
-        let eh2 = ef1 & gh1;
+    //     let eh0 = ef0 ^ gh0;
+    //     let eh1 = (ef1 ^ gh1) ^ (ef0 & gh0);
+    //     let eh2 = ef1 & gh1;
 
-        let ah0 = ad0 ^ eh0;
-        let xx = ad0 & eh0;
-        let yy = ad1 ^ eh1;
-        let ah1 = xx ^ yy;
-        let ah23 = (ad2 | eh2) | (ad1 & eh1) | (xx & yy);
-        let z = !ah23 & ah1;
-        let i2 = !ah0 & z;
-        let i3 = ah0 & z;
-        (i & i2) | i3
-    }
+    //     let ah0 = ad0 ^ eh0;
+    //     let xx = ad0 & eh0;
+    //     let yy = ad1 ^ eh1;
+    //     let ah1 = xx ^ yy;
+    //     let ah23 = (ad2 | eh2) | (ad1 & eh1) | (xx & yy);
+    //     let z = !ah23 & ah1;
+    //     let i2 = !ah0 & z;
+    //     let i3 = ah0 & z;
+    //     (i & i2) | i3
+    // }
 
-    /// `nw`, `ne`, `sw`, `se` must be leaves
-    pub(super) fn update_leaves(
-        &self,
-        nw: NodeIdx,
-        ne: NodeIdx,
-        sw: NodeIdx,
-        se: NodeIdx,
-        steps: u64,
-    ) -> NodeIdx {
-        let [nw, ne, sw, se] = [nw, ne, sw, se].map(|x| self.mem.get(x).leaf_cells());
+    // /// `nw`, `ne`, `sw`, `se` must be leaves
+    // pub(super) fn update_leaves(
+    //     &self,
+    //     nw: NodeIdx,
+    //     ne: NodeIdx,
+    //     sw: NodeIdx,
+    //     se: NodeIdx,
+    //     steps: u64,
+    // ) -> NodeIdx {
+    //     let [nw, ne, sw, se] = [nw, ne, sw, se].map(|x| self.mem.get(x).leaf_cells());
 
-        let mut src = [0; 16];
-        for i in 0..8 {
-            src[i] = u16::from_le_bytes([nw[i], ne[i]]);
-            src[i + 8] = u16::from_le_bytes([sw[i], se[i]]);
-        }
-        let mut dst = [0; 16];
+    //     let mut src = [0; 16];
+    //     for i in 0..8 {
+    //         src[i] = u16::from_le_bytes([nw[i], ne[i]]);
+    //         src[i + 8] = u16::from_le_bytes([sw[i], se[i]]);
+    //     }
+    //     let mut dst = [0; 16];
 
-        for t in 1..=steps as usize {
-            for y in t..16 - t {
-                dst[y] = Self::update_row(src[y - 1], src[y], src[y + 1]);
-            }
-            std::mem::swap(&mut src, &mut dst);
-        }
+    //     for t in 1..=steps as usize {
+    //         for y in t..16 - t {
+    //             dst[y] = Self::update_row(src[y - 1], src[y], src[y + 1]);
+    //         }
+    //         std::mem::swap(&mut src, &mut dst);
+    //     }
 
-        let arr: [u16; 8] = src[4..12].try_into().unwrap();
-        self.mem
-            .find_or_create_leaf_from_u64(u64::from_le_bytes(arr.map(|x| (x >> 4) as u8)))
-    }
+    //     let arr: [u16; 8] = src[4..12].try_into().unwrap();
+    //     self.mem
+    //         .find_or_create_leaf_from_u64(u64::from_le_bytes(arr.map(|x| (x >> 4) as u8)))
+    // }
 
-    pub(super) fn nine_children_overlapping(
-        &self,
-        nw: NodeIdx,
-        ne: NodeIdx,
-        sw: NodeIdx,
-        se: NodeIdx,
-    ) -> [NodeIdx; 9] {
-        let [nw_, ne_, sw_, se_] = [nw, ne, sw, se].map(|x| self.mem.get(x));
-        [
-            nw,
-            self.mem.find_or_create_node(nw_.ne, ne_.nw, nw_.se, ne_.sw),
-            ne,
-            self.mem.find_or_create_node(nw_.sw, nw_.se, sw_.nw, sw_.ne),
-            self.mem.find_or_create_node(nw_.se, ne_.sw, sw_.ne, se_.nw),
-            self.mem.find_or_create_node(ne_.sw, ne_.se, se_.nw, se_.ne),
-            sw,
-            self.mem.find_or_create_node(sw_.ne, se_.nw, sw_.se, se_.sw),
-            se,
-        ]
-    }
+    // pub(super) fn nine_children_overlapping(
+    //     &self,
+    //     nw: NodeIdx,
+    //     ne: NodeIdx,
+    //     sw: NodeIdx,
+    //     se: NodeIdx,
+    // ) -> [NodeIdx; 9] {
+    //     let [nw_, ne_, sw_, se_] = [nw, ne, sw, se].map(|x| self.mem.get(x));
+    //     [
+    //         nw,
+    //         self.mem.find_or_create_node(nw_.ne, ne_.nw, nw_.se, ne_.sw),
+    //         ne,
+    //         self.mem.find_or_create_node(nw_.sw, nw_.se, sw_.nw, sw_.ne),
+    //         self.mem.find_or_create_node(nw_.se, ne_.sw, sw_.ne, se_.nw),
+    //         self.mem.find_or_create_node(ne_.sw, ne_.se, se_.nw, se_.ne),
+    //         sw,
+    //         self.mem.find_or_create_node(sw_.ne, se_.nw, sw_.se, se_.sw),
+    //         se,
+    //     ]
+    // }
 
-    pub(super) fn nine_children_disjoint(
-        &self,
-        nw: NodeIdx,
-        ne: NodeIdx,
-        sw: NodeIdx,
-        se: NodeIdx,
-        size_log2: u32,
-    ) -> [NodeIdx; 9] {
-        let [
-            [nwnw, nwne, nwsw, nwse],
-            [nenw, nene, nesw, nese],
-            [swnw, swne, swsw, swse],
-            [senw, sene, sesw, sese],
-        ] = [nw, ne, sw, se].map(|x| self.mem.get(x).parts().map(|y| self.mem.get(y)));
+    // pub(super) fn nine_children_disjoint(
+    //     &self,
+    //     nw: NodeIdx,
+    //     ne: NodeIdx,
+    //     sw: NodeIdx,
+    //     se: NodeIdx,
+    //     size_log2: u32,
+    // ) -> [NodeIdx; 9] {
+    //     let [
+    //         [nwnw, nwne, nwsw, nwse],
+    //         [nenw, nene, nesw, nese],
+    //         [swnw, swne, swsw, swse],
+    //         [senw, sene, sesw, sese],
+    //     ] = [nw, ne, sw, se].map(|x| self.mem.get(x).parts().map(|y| self.mem.get(y)));
 
-        [
-            [nwnw, nwne, nwsw, nwse],
-            [nwne, nenw, nwse, nesw],
-            [nenw, nene, nesw, nese],
-            [nwsw, nwse, swnw, swne],
-            [nwse, nesw, swne, senw],
-            [nesw, nese, senw, sene],
-            [swnw, swne, swsw, swse],
-            [swne, senw, swse, sesw],
-            [senw, sene, sesw, sese],
-        ]
-        .map(|[nw, ne, sw, se]| {
-            if size_log2 >= LEAF_SIZE_LOG2 + 2 {
-                self.mem.find_or_create_node(nw.se, ne.sw, sw.ne, se.nw)
-            } else {
-                self.mem.find_or_create_leaf_from_parts(
-                    nw.leaf_se(),
-                    ne.leaf_sw(),
-                    sw.leaf_ne(),
-                    se.leaf_nw(),
-                )
-            }
-        })
-    }
+    //     [
+    //         [nwnw, nwne, nwsw, nwse],
+    //         [nwne, nenw, nwse, nesw],
+    //         [nenw, nene, nesw, nese],
+    //         [nwsw, nwse, swnw, swne],
+    //         [nwse, nesw, swne, senw],
+    //         [nesw, nese, senw, sene],
+    //         [swnw, swne, swsw, swse],
+    //         [swne, senw, swse, sesw],
+    //         [senw, sene, sesw, sese],
+    //     ]
+    //     .map(|[nw, ne, sw, se]| {
+    //         if size_log2 >= LEAF_SIZE_LOG2 + 2 {
+    //             self.mem.find_or_create_node(nw.se, ne.sw, sw.ne, se.nw)
+    //         } else {
+    //             self.mem.find_or_create_leaf_from_parts(
+    //                 nw.leaf_se(),
+    //                 ne.leaf_sw(),
+    //                 sw.leaf_ne(),
+    //                 se.leaf_nw(),
+    //             )
+    //         }
+    //     })
+    // }
 
-    pub(super) fn four_children_overlapping(&self, arr: &[NodeIdx; 9]) -> [NodeIdx; 4] {
-        [
-            self.mem.find_or_create_node(arr[0], arr[1], arr[3], arr[4]),
-            self.mem.find_or_create_node(arr[1], arr[2], arr[4], arr[5]),
-            self.mem.find_or_create_node(arr[3], arr[4], arr[6], arr[7]),
-            self.mem.find_or_create_node(arr[4], arr[5], arr[7], arr[8]),
-        ]
-    }
+    // pub(super) fn four_children_overlapping(&self, arr: &[NodeIdx; 9]) -> [NodeIdx; 4] {
+    //     [
+    //         self.mem.find_or_create_node(arr[0], arr[1], arr[3], arr[4]),
+    //         self.mem.find_or_create_node(arr[1], arr[2], arr[4], arr[5]),
+    //         self.mem.find_or_create_node(arr[3], arr[4], arr[6], arr[7]),
+    //         self.mem.find_or_create_node(arr[4], arr[5], arr[7], arr[8]),
+    //     ]
+    // }
 
-    fn update_inner_sync(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
-        let n = self.mem.get(node);
-        let generations_log2 = self.generations_per_update_log2.unwrap();
-        let both_stages = generations_log2 + 2 >= size_log2;
-        if size_log2 == LEAF_SIZE_LOG2 + 1 {
-            let steps = if both_stages {
-                LEAF_SIZE / 2
-            } else {
-                1 << generations_log2
-            };
-            self.update_leaves(n.nw, n.ne, n.sw, n.se, steps)
-        } else {
-            let mut arr9;
-            if both_stages {
-                arr9 = self.nine_children_overlapping(n.nw, n.ne, n.sw, n.se);
-                for x in arr9.iter_mut() {
-                    *x = self.update_node_sync(*x, size_log2 - 1);
-                }
-            } else {
-                arr9 = self.nine_children_disjoint(n.nw, n.ne, n.sw, n.se, size_log2 - 1);
-            }
+    // fn update_inner_sync(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
+    //     let n = self.mem.get(node);
+    //     let generations_log2 = self.generations_per_update_log2.unwrap();
+    //     let both_stages = generations_log2 + 2 >= size_log2;
+    //     if size_log2 == LEAF_SIZE_LOG2 + 1 {
+    //         let steps = if both_stages {
+    //             LEAF_SIZE / 2
+    //         } else {
+    //             1 << generations_log2
+    //         };
+    //         self.update_leaves(n.nw, n.ne, n.sw, n.se, steps)
+    //     } else {
+    //         let mut arr9;
+    //         if both_stages {
+    //             arr9 = self.nine_children_overlapping(n.nw, n.ne, n.sw, n.se);
+    //             for x in arr9.iter_mut() {
+    //                 *x = self.update_node_sync(*x, size_log2 - 1);
+    //             }
+    //         } else {
+    //             arr9 = self.nine_children_disjoint(n.nw, n.ne, n.sw, n.se, size_log2 - 1);
+    //         }
 
-            let mut arr4 = self.four_children_overlapping(&arr9);
-            for x in arr4.iter_mut() {
-                *x = self.update_node_sync(*x, size_log2 - 1);
-            }
+    //         let mut arr4 = self.four_children_overlapping(&arr9);
+    //         for x in arr4.iter_mut() {
+    //             *x = self.update_node_sync(*x, size_log2 - 1);
+    //         }
 
-            self.mem
-                .find_or_create_node(arr4[0], arr4[1], arr4[2], arr4[3])
-        }
-    }
+    //         self.mem
+    //             .find_or_create_node(arr4[0], arr4[1], arr4[2], arr4[3])
+    //     }
+    // }
 
-    fn update_node_sync(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
-        let n = self.mem.get(node);
-        let status = n.status.load(Ordering::Acquire);
-        if status == status::FINISHED {
-            return n.cache.get_node_idx();
-        }
+    // fn update_node_sync(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
+    //     let n = self.mem.get(node);
+    //     let status = n.status.load(Ordering::Acquire);
+    //     if status == status::FINISHED {
+    //         return n.cache.get_node_idx();
+    //     }
 
-        if status == status::NOT_STARTED
-            && n.status
-                .compare_exchange(
-                    status::NOT_STARTED,
-                    status::PROCESSING,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            let cache = self.update_inner_sync(node, size_log2);
-            n.cache.set_node_idx(cache);
-            n.status.store(status::FINISHED, Ordering::Release);
-            cache
-        } else {
-            while n.status.load(Ordering::Acquire) != status::FINISHED {
-                if ExecutionStatistics::is_poisoned() {
-                    return NodeIdx::default();
-                }
-                spin_loop();
-            }
-            n.cache.get_node_idx()
-        }
-    }
+    //     if status == status::NOT_STARTED
+    //         && n.status
+    //             .compare_exchange(
+    //                 status::NOT_STARTED,
+    //                 status::PROCESSING,
+    //                 Ordering::Relaxed,
+    //                 Ordering::Relaxed,
+    //             )
+    //             .is_ok()
+    //     {
+    //         let cache = self.update_inner_sync(node, size_log2);
+    //         n.cache.set_node_idx(cache);
+    //         n.status.store(status::FINISHED, Ordering::Release);
+    //         cache
+    //     } else {
+    //         while n.status.load(Ordering::Acquire) != status::FINISHED {
+    //             if ExecutionStatistics::is_poisoned() {
+    //                 return NodeIdx::default();
+    //             }
+    //             spin_loop();
+    //         }
+    //         n.cache.get_node_idx()
+    //     }
+    // }
 
-    fn update_inner_async(
-        &self,
-        node: NodeIdx,
-        size_log2: u32,
-    ) -> Pin<Box<dyn Future<Output = NodeIdx> + Send>> {
-        let this = self as *const _ as usize;
-        Box::pin(async move {
-            let this = unsafe { &*(this as *const HashLifeEngineAsync<Extra>) };
-            let n = this.mem.get(node);
-            let generations_log2 = this.generations_per_update_log2.unwrap();
-            let both_stages = generations_log2 + 2 >= size_log2;
-            if size_log2 == LEAF_SIZE_LOG2 + 1 {
-                let steps = if both_stages {
-                    LEAF_SIZE / 2
-                } else {
-                    1 << generations_log2
-                };
-                this.update_leaves(n.nw, n.ne, n.sw, n.se, steps)
-            } else {
-                let mut arr9;
-                if both_stages {
-                    arr9 = this.nine_children_overlapping(n.nw, n.ne, n.sw, n.se);
-                    if ExecutionStatistics::should_spawn(size_log2) {
-                        let _guard = TasksCountGuard::new(9);
-                        let this_ptr = this as *const _ as usize;
-                        let handles = arr9.map(|x| {
-                            tokio::spawn(async move {
-                                unsafe { &*(this_ptr as *const HashLifeEngineAsync<Extra>) }
-                                    .update_node_async(x, size_log2 - 1)
-                                    .await
-                            })
-                        });
-                        for (i, handle) in handles.into_iter().enumerate() {
-                            arr9[i] = handle.await.unwrap();
-                        }
-                    } else {
-                        for x in arr9.iter_mut() {
-                            *x = this.update_node_async(*x, size_log2 - 1).await;
-                        }
-                    }
-                } else {
-                    arr9 = this.nine_children_disjoint(n.nw, n.ne, n.sw, n.se, size_log2 - 1);
-                }
+    // fn update_inner_async(
+    //     &self,
+    //     node: NodeIdx,
+    //     size_log2: u32,
+    // ) -> Pin<Box<dyn Future<Output = NodeIdx> + Send>> {
+    //     let this = self as *const _ as usize;
+    //     Box::pin(async move {
+    //         let this = unsafe { &*(this as *const HashLifeEngineAsync<Extra>) };
+    //         let n = this.mem.get(node);
+    //         let generations_log2 = this.generations_per_update_log2.unwrap();
+    //         let both_stages = generations_log2 + 2 >= size_log2;
+    //         if size_log2 == LEAF_SIZE_LOG2 + 1 {
+    //             let steps = if both_stages {
+    //                 LEAF_SIZE / 2
+    //             } else {
+    //                 1 << generations_log2
+    //             };
+    //             this.update_leaves(n.nw, n.ne, n.sw, n.se, steps)
+    //         } else {
+    //             let mut arr9;
+    //             if both_stages {
+    //                 arr9 = this.nine_children_overlapping(n.nw, n.ne, n.sw, n.se);
+    //                 if ExecutionStatistics::should_spawn(size_log2) {
+    //                     let _guard = TasksCountGuard::new(9);
+    //                     let this_ptr = this as *const _ as usize;
+    //                     let handles = arr9.map(|x| {
+    //                         tokio::spawn(async move {
+    //                             unsafe { &*(this_ptr as *const HashLifeEngineAsync<Extra>) }
+    //                                 .update_node_async(x, size_log2 - 1)
+    //                                 .await
+    //                         })
+    //                     });
+    //                     for (i, handle) in handles.into_iter().enumerate() {
+    //                         arr9[i] = handle.await.unwrap();
+    //                     }
+    //                 } else {
+    //                     for x in arr9.iter_mut() {
+    //                         *x = this.update_node_async(*x, size_log2 - 1).await;
+    //                     }
+    //                 }
+    //             } else {
+    //                 arr9 = this.nine_children_disjoint(n.nw, n.ne, n.sw, n.se, size_log2 - 1);
+    //             }
 
-                let mut arr4 = this.four_children_overlapping(&arr9);
-                if ExecutionStatistics::should_spawn(size_log2) {
-                    let _guard = TasksCountGuard::new(4);
-                    let this_ptr = this as *const _ as usize;
-                    let handles = arr4.map(|x| {
-                        tokio::spawn(async move {
-                            unsafe { &*(this_ptr as *const HashLifeEngineAsync<Extra>) }
-                                .update_node_async(x, size_log2 - 1)
-                                .await
-                        })
-                    });
-                    for (i, handle) in handles.into_iter().enumerate() {
-                        arr4[i] = handle.await.unwrap();
-                    }
-                } else {
-                    for x in arr4.iter_mut() {
-                        *x = this.update_node_async(*x, size_log2 - 1).await;
-                    }
-                }
-                this.mem
-                    .find_or_create_node(arr4[0], arr4[1], arr4[2], arr4[3])
-            }
-        })
-    }
+    //             let mut arr4 = this.four_children_overlapping(&arr9);
+    //             if ExecutionStatistics::should_spawn(size_log2) {
+    //                 let _guard = TasksCountGuard::new(4);
+    //                 let this_ptr = this as *const _ as usize;
+    //                 let handles = arr4.map(|x| {
+    //                     tokio::spawn(async move {
+    //                         unsafe { &*(this_ptr as *const HashLifeEngineAsync<Extra>) }
+    //                             .update_node_async(x, size_log2 - 1)
+    //                             .await
+    //                     })
+    //                 });
+    //                 for (i, handle) in handles.into_iter().enumerate() {
+    //                     arr4[i] = handle.await.unwrap();
+    //                 }
+    //             } else {
+    //                 for x in arr4.iter_mut() {
+    //                     *x = this.update_node_async(*x, size_log2 - 1).await;
+    //                 }
+    //             }
+    //             this.mem
+    //                 .find_or_create_node(arr4[0], arr4[1], arr4[2], arr4[3])
+    //         }
+    //     })
+    // }
 
-    /// Recursively updates nodes in graph.
-    ///
-    /// `size_log2` is related to `node`
-    pub(super) async fn update_node_async(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
-        let n = self.mem.get(node);
-        let status = n.status.load(Ordering::Acquire);
-        if status == status::FINISHED {
-            return n.cache.get_node_idx();
-        }
+    // /// Recursively updates nodes in graph.
+    // ///
+    // /// `size_log2` is related to `node`
+    // pub(super) async fn update_node_async(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
+    //     let n = self.mem.get(node);
+    //     let status = n.status.load(Ordering::Acquire);
+    //     if status == status::FINISHED {
+    //         return n.cache.get_node_idx();
+    //     }
 
-        if status == status::NOT_STARTED
-            && n.status
-                .compare_exchange(
-                    status::NOT_STARTED,
-                    status::PROCESSING,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            let cache = if size_log2 >= ExecutionStatistics::get_min_task_spawn_size_log2() {
-                self.update_inner_async(node, size_log2).await
-            } else {
-                self.update_inner_sync(node, size_log2)
-            };
-            n.cache.set_node_idx(cache);
-            n.status.store(status::FINISHED, Ordering::Release);
-            cache
-        } else {
-            while n.status.load(Ordering::Acquire) != status::FINISHED {
-                if ExecutionStatistics::is_poisoned() {
-                    return NodeIdx::default();
-                }
-                tokio::task::yield_now().await;
-            }
-            n.cache.get_node_idx()
-        }
-    }
+    //     if status == status::NOT_STARTED
+    //         && n.status
+    //             .compare_exchange(
+    //                 status::NOT_STARTED,
+    //                 status::PROCESSING,
+    //                 Ordering::Relaxed,
+    //                 Ordering::Relaxed,
+    //             )
+    //             .is_ok()
+    //     {
+    //         let cache = if size_log2 >= ExecutionStatistics::get_min_task_spawn_size_log2() {
+    //             self.update_inner_async(node, size_log2).await
+    //         } else {
+    //             self.update_inner_sync(node, size_log2)
+    //         };
+    //         n.cache.set_node_idx(cache);
+    //         n.status.store(status::FINISHED, Ordering::Release);
+    //         cache
+    //     } else {
+    //         while n.status.load(Ordering::Acquire) != status::FINISHED {
+    //             if ExecutionStatistics::is_poisoned() {
+    //                 return NodeIdx::default();
+    //             }
+    //             tokio::task::yield_now().await;
+    //         }
+    //         n.cache.get_node_idx()
+    //     }
+    // }
 
     /// Add a frame around the field: if `self.topology` is Unbounded, frame is blank,
     /// and if `self.topology` is Torus, frame mirrors the field.
@@ -429,7 +426,6 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
             generations_per_update_log2: None,
             topology: Topology::Unbounded,
             blank_nodes: BlankNodes::new(),
-            _stats: ExecutionStatistics::new(cap_log2),
         }
     }
 }
@@ -454,7 +450,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         self.size_log2 = size_log2;
         self.mem.clear();
         self.blank_nodes.clear();
-        ExecutionStatistics::reset();
+        // ExecutionStatistics::reset(); TODO
         let mut cache = HashMap::new();
         self.root =
             Self::from_pattern_recursive(pattern.get_root(), pattern, &self.mem, &mut cache);
@@ -507,7 +503,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
                 self.run_gc();
             }
         }
-        let backup = self.current_state();
+        // let backup = self.current_state();
         self.generations_per_update_log2 = Some(generations_log2);
 
         let frames_cnt = (generations_log2 + 2).max(self.size_log2 + 1) - self.size_log2;
@@ -535,12 +531,12 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
             HashLifeExecutor::new(self).run(num_threads)
             // self.update_node_sync(self.root, self.size_log2)
         };
-        if ExecutionStatistics::is_poisoned() {
-            self.load_pattern(&backup, self.topology)?;
-            return Err(anyhow!(
-                "HashLifeAsync: overfilled MemoryManager, try smaller step"
-            ));
-        }
+        // if ExecutionStatistics::is_poisoned() { TODO
+        //     self.load_pattern(&backup, self.topology)?;
+        //     return Err(anyhow!(
+        //         "HashLifeAsync: overfilled MemoryManager, try smaller step"
+        //     ));
+        // }
 
         self.size_log2 -= 1;
         dx -= BigInt::from(1) << (self.size_log2 - 1);
@@ -566,7 +562,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         let pattern = self.current_state();
         self.mem.clear();
         self.blank_nodes.clear();
-        ExecutionStatistics::reset();
+        // ExecutionStatistics::reset(); TODO
         let mut cache = HashMap::new();
         self.root =
             Self::from_pattern_recursive(pattern.get_root(), &pattern, &self.mem, &mut cache);

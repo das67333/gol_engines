@@ -1,5 +1,4 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use crossbeam_deque::Worker;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
@@ -12,7 +11,7 @@ const NUM_ITEMS: u64 = 1_000_000; // Total items to push/pop in one run.
 /// The core logic for one benchmark run.
 /// Spawns a configurable number of producer and consumer threads.
 fn run_mpmc_test(num_producers: usize, num_consumers: usize) {
-    let (sender, receiver) = crossbeam_channel::unbounded::<NodeIdx>();
+    let (sender, receiver) = crossbeam::channel::unbounded::<NodeIdx>();
 
     // --- Producer Threads ---
     let mut producer_handles = Vec::new();
@@ -88,7 +87,7 @@ fn push_pop_benchmark(c: &mut Criterion) {
         })
     });
 
-    let worker_fifo = Worker::new_fifo();
+    let worker_fifo = crossbeam::deque::Worker::new_fifo();
     group.bench_function("worker_fifo", |b| {
         b.iter(|| {
             black_box(worker_fifo.push(1));
@@ -96,7 +95,7 @@ fn push_pop_benchmark(c: &mut Criterion) {
         })
     });
 
-    let worker_lifo = Worker::new_lifo();
+    let worker_lifo = crossbeam::deque::Worker::new_lifo();
     group.bench_function("worker_lifo", |b| {
         b.iter(|| {
             black_box(worker_lifo.push(1));

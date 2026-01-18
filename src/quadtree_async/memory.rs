@@ -1,7 +1,4 @@
-use super::{
-    node::{NodeIdx, QuadTreeNode},
-    statistics::ExecutionStatistics,
-};
+use super::node::{NodeIdx, QuadTreeNode};
 use std::{cell::UnsafeCell, hint, mem, sync::atomic::Ordering};
 
 /// Stores the nodes of the quadtree.
@@ -122,10 +119,6 @@ impl<Extra: Default> MemoryManager<Extra> {
         se: NodeIdx,
         hash: usize,
     ) -> NodeIdx {
-        if ExecutionStatistics::is_poisoned() {
-            return NodeIdx::default();
-        }
-
         const FLAG_LEAF: u8 = 1 << 0;
         const FLAG_USED: u8 = 1 << 1;
         const FLAG_LOCKED: u8 = 1 << 2;
@@ -181,8 +174,6 @@ impl<Extra: Default> MemoryManager<Extra> {
 
                 // CRITICAL: Write flags with Release ordering!
                 flags.store(target_flags, Ordering::Release);
-
-                ExecutionStatistics::on_insertion::<0>();
                 return NodeIdx(index as u32);
             }
 

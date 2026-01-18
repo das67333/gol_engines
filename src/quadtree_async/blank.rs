@@ -26,10 +26,10 @@ impl BlankNodes {
         v[i]
     }
 
-    pub(super) fn get(&self, size_log2: u32) -> NodeIdx {
-        let i = (size_log2 - LEAF_SIZE_LOG2) as usize;
-        self.data[i]
-    }
+    // pub(super) fn get(&self, size_log2: u32) -> NodeIdx {
+    //     let i = (size_log2 - LEAF_SIZE_LOG2) as usize;
+    //     self.data[i]
+    // }
 
     pub(super) fn clear(&mut self) {
         self.data.clear();
