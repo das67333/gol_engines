@@ -136,7 +136,7 @@ impl SIMDEngine {
 }
 
 impl GoLEngine for SIMDEngine {
-    fn new(mem_limit_mib: u32) -> Self {
+    fn new(mem_limit_mib: u32, _threads_cnt: usize) -> Self {
         Self {
             data: vec![0; 128 * 128 / Self::CELLS_IN_CHUNK],
             n: 128,
@@ -211,7 +211,7 @@ mod tests {
     fn test_pattern_roundtrip() {
         for size_log2 in 7..10 {
             let original = Pattern::random(size_log2, Some(SEED)).unwrap();
-            let mut engine = SIMDEngine::new(1);
+            let mut engine = SIMDEngine::new(1, 1);
             engine.load_pattern(&original, Topology::Torus).unwrap();
             let converted = engine.current_state();
 

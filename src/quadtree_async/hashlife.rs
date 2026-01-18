@@ -5,11 +5,10 @@ use super::{
     memory::MemoryManager,
     node::{NodeIdx, QuadTreeNode},
 };
-use crate::{GoLEngine, Pattern, PatternNode, Topology, WORKER_THREADS};
+use crate::{GoLEngine, Pattern, PatternNode, Topology};
 use ahash::AHashMap as HashMap;
 use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
-use std::{sync::atomic::Ordering, thread};
 
 /// Parallel implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife).
 ///
@@ -22,6 +21,7 @@ pub struct HashLifeEngineAsync<Extra> {
     pub(super) generations_per_update_log2: Option<u32>,
     pub(super) topology: Topology,
     pub(super) blank_nodes: BlankNodes,
+    pub(super) threads_cnt: usize,
 }
 
 impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
@@ -395,7 +395,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
         self.size_log2 -= 1;
     }
 
-    fn from_pattern_recursive(
+    fn init_pattern_recursive(
         idx: u32,
         pattern: &Pattern,
         mem: &MemoryManager<Extra>,
@@ -407,18 +407,18 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
         let result = match pattern.get_node(idx) {
             PatternNode::Leaf(cells) => mem.find_or_create_leaf_from_u64(*cells),
             PatternNode::Node { nw, ne, sw, se } => mem.find_or_create_node(
-                Self::from_pattern_recursive(*nw, pattern, mem, cache),
-                Self::from_pattern_recursive(*ne, pattern, mem, cache),
-                Self::from_pattern_recursive(*sw, pattern, mem, cache),
-                Self::from_pattern_recursive(*se, pattern, mem, cache),
+                Self::init_pattern_recursive(*nw, pattern, mem, cache),
+                Self::init_pattern_recursive(*ne, pattern, mem, cache),
+                Self::init_pattern_recursive(*sw, pattern, mem, cache),
+                Self::init_pattern_recursive(*se, pattern, mem, cache),
             ),
         };
         cache.insert(idx, result);
         result
     }
 
-    pub(super) fn with_capacity(cap_log2: u32) -> Self {
-        let mem = MemoryManager::with_capacity(cap_log2);
+    pub(super) fn with_capacity(cap_log2: u32, threads_cnt: usize) -> Self {
+        let mem = MemoryManager::new(cap_log2, threads_cnt);
         Self {
             size_log2: LEAF_SIZE_LOG2,
             root: mem.find_or_create_leaf_from_u64(0),
@@ -426,12 +426,13 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
             generations_per_update_log2: None,
             topology: Topology::Unbounded,
             blank_nodes: BlankNodes::new(),
+            threads_cnt,
         }
     }
 }
 
 impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
-    fn new(mem_limit_mib: u32) -> Self {
+    fn new(mem_limit_mib: u32, threads_cnt: usize) -> Self {
         let nodes =
             ((mem_limit_mib as u64) << 20) / std::mem::size_of::<QuadTreeNode<Extra>>() as u64;
         // previous power of two
@@ -439,7 +440,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
             .checked_next_power_of_two()
             .unwrap()
             .trailing_zeros();
-        Self::with_capacity(cap_log2)
+        Self::with_capacity(cap_log2, threads_cnt)
     }
 
     fn load_pattern(&mut self, pattern: &Pattern, topology: Topology) -> Result<()> {
@@ -453,7 +454,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         // ExecutionStatistics::reset(); TODO
         let mut cache = HashMap::new();
         self.root =
-            Self::from_pattern_recursive(pattern.get_root(), pattern, &self.mem, &mut cache);
+            Self::init_pattern_recursive(pattern.get_root(), pattern, &self.mem, &mut cache);
         self.generations_per_update_log2 = None;
         self.topology = topology;
         Ok(())
@@ -513,12 +514,6 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         }
 
         self.root = {
-            let mut num_threads = WORKER_THREADS.load(Ordering::Relaxed);
-            if num_threads == 0 {
-                num_threads = thread::available_parallelism()
-                    .map(|n| n.get())
-                    .expect("Failed to request available parallelism");
-            }
             // let mut builder = tokio::runtime::Builder::new_multi_thread();
             // if num_threads > 0 {
             //     builder.worker_threads(num_threads as usize);
@@ -528,7 +523,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
             //     .build()
             //     .unwrap()
             //     .block_on(async { self.update_node_async(self.root, self.size_log2).await })
-            HashLifeExecutor::new(self).run(num_threads)
+            HashLifeExecutor::new(self).run(self.threads_cnt)
             // self.update_node_sync(self.root, self.size_log2)
         };
         // if ExecutionStatistics::is_poisoned() { TODO
@@ -565,7 +560,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         // ExecutionStatistics::reset(); TODO
         let mut cache = HashMap::new();
         self.root =
-            Self::from_pattern_recursive(pattern.get_root(), &pattern, &self.mem, &mut cache);
+            Self::init_pattern_recursive(pattern.get_root(), &pattern, &self.mem, &mut cache);
         self.generations_per_update_log2 = None;
     }
 
@@ -585,7 +580,7 @@ mod tests {
     fn test_pattern_roundtrip() {
         for size_log2 in 3..10 {
             let original = Pattern::random(size_log2, Some(SEED)).unwrap();
-            let mut engine = HashLifeEngineAsync::<()>::new(1);
+            let mut engine = HashLifeEngineAsync::<()>::new(1, 1);
             engine.load_pattern(&original, Topology::Unbounded).unwrap();
             let converted = engine.current_state();
 

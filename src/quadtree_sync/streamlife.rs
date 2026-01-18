@@ -407,7 +407,7 @@ impl StreamLifeEngineSync {
 }
 
 impl GoLEngine for StreamLifeEngineSync {
-    fn new(mem_limit_mib: u32) -> Self {
+    fn new(mem_limit_mib: u32, _threads_cnt: usize) -> Self {
         let nodes = ((mem_limit_mib as u64) << 20)
             / (std::mem::size_of::<QuadTreeNode<u64>>() + std::mem::size_of::<CacheEntry>()) as u64;
         // previous power of two
@@ -504,7 +504,7 @@ mod tests {
     fn test_pattern_roundtrip() {
         for size_log2 in 3..10 {
             let original = Pattern::random(size_log2, Some(SEED)).unwrap();
-            let mut engine = StreamLifeEngineSync::new(2);
+            let mut engine = StreamLifeEngineSync::new(2, 1);
             engine.load_pattern(&original, Topology::Unbounded).unwrap();
             let converted = engine.current_state();
 

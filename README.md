@@ -14,20 +14,22 @@ Moved from https://github.com/das67333/conway/
 [actions-url]: https://github.com/das67333/gol_engines/actions?branch%3Amain
 
 ## Table of Contents
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [Features](#features)
-- [Building](#building)
-- [Examples](#examples)
-  - [Update](#update)
-  - [Metafy](#metafy)
-  - [Stats](#stats)
-- [Help](#help)
-  - [Update Command](#update)
-  - [Metafy Command](#metafy)
-  - [Stats Command](#stats)
-- [Benchmark](#benchmark)
-- [Tips](#tips)
+- [GoL Engines: top-performing Conway's Game of Life update algorithms, including parallel hashlife](#gol-engines-top-performing-conways-game-of-life-update-algorithms-including-parallel-hashlife)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Architecture](#architecture)
+  - [Features](#features)
+  - [Building](#building)
+  - [Examples](#examples)
+      - [Update](#update)
+      - [Metafy](#metafy)
+      - [Stats](#stats)
+  - [Help](#help)
+      - [Update](#update-1)
+      - [Metafy](#metafy-1)
+      - [Stats](#stats-1)
+  - [Benchmark](#benchmark)
+  - [Tips](#tips)
 
 ## Overview
 
@@ -364,7 +366,7 @@ As all the hashtables are power-of-two sized, there are certain memory-limit-gib
 
 I reached best performance with about 24 workers for hashlife and 6 workers for streamlife on 96-core virtual machine for 0e0p-metaglider. The best value can depend on the pattern structure and hardware used. You can try other values, but notice that it might be important to provide a whole physical (not logical) core for every worker.
 
-This is updating 0e0p-metaglider with HashLifeEngineAsync by $2^{12}$ generations with different values of `WORKER_THREADS`:
+This is updating 0e0p-metaglider with HashLifeEngineAsync by $2^{12}$ generations with different values of worker threads:
 
 ![HashLifeEngineAsync](https://github.com/user-attachments/assets/7f0ee110-56fd-48e1-8acb-bcc103e53dd6)
 

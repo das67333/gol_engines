@@ -15,10 +15,11 @@ pub trait GoLEngine {
     ///   insignificantly exceed this value when necessary.
     ///   For example, the amount of memory consumed by [`Pattern`]
     ///   is considered negligible.
+    /// * `threads_cnt` - The number of threads the engine can use for parallel computation.
     ///
     /// # Returns
     /// A new instance of the Game of Life engine with a blank pattern
-    fn new(mem_limit_mib: u32) -> Self
+    fn new(mem_limit_mib: u32, threads_cnt: usize) -> Self
     where
         Self: Sized;
 

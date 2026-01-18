@@ -1,16 +1,22 @@
 use super::node::{NodeIdx, QuadTreeNode};
-use std::{cell::UnsafeCell, hint, mem, sync::atomic::Ordering};
+use crossbeam::utils::CachePadded;
+use std::{
+    cell::UnsafeCell,
+    hint, mem,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 /// Stores the nodes of the quadtree.
 pub(super) struct MemoryManager<Extra> {
-    hashtable: Vec<UnsafeCell<QuadTreeNode<Extra>>>,
+    hashtable: Box<[UnsafeCell<QuadTreeNode<Extra>>]>,
+    length: ShardedLength,
 }
 
 unsafe impl<Extra: Sync> Sync for MemoryManager<Extra> {}
 
 impl<Extra: Default> MemoryManager<Extra> {
     /// Create a new memory manager with capacity of `1 << cap_log2`.
-    pub(super) fn with_capacity(cap_log2: u32) -> Self {
+    pub(super) fn new(cap_log2: u32, threads_cnt: usize) -> Self {
         let max_cap_log2 = mem::size_of::<NodeIdx>() as u32 * 8;
         assert!(
             cap_log2 <= max_cap_log2,
@@ -20,6 +26,7 @@ impl<Extra: Default> MemoryManager<Extra> {
             hashtable: (0..1u64 << cap_log2)
                 .map(|_| UnsafeCell::new(QuadTreeNode::default()))
                 .collect(),
+            length: ShardedLength::new(threads_cnt),
         }
     }
 
@@ -95,7 +102,7 @@ impl<Extra: Default> MemoryManager<Extra> {
     }
 
     pub(super) fn bytes_total(&self) -> usize {
-        self.hashtable.capacity() * std::mem::size_of::<QuadTreeNode<Extra>>()
+        self.hashtable.len() * std::mem::size_of::<QuadTreeNode<Extra>>()
     }
 
     /// Find an item in hashtable; if it is not present, it is created and its index is returned.
@@ -174,6 +181,7 @@ impl<Extra: Default> MemoryManager<Extra> {
 
                 // CRITICAL: Write flags with Release ordering!
                 flags.store(target_flags, Ordering::Release);
+
                 return NodeIdx(index as u32);
             }
 
@@ -192,4 +200,54 @@ fn compute_hash(nw: NodeIdx, ne: NodeIdx, sw: NodeIdx, se: NodeIdx) -> usize {
         .wrapping_add((sw.0).wrapping_mul(257))
         .wrapping_add((se.0).wrapping_mul(65537));
     h.wrapping_add(h >> 11) as usize
+}
+
+struct ShardedLength {
+    global: AtomicUsize,
+    shards: Box<[CachePadded<AtomicUsize>]>,
+    max_inaccuracy: usize,
+}
+
+impl ShardedLength {
+    // must be even
+    const FLUSH_THRESHOLD: usize = 256;
+
+    fn new(shards_cnt: usize) -> Self {
+        let shards = (0..shards_cnt)
+            .map(|_| CachePadded::new(AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
+        Self {
+            global: AtomicUsize::new(0),
+            shards: shards.into_boxed_slice(),
+            max_inaccuracy: Self::FLUSH_THRESHOLD / 2 * shards_cnt,
+        }
+    }
+
+    pub(super) fn increment(&self, thread_idx: usize) {
+        let local = &self.shards[thread_idx];
+        if local.fetch_add(1, Ordering::Relaxed) + 1 == Self::FLUSH_THRESHOLD {
+            local.store(0, Ordering::Relaxed);
+            self.global.fetch_add(Self::FLUSH_THRESHOLD, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn get_approx(&self) -> usize {
+        let shards_sum_approx = self.max_inaccuracy;
+        self.global.load(Ordering::Relaxed) + shards_sum_approx
+    }
+
+    pub(super) fn get_exact(&self) -> usize {
+        let shards_sum_exact = self
+            .shards
+            .iter()
+            .map(|shard| shard.load(Ordering::Relaxed))
+            .sum::<usize>();
+
+        self.global.load(Ordering::Relaxed) + shards_sum_exact
+    }
+
+    /// Returns the maximum possible error from the true value.
+    pub(super) fn max_error(&self) -> usize {
+        self.max_inaccuracy
+    }
 }

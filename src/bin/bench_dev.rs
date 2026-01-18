@@ -15,7 +15,7 @@ fn detect_format(filename: &str) -> Option<PatternFormat> {
 fn main() {
     // updating all patterns in res/very_large_patterns
     let paths = std::fs::read_dir("res/very_large_patterns").unwrap();
-    let mut engine = HashLifeEngineSync::new(16 << 10);
+    let mut engine = HashLifeEngineSync::new(16 << 10, 1);
     for (i, path) in paths.enumerate() {
         let path = path.unwrap().path();
         let name = path.file_name().unwrap().to_str().unwrap();

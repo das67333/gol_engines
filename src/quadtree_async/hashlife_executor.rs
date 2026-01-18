@@ -79,7 +79,7 @@ static STEAL_FROM_LAST_VICTIM_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static STEAL_FROM_LAST_VICTIM_FAIL: AtomicU64 = AtomicU64::new(0);
 
 struct TaskFetcher<'a, F: Fn() -> bool> {
-    thread_id: usize,
+    thread_idx: usize,
     queue: &'a Worker<Task>,
     stealers: &'a [Stealer<Task>],
     stop_condition: F,
@@ -96,13 +96,13 @@ impl<'a, F: Fn() -> bool> TaskFetcher<'a, F> {
     const MAX_WAIT_DURATION: Duration = Duration::from_millis(100);
 
     fn new(
-        thread_id: usize,
+        thread_idx: usize,
         queue: &'a Worker<Task>,
         stealers: &'a [Stealer<Task>],
         stop_condition: F,
     ) -> Self {
         Self {
-            thread_id,
+            thread_idx,
             queue,
             stealers,
             stop_condition,
@@ -165,7 +165,7 @@ impl<'a, F: Fn() -> bool> TaskFetcher<'a, F> {
         for i in self.rng_buffer.iter_mut() {
             *i %= self.stealers.len() as u32 - 1;
             // skip current index
-            if *i >= self.thread_id as u32 {
+            if *i >= self.thread_idx as u32 {
                 *i += 1;
             }
         }
@@ -228,9 +228,9 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         queues[0].push(Task::new(self.root, self.size_log2));
 
         thread::scope(|scope| {
-            for (thread_id, mut queue) in queues.into_iter().enumerate() {
+            for (thread_idx, mut queue) in queues.into_iter().enumerate() {
                 let stealers = &stealers;
-                scope.spawn(move || self.worker_thread(thread_id, &mut queue, stealers));
+                scope.spawn(move || self.worker_thread(thread_idx, &mut queue, stealers));
             }
         });
 
@@ -265,9 +265,9 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         n.cache.get_node_idx()
     }
 
-    fn worker_thread(&self, thread_id: usize, queue: &Worker<Task>, stealers: &[Stealer<Task>]) {
+    fn worker_thread(&self, thread_idx: usize, queue: &Worker<Task>, stealers: &[Stealer<Task>]) {
         let stop_condition = || is_finished(&self.mem.get(self.root).status);
-        let mut fetcher = TaskFetcher::new(thread_id, queue, stealers, stop_condition);
+        let mut fetcher = TaskFetcher::new(thread_idx, queue, stealers, stop_condition);
         while let Some(task) = fetcher.fetch_task() {
             self.process_task(task, queue);
         }

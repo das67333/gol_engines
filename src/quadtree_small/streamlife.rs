@@ -413,10 +413,10 @@ impl StreamLifeEngineSmall {
 }
 
 impl GoLEngine for StreamLifeEngineSmall {
-    fn new(mem_limit_mib: u32) -> Self {
+    fn new(mem_limit_mib: u32, threads_cnt: usize) -> Self {
         // mem_limit_mib is actually ignored
         Self {
-            base: HashLifeEngineSmall::new(mem_limit_mib),
+            base: HashLifeEngineSmall::new(mem_limit_mib, threads_cnt),
             biroot: None,
             bicache: HashMap::new(),
         }
@@ -497,7 +497,7 @@ mod tests {
     fn test_pattern_roundtrip() {
         for size_log2 in 3..10 {
             let original = Pattern::random(size_log2, Some(SEED)).unwrap();
-            let mut engine = StreamLifeEngineSmall::new(0);
+            let mut engine = StreamLifeEngineSmall::new(0, 1);
             engine.load_pattern(&original, Topology::Unbounded).unwrap();
             let converted = engine.current_state();
 

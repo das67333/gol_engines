@@ -2,7 +2,7 @@ use crate::util::{local_time, print_population};
 use clap::{Args, ValueEnum};
 use gol_engines::{
     GoLEngine, HashLifeEngineAsync, HashLifeEngineSync, Pattern, StreamLifeEngineAsync,
-    StreamLifeEngineSync, WORKER_THREADS,
+    StreamLifeEngineSync,
 };
 use num_bigint::BigInt;
 
@@ -78,7 +78,6 @@ pub(super) fn run_update(args: UpdateArgs) {
         "Memory limit must be greater than 0"
     );
 
-    WORKER_THREADS.store(args.workers, std::sync::atomic::Ordering::Relaxed);
     let mem_limit_mib = args.mem_limit_gib.saturating_mul(1024);
     let topology = match args.topology {
         Topology::Unbounded => gol_engines::Topology::Unbounded,
@@ -87,10 +86,10 @@ pub(super) fn run_update(args: UpdateArgs) {
 
     let timer = std::time::Instant::now();
     let mut engine: Box<dyn GoLEngine> = match args.engine {
-        Engine::Hashlife => Box::new(HashLifeEngineAsync::new(mem_limit_mib)),
-        Engine::HashlifeSt => Box::new(HashLifeEngineSync::new(mem_limit_mib)),
-        Engine::Streamlife => Box::new(StreamLifeEngineAsync::new(mem_limit_mib)),
-        Engine::StreamlifeSt => Box::new(StreamLifeEngineSync::new(mem_limit_mib)),
+        Engine::Hashlife => Box::new(HashLifeEngineAsync::new(mem_limit_mib, args.workers)),
+        Engine::HashlifeSt => Box::new(HashLifeEngineSync::new(mem_limit_mib, args.workers)),
+        Engine::Streamlife => Box::new(StreamLifeEngineAsync::new(mem_limit_mib, args.workers)),
+        Engine::StreamlifeSt => Box::new(StreamLifeEngineSync::new(mem_limit_mib, args.workers)),
     };
     println!(
         "Initialized engine in {:.1} secs",

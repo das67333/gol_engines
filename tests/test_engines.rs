@@ -7,14 +7,15 @@ mod tests {
         let data = std::fs::read("res/otca_0.mc.gz").unwrap();
         let pattern = Pattern::from_format(PatternFormat::CompressedMacrocell, &data).unwrap();
         let mem_limit_mib = 16;
+        let threads_cnt = 1;
         let mut engines: Vec<Box<dyn GoLEngine>> = vec![
-            Box::new(SIMDEngine::new(mem_limit_mib)),
-            Box::new(HashLifeEngineSmall::new(mem_limit_mib)),
-            Box::new(StreamLifeEngineSmall::new(mem_limit_mib)),
-            Box::new(HashLifeEngineSync::new(mem_limit_mib)),
-            Box::new(StreamLifeEngineSync::new(mem_limit_mib)),
-            // Box::new(HashLifeEngineAsync::new(mem_limit_mib)),
-            Box::new(StreamLifeEngineAsync::new(mem_limit_mib)),
+            Box::new(SIMDEngine::new(mem_limit_mib, threads_cnt)),
+            Box::new(HashLifeEngineSmall::new(mem_limit_mib, threads_cnt)),
+            Box::new(StreamLifeEngineSmall::new(mem_limit_mib, threads_cnt)),
+            Box::new(HashLifeEngineSync::new(mem_limit_mib, threads_cnt)),
+            Box::new(StreamLifeEngineSync::new(mem_limit_mib, threads_cnt)),
+            // Box::new(HashLifeEngineAsync::new(mem_limit_mib, threads_cnt)),
+            Box::new(StreamLifeEngineAsync::new(mem_limit_mib, threads_cnt)),
         ];
         for engine in engines.iter_mut() {
             engine.load_pattern(&pattern, Topology::Torus).unwrap();

@@ -459,7 +459,7 @@ impl<Extra: Clone + Default> HashLifeEngineSmall<Extra> {
 impl<Extra: Clone + Default> GoLEngine for HashLifeEngineSmall<Extra> {
     /// Creates a new Game of Life engine instance with a blank pattern.
     /// Notice that this engine ignores the `mem_limit_mib` parameter!
-    fn new(_mem_limit_mib: u32) -> Self {
+    fn new(_mem_limit_mib: u32, _threads_cnt: usize) -> Self {
         let mut mem = MemoryManager::new();
         Self {
             size_log2: LEAF_SIZE_LOG2,
@@ -608,7 +608,7 @@ mod tests {
     fn test_pattern_roundtrip() {
         for size_log2 in 3..10 {
             let original = Pattern::random(size_log2, Some(SEED)).unwrap();
-            let mut engine = HashLifeEngineSmall::<()>::new(0);
+            let mut engine = HashLifeEngineSmall::<()>::new(0, 1);
             engine.load_pattern(&original, Topology::Unbounded).unwrap();
             let converted = engine.current_state();
 

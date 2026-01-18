@@ -1,10 +1,9 @@
 use gol_engines::*;
 use num_bigint::BigInt;
-use std::sync::atomic::Ordering;
 
 fn main() {
     let timer = std::time::Instant::now();
-    let mut engine = HashLifeEngineAsync::new(18 << 10);
+    let mut engine = HashLifeEngineAsync::new(18 << 10, 4);
     println!("Time spent on initializing engine: {:?}", timer.elapsed());
 
     let timer = std::time::Instant::now();
@@ -14,7 +13,6 @@ fn main() {
     assert_eq!(pattern.population(), BigInt::from(93_235_805));
     println!("Time spent on loading pattern: {:?}", timer.elapsed());
 
-    WORKER_THREADS.store(4, Ordering::Relaxed);
     let timer = std::time::Instant::now();
     let gens_log2 = 12;
     engine.update(gens_log2).unwrap();
