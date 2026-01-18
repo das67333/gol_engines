@@ -572,11 +572,9 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     const SEED: u64 = 42;
 
     #[test]
-    #[serial]
     fn test_pattern_roundtrip() {
         for size_log2 in 3..10 {
             let original = Pattern::random(size_log2, Some(SEED)).unwrap();

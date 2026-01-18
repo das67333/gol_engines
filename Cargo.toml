@@ -46,7 +46,6 @@ num-format = { version = "0.4", features = [
 [dev-dependencies]
 criterion = "0.7"
 libc = "0.2"
-serial_test = "3.2"
 
 [[bench]]
 name = "channel_throughput"
