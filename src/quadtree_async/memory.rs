@@ -47,6 +47,20 @@ impl<Extra: Default> MemoryManager<Extra> {
         sw: u16,
         se: u16,
     ) -> NodeIdx {
+        let (result, inserted) = self.find_or_create_leaf_from_parts_inner(nw, ne, sw, se);
+        if inserted {
+            self.length.increment_global();
+        }
+        result
+    }
+
+    fn find_or_create_leaf_from_parts_inner(
+        &self,
+        nw: u16,
+        ne: u16,
+        sw: u16,
+        se: u16,
+    ) -> (NodeIdx, bool) {
         // See Morton order: https://en.wikipedia.org/wiki/Z-order_curve
         let (mut nw, mut ne) = (nw as u64, ne as u64);
         let mut cells = 0;
@@ -69,7 +83,7 @@ impl<Extra: Default> MemoryManager<Extra> {
             shift += 4;
         }
 
-        self.find_or_create_leaf_from_u64(cells)
+        self.find_or_create_leaf_from_u64_inner(cells)
     }
 
     /// Find a leaf node with the given cells.
@@ -78,11 +92,19 @@ impl<Extra: Default> MemoryManager<Extra> {
     /// `value` represents 8x8 grid stored as 64-bit integer.
     /// The bits are packed in row-major order.
     pub(super) fn find_or_create_leaf_from_u64(&self, value: u64) -> NodeIdx {
+        let (result, inserted) = self.find_or_create_leaf_from_u64_inner(value);
+        if inserted {
+            self.length.increment_global();
+        }
+        result
+    }
+
+    fn find_or_create_leaf_from_u64_inner(&self, value: u64) -> (NodeIdx, bool) {
         let rows = value.to_le_bytes();
         let nw = NodeIdx(u32::from_le_bytes(rows[0..4].try_into().unwrap()));
         let ne = NodeIdx(u32::from_le_bytes(rows[4..8].try_into().unwrap()));
         let (sw, se) = (NodeIdx::default(), NodeIdx::default());
-        self.find_or_create_inner::<true>(nw, ne, sw, se, compute_hash(nw, ne, sw, se))
+        self.find_or_create_generic::<true>(nw, ne, sw, se, compute_hash(nw, ne, sw, se))
     }
 
     /// Find a node with the given parts.
@@ -94,7 +116,26 @@ impl<Extra: Default> MemoryManager<Extra> {
         sw: NodeIdx,
         se: NodeIdx,
     ) -> NodeIdx {
-        self.find_or_create_inner::<false>(nw, ne, sw, se, compute_hash(nw, ne, sw, se))
+        let (result, inserted) = self.find_or_create_node_inner(nw, ne, sw, se);
+        if inserted {
+            self.length.increment_global();
+        }
+        result
+    }
+
+    fn find_or_create_node_inner(
+        &self,
+        nw: NodeIdx,
+        ne: NodeIdx,
+        sw: NodeIdx,
+        se: NodeIdx,
+    ) -> (NodeIdx, bool) {
+        self.find_or_create_generic::<false>(nw, ne, sw, se, compute_hash(nw, ne, sw, se))
+    }
+
+    /// Create a per-thread reference to this memory manager.
+    pub(super) fn create_ref(&self, thread_idx: usize) -> MemoryManagerRef<'_, Extra> {
+        MemoryManagerRef::new(self, thread_idx)
     }
 
     pub(super) fn clear(&mut self) {
@@ -103,6 +144,10 @@ impl<Extra: Default> MemoryManager<Extra> {
 
     pub(super) fn bytes_total(&self) -> usize {
         self.hashtable.len() * std::mem::size_of::<QuadTreeNode<Extra>>()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.length.get_exact()
     }
 
     /// Find an item in hashtable; if it is not present, it is created and its index is returned.
@@ -118,14 +163,14 @@ impl<Extra: Default> MemoryManager<Extra> {
     /// 1. Acquire slot lock via `flags`
     /// 2. Double-check node doesn't exist
     /// 3. Write data fields, then set flags with Release ordering
-    fn find_or_create_inner<const IS_LEAF: bool>(
+    fn find_or_create_generic<const IS_LEAF: bool>(
         &self,
         nw: NodeIdx,
         ne: NodeIdx,
         sw: NodeIdx,
         se: NodeIdx,
         hash: usize,
-    ) -> NodeIdx {
+    ) -> (NodeIdx, bool) {
         const FLAG_LEAF: u8 = 1 << 0;
         const FLAG_USED: u8 = 1 << 1;
         const FLAG_LOCKED: u8 = 1 << 2;
@@ -144,7 +189,7 @@ impl<Extra: Default> MemoryManager<Extra> {
             if current_flags == target_flags
                 && unsafe { ((*n).nw, (*n).ne, (*n).sw, (*n).se) == (nw, ne, sw, se) }
             {
-                return NodeIdx(index as u32);
+                return (NodeIdx(index as u32), false);
             }
 
             // STEP 2: Not found optimistically - acquire slot lock
@@ -169,7 +214,7 @@ impl<Extra: Default> MemoryManager<Extra> {
                 && unsafe { ((*n).nw, (*n).ne, (*n).sw, (*n).se) == (nw, ne, sw, se) }
             {
                 flags.store(target_flags, Ordering::Release);
-                return NodeIdx(index as u32);
+                return (NodeIdx(index as u32), false);
             }
 
             // STEP 4: Slot is free - create node
@@ -182,7 +227,8 @@ impl<Extra: Default> MemoryManager<Extra> {
                 // CRITICAL: Write flags with Release ordering!
                 flags.store(target_flags, Ordering::Release);
 
-                return NodeIdx(index as u32);
+                // self.length.increment_local(thread_idx);
+                return (NodeIdx(index as u32), true);
             }
 
             // STEP 5: Collision - move to next slot
@@ -200,6 +246,73 @@ fn compute_hash(nw: NodeIdx, ne: NodeIdx, sw: NodeIdx, se: NodeIdx) -> usize {
         .wrapping_add((sw.0).wrapping_mul(257))
         .wrapping_add((se.0).wrapping_mul(65537));
     h.wrapping_add(h >> 11) as usize
+}
+
+/// A per-thread reference to the memory manager that uses local sharding for length tracking.
+pub(super) struct MemoryManagerRef<'a, Extra> {
+    base: &'a MemoryManager<Extra>,
+    thread_idx: usize,
+}
+
+impl<'a, Extra: Default> MemoryManagerRef<'a, Extra> {
+    pub(super) fn new(base: &'a MemoryManager<Extra>, thread_idx: usize) -> Self {
+        Self { base, thread_idx }
+    }
+
+    /// Get a const reference to the node at the given index.
+    pub(super) fn get(&self, idx: NodeIdx) -> &QuadTreeNode<Extra> {
+        self.base.get(idx)
+    }
+
+    /// Find a leaf node with the given parts.
+    /// If the node is not found, it is created.
+    ///
+    /// `nw`, `ne`, `sw`, `se` represent 4x4 grids stored as 16-bit integers.
+    /// The bits are packed in row-major order.
+    pub(super) fn find_or_create_leaf_from_parts(
+        &self,
+        nw: u16,
+        ne: u16,
+        sw: u16,
+        se: u16,
+    ) -> NodeIdx {
+        let (result, inserted) = self
+            .base
+            .find_or_create_leaf_from_parts_inner(nw, ne, sw, se);
+        if inserted {
+            self.base.length.increment_local(self.thread_idx);
+        }
+        result
+    }
+
+    /// Find a leaf node with the given cells.
+    /// If the node is not found, it is created.
+    ///
+    /// `value` represents 8x8 grid stored as 64-bit integer.
+    /// The bits are packed in row-major order.
+    pub(super) fn find_or_create_leaf_from_u64(&self, value: u64) -> NodeIdx {
+        let (result, inserted) = self.base.find_or_create_leaf_from_u64_inner(value);
+        if inserted {
+            self.base.length.increment_local(self.thread_idx);
+        }
+        result
+    }
+
+    /// Find a node with the given parts.
+    /// If the node is not found, it is created.
+    pub(super) fn find_or_create_node(
+        &self,
+        nw: NodeIdx,
+        ne: NodeIdx,
+        sw: NodeIdx,
+        se: NodeIdx,
+    ) -> NodeIdx {
+        let (result, inserted) = self.base.find_or_create_node_inner(nw, ne, sw, se);
+        if inserted {
+            self.base.length.increment_local(self.thread_idx);
+        }
+        result
+    }
 }
 
 struct ShardedLength {
@@ -223,20 +336,25 @@ impl ShardedLength {
         }
     }
 
-    pub(super) fn increment(&self, thread_idx: usize) {
+    fn increment_global(&self) {
+        self.global.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_local(&self, thread_idx: usize) {
         let local = &self.shards[thread_idx];
         if local.fetch_add(1, Ordering::Relaxed) + 1 == Self::FLUSH_THRESHOLD {
             local.store(0, Ordering::Relaxed);
-            self.global.fetch_add(Self::FLUSH_THRESHOLD, Ordering::Relaxed);
+            self.global
+                .fetch_add(Self::FLUSH_THRESHOLD, Ordering::Relaxed);
         }
     }
 
-    pub(super) fn get_approx(&self) -> usize {
+    fn get_approx(&self) -> usize {
         let shards_sum_approx = self.max_inaccuracy;
         self.global.load(Ordering::Relaxed) + shards_sum_approx
     }
 
-    pub(super) fn get_exact(&self) -> usize {
+    fn get_exact(&self) -> usize {
         let shards_sum_exact = self
             .shards
             .iter()
@@ -247,7 +365,7 @@ impl ShardedLength {
     }
 
     /// Returns the maximum possible error from the true value.
-    pub(super) fn max_error(&self) -> usize {
+    fn max_error(&self) -> usize {
         self.max_inaccuracy
     }
 }

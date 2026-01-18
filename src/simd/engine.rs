@@ -21,7 +21,7 @@ use num_bigint::BigInt;
 /// expanded_pattern.expand(7); // Expand to at least 128×128
 ///
 /// // Create the SIMD engine
-/// let mut engine = SIMDEngine::new(1);
+/// let mut engine = SIMDEngine::new(1, 1);
 /// engine.load_pattern(&expanded_pattern, Topology::Torus).unwrap();
 ///
 /// // Run for 2^10 = 1024 generations

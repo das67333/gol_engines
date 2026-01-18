@@ -46,7 +46,7 @@
 use super::{
     LEAF_SIZE, LEAF_SIZE_LOG2,
     hashlife::HashLifeEngineAsync,
-    memory::MemoryManager,
+    memory::{MemoryManager, MemoryManagerRef},
     node::{Dependents, NodeIdx, ProcessingData, QuadTreeNode},
     status,
 };
@@ -228,17 +228,21 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         queues[0].push(Task::new(self.root, self.size_log2));
 
         thread::scope(|scope| {
-            for (thread_idx, mut queue) in queues.into_iter().enumerate() {
-                let stealers = &stealers;
-                scope.spawn(move || self.worker_thread(thread_idx, &mut queue, stealers));
+            for (thread_idx, queue) in queues.into_iter().enumerate() {
+                let executor_thread = ExecutorThread {
+                    root: self.root,
+                    generations_log2: self.generations_log2,
+                    mem: self.mem.create_ref(thread_idx),
+                    thread_idx,
+                    queue,
+                    stealers: &stealers,
+                };
+                scope.spawn(move || executor_thread.run());
             }
         });
 
         assert!(is_finished(&self.mem.get(self.root).status));
-        println!(
-            "Nodes count: {}",
-            0 // crate::quadtree_async::statistics::LENGTH_GLOBAL_COUNT[0].load(Ordering::Relaxed)
-        );
+        println!("Nodes count: {}", self.mem.len());
         println!(
             "STEAL_ATTEMPTS_SUCCESS: {}",
             STEAL_ATTEMPTS_SUCCESS.load(Ordering::Relaxed)
@@ -264,12 +268,24 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         let n = self.mem.get(self.root);
         n.cache.get_node_idx()
     }
+}
 
-    fn worker_thread(&self, thread_idx: usize, queue: &Worker<Task>, stealers: &[Stealer<Task>]) {
+struct ExecutorThread<'a, Extra: Default + Sync> {
+    root: NodeIdx,
+    generations_log2: u32,
+    mem: MemoryManagerRef<'a, Extra>,
+    thread_idx: usize,
+    queue: Worker<Task>,
+    stealers: &'a [Stealer<Task>],
+}
+
+impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
+    fn run(&self) {
         let stop_condition = || is_finished(&self.mem.get(self.root).status);
-        let mut fetcher = TaskFetcher::new(thread_idx, queue, stealers, stop_condition);
+        let mut fetcher =
+            TaskFetcher::new(self.thread_idx, &self.queue, self.stealers, stop_condition);
         while let Some(task) = fetcher.fetch_task() {
-            self.process_task(task, queue);
+            self.process_task(task);
         }
     }
 
@@ -280,17 +296,17 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     /// 2. Call `update_node` to compute result or identify dependencies
     /// 3. If result ready: cache it, notify dependents, mark FINISHED
     /// 4. If dependencies needed: guard drops, status returns to PENDING
-    fn process_task(&self, task: Task, queue: &Worker<Task>) {
+    fn process_task(&self, task: Task) {
         let n = self.mem.get(task.idx);
         let mut guard = ProcessingGuard::new(&n.status);
         let data = n.cache.get_ref();
-        if let Some(result) = self.update_node(&task, n.parts(), data, queue) {
+        if let Some(result) = self.update_node(&task, n.parts(), data) {
             n.cache.set_node_idx(result);
             let mut dependents = SmallVec::new();
             mem::swap(&mut data.dependents, &mut dependents);
             guard.finish(); // Mark as FINISHED
             unsafe { drop(Box::from_raw(data)) } // Free ProcessingData
-            self.notify_dependents(&task, dependents, queue);
+            self.notify_dependents(&task, dependents);
         }
     }
 
@@ -316,7 +332,6 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         task: &Task,
         parts: [NodeIdx; 4],
         data: &mut ProcessingData,
-        queue: &Worker<Task>,
     ) -> Option<NodeIdx> {
         let both_stages = self.generations_log2 + 2 >= task.size_log2;
         let [nw, ne, sw, se] = parts;
@@ -352,7 +367,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                             *x = d.cache.get_node_idx();
                         }
                         DependencyHandlingResult::StartedByThisThread => {
-                            queue.push(Task::new(*x, task.size_log2 - 1));
+                            self.queue.push(Task::new(*x, task.size_log2 - 1));
                             waiting_cnt += 1;
                         }
                         DependencyHandlingResult::StartedByOtherThread => {
@@ -384,7 +399,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                     *x = d.cache.get_node_idx();
                 }
                 DependencyHandlingResult::StartedByThisThread => {
-                    queue.push(Task::new(*x, task.size_log2 - 1));
+                    self.queue.push(Task::new(*x, task.size_log2 - 1));
                     waiting_cnt += 1;
                 }
                 DependencyHandlingResult::StartedByOtherThread => {
@@ -410,7 +425,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
     /// 1. Acquire PROCESSING status
     /// 2. Decrement its `waiting_cnt`
     /// 3. If `waiting_cnt` reaches 0, re-queue for processing
-    fn notify_dependents(&self, task: &Task, dependents: Dependents, queue: &Worker<Task>) {
+    fn notify_dependents(&self, task: &Task, dependents: Dependents) {
         for &dependent in dependents.iter() {
             let n = self.mem.get(dependent);
             let waiting_cnt = {
@@ -420,7 +435,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                 dep_data.waiting_cnt
             };
             if waiting_cnt == 0 {
-                queue.push(Task::new(dependent, task.size_log2 + 1));
+                self.queue.push(Task::new(dependent, task.size_log2 + 1));
             }
         }
     }
