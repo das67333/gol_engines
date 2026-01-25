@@ -78,17 +78,18 @@ static STEAL_ATTEMPTS_RETRY: AtomicU64 = AtomicU64::new(0);
 static STEAL_FROM_LAST_VICTIM_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static STEAL_FROM_LAST_VICTIM_FAIL: AtomicU64 = AtomicU64::new(0);
 
-struct TaskFetcher<'a, F: Fn() -> bool> {
+struct TaskFetcher<'a, F: Fn() -> bool, C: Fn() -> bool> {
     thread_idx: usize,
     queue: &'a Worker<Task>,
     stealers: &'a [Stealer<Task>],
-    stop_condition: F,
+    finish_condition: F,
+    cancel_condition: C,
     last_victim: usize,
     rng: rand_chacha::ChaCha8Rng,
     rng_buffer: Vec<u32>,
 }
 
-impl<'a, F: Fn() -> bool> TaskFetcher<'a, F> {
+impl<'a, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, F, C> {
     /// Number of tasks to steal at once when work-stealing.
     const STEAL_BATCH_SIZE: usize = 1;
     const RNG_BUFFER_SIZE: usize = 256;
@@ -99,13 +100,15 @@ impl<'a, F: Fn() -> bool> TaskFetcher<'a, F> {
         thread_idx: usize,
         queue: &'a Worker<Task>,
         stealers: &'a [Stealer<Task>],
-        stop_condition: F,
+        finish_condition: F,
+        cancel_condition: C,
     ) -> Self {
         Self {
             thread_idx,
             queue,
             stealers,
-            stop_condition,
+            finish_condition,
+            cancel_condition,
             last_victim: 0,
             rng: <rand_chacha::ChaCha8Rng as rand::SeedableRng>::from_os_rng(),
             rng_buffer: Vec::with_capacity(Self::RNG_BUFFER_SIZE),
@@ -114,6 +117,10 @@ impl<'a, F: Fn() -> bool> TaskFetcher<'a, F> {
 
     /// Fetch a task from local queue or steal from other threads.
     fn fetch_task(&mut self) -> Option<Task> {
+        if (self.cancel_condition)() {
+            return None;
+        }
+
         // local queue
         if let Some(task) = self.queue.pop() {
             return Some(task);
@@ -131,7 +138,7 @@ impl<'a, F: Fn() -> bool> TaskFetcher<'a, F> {
         STEAL_FROM_LAST_VICTIM_FAIL.fetch_add(1, Ordering::Relaxed);
 
         let mut duration = Self::INITIAL_WAIT_DURATION;
-        loop {
+        while !(self.finish_condition)() && !(self.cancel_condition)() {
             // power of two choices - choosing a longer queue
             let (i, j) = (self.generate_random_index(), self.generate_random_index());
             let (len_i, len_j) = (self.stealers[i].len(), self.stealers[j].len());
@@ -149,11 +156,9 @@ impl<'a, F: Fn() -> bool> TaskFetcher<'a, F> {
 
             thread::sleep(duration);
             duration = Self::MAX_WAIT_DURATION.min(duration * 2);
-
-            if (self.stop_condition)() {
-                return None;
-            }
         }
+
+        None
     }
 
     fn generate_random_index(&mut self) -> usize {
@@ -212,7 +217,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         }
     }
 
-    pub(super) fn run(&self, num_threads: usize) -> NodeIdx {
+    pub(super) fn run(&self, num_threads: usize) -> Option<NodeIdx> {
         // Create worker queues and stealers
         let mut queues = Vec::with_capacity(num_threads);
         let mut stealers = Vec::with_capacity(num_threads);
@@ -224,13 +229,14 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             stealers.push(stealer);
         }
 
-        start_processing_node(self.mem.get(self.root), smallvec![]);
+        let root_node = self.mem.get(self.root);
+        start_processing_node(root_node, smallvec![]);
         queues[0].push(Task::new(self.root, self.size_log2));
 
         thread::scope(|scope| {
             for (thread_idx, queue) in queues.into_iter().enumerate() {
                 let executor_thread = ExecutorThread {
-                    root: self.root,
+                    root_node,
                     generations_log2: self.generations_log2,
                     mem: self.mem.create_ref(thread_idx),
                     thread_idx,
@@ -240,6 +246,10 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
                 scope.spawn(move || executor_thread.run());
             }
         });
+
+        if self.mem.exceeds_load_factor() {
+            return None;
+        }
 
         assert!(is_finished(&self.mem.get(self.root).status));
         println!("Nodes count: {}", self.mem.len());
@@ -265,13 +275,12 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             STEAL_FROM_LAST_VICTIM_FAIL.load(Ordering::Relaxed)
         );
 
-        let n = self.mem.get(self.root);
-        n.cache.get_node_idx()
+        Some(root_node.cache.get_node_idx())
     }
 }
 
 struct ExecutorThread<'a, Extra: Default + Sync> {
-    root: NodeIdx,
+    root_node: &'a QuadTreeNode<Extra>,
     generations_log2: u32,
     mem: MemoryManagerRef<'a, Extra>,
     thread_idx: usize,
@@ -281,9 +290,14 @@ struct ExecutorThread<'a, Extra: Default + Sync> {
 
 impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
     fn run(&self) {
-        let stop_condition = || is_finished(&self.mem.get(self.root).status);
-        let mut fetcher =
-            TaskFetcher::new(self.thread_idx, &self.queue, self.stealers, stop_condition);
+        let mut fetcher = TaskFetcher::new(
+            self.thread_idx,
+            &self.queue,
+            self.stealers,
+            || is_finished(&self.root_node.status),
+            || self.mem.exceeds_load_factor(),
+        );
+
         while let Some(task) = fetcher.fetch_task() {
             self.process_task(task);
         }

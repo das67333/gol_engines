@@ -1,15 +1,16 @@
-use super::node::{NodeIdx, QuadTreeNode};
-use crossbeam::utils::CachePadded;
-use std::{
-    cell::UnsafeCell,
-    hint, mem,
-    sync::atomic::{AtomicUsize, Ordering},
+use super::{
+    node::{NodeIdx, QuadTreeNode},
+    sharded_length::{LengthShard, ShardedLength},
 };
+use std::{cell::UnsafeCell, hint, mem, sync::atomic::Ordering};
+
+const MAX_LOAD_FACTOR: f64 = 0.75;
 
 /// Stores the nodes of the quadtree.
 pub(super) struct MemoryManager<Extra> {
     hashtable: Box<[UnsafeCell<QuadTreeNode<Extra>>]>,
     length: ShardedLength,
+    length_limit: usize,
 }
 
 unsafe impl<Extra: Sync> Sync for MemoryManager<Extra> {}
@@ -27,6 +28,7 @@ impl<Extra: Default> MemoryManager<Extra> {
                 .map(|_| UnsafeCell::new(QuadTreeNode::default()))
                 .collect(),
             length: ShardedLength::new(threads_cnt),
+            length_limit: (2f64.powi(cap_log2 as i32) * MAX_LOAD_FACTOR) as usize,
         }
     }
 
@@ -49,7 +51,7 @@ impl<Extra: Default> MemoryManager<Extra> {
     ) -> NodeIdx {
         let (result, inserted) = self.find_or_create_leaf_from_parts_inner(nw, ne, sw, se);
         if inserted {
-            self.length.increment_global();
+            self.length.increment();
         }
         result
     }
@@ -94,7 +96,7 @@ impl<Extra: Default> MemoryManager<Extra> {
     pub(super) fn find_or_create_leaf_from_u64(&self, value: u64) -> NodeIdx {
         let (result, inserted) = self.find_or_create_leaf_from_u64_inner(value);
         if inserted {
-            self.length.increment_global();
+            self.length.increment();
         }
         result
     }
@@ -118,7 +120,7 @@ impl<Extra: Default> MemoryManager<Extra> {
     ) -> NodeIdx {
         let (result, inserted) = self.find_or_create_node_inner(nw, ne, sw, se);
         if inserted {
-            self.length.increment_global();
+            self.length.increment();
         }
         result
     }
@@ -134,8 +136,8 @@ impl<Extra: Default> MemoryManager<Extra> {
     }
 
     /// Create a per-thread reference to this memory manager.
-    pub(super) fn create_ref(&self, thread_idx: usize) -> MemoryManagerRef<'_, Extra> {
-        MemoryManagerRef::new(self, thread_idx)
+    pub(super) fn create_ref(&self, shard_idx: usize) -> MemoryManagerRef<'_, Extra> {
+        MemoryManagerRef::new(self, shard_idx)
     }
 
     pub(super) fn clear(&mut self) {
@@ -147,7 +149,7 @@ impl<Extra: Default> MemoryManager<Extra> {
     }
 
     pub(super) fn len(&self) -> usize {
-        self.length.get_exact()
+        self.length.get()
     }
 
     /// Find an item in hashtable; if it is not present, it is created and its index is returned.
@@ -236,6 +238,10 @@ impl<Extra: Default> MemoryManager<Extra> {
             index = index.wrapping_add(1) & mask;
         }
     }
+
+    pub(super) fn exceeds_load_factor(&self) -> bool {
+        self.length.get_upper_bound() > self.length_limit
+    }
 }
 
 /// Hash function for hashtable lookup (polynomial hash with mixing).
@@ -251,12 +257,15 @@ fn compute_hash(nw: NodeIdx, ne: NodeIdx, sw: NodeIdx, se: NodeIdx) -> usize {
 /// A per-thread reference to the memory manager that uses local sharding for length tracking.
 pub(super) struct MemoryManagerRef<'a, Extra> {
     base: &'a MemoryManager<Extra>,
-    thread_idx: usize,
+    length_shard: LengthShard<'a>,
 }
 
 impl<'a, Extra: Default> MemoryManagerRef<'a, Extra> {
-    pub(super) fn new(base: &'a MemoryManager<Extra>, thread_idx: usize) -> Self {
-        Self { base, thread_idx }
+    pub(super) fn new(base: &'a MemoryManager<Extra>, shard_idx: usize) -> Self {
+        Self {
+            base,
+            length_shard: base.length.get_shard(shard_idx),
+        }
     }
 
     /// Get a const reference to the node at the given index.
@@ -280,7 +289,7 @@ impl<'a, Extra: Default> MemoryManagerRef<'a, Extra> {
             .base
             .find_or_create_leaf_from_parts_inner(nw, ne, sw, se);
         if inserted {
-            self.base.length.increment_local(self.thread_idx);
+            self.length_shard.increment();
         }
         result
     }
@@ -293,7 +302,7 @@ impl<'a, Extra: Default> MemoryManagerRef<'a, Extra> {
     pub(super) fn find_or_create_leaf_from_u64(&self, value: u64) -> NodeIdx {
         let (result, inserted) = self.base.find_or_create_leaf_from_u64_inner(value);
         if inserted {
-            self.base.length.increment_local(self.thread_idx);
+            self.length_shard.increment();
         }
         result
     }
@@ -309,63 +318,12 @@ impl<'a, Extra: Default> MemoryManagerRef<'a, Extra> {
     ) -> NodeIdx {
         let (result, inserted) = self.base.find_or_create_node_inner(nw, ne, sw, se);
         if inserted {
-            self.base.length.increment_local(self.thread_idx);
+            self.length_shard.increment();
         }
         result
     }
-}
 
-struct ShardedLength {
-    global: AtomicUsize,
-    shards: Box<[CachePadded<AtomicUsize>]>,
-    max_inaccuracy: usize,
-}
-
-impl ShardedLength {
-    // must be even
-    const FLUSH_THRESHOLD: usize = 256;
-
-    fn new(shards_cnt: usize) -> Self {
-        let shards = (0..shards_cnt)
-            .map(|_| CachePadded::new(AtomicUsize::new(0)))
-            .collect::<Vec<_>>();
-        Self {
-            global: AtomicUsize::new(0),
-            shards: shards.into_boxed_slice(),
-            max_inaccuracy: Self::FLUSH_THRESHOLD / 2 * shards_cnt,
-        }
-    }
-
-    fn increment_global(&self) {
-        self.global.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn increment_local(&self, thread_idx: usize) {
-        let local = &self.shards[thread_idx];
-        if local.fetch_add(1, Ordering::Relaxed) + 1 == Self::FLUSH_THRESHOLD {
-            local.store(0, Ordering::Relaxed);
-            self.global
-                .fetch_add(Self::FLUSH_THRESHOLD, Ordering::Relaxed);
-        }
-    }
-
-    fn get_approx(&self) -> usize {
-        let shards_sum_approx = self.max_inaccuracy;
-        self.global.load(Ordering::Relaxed) + shards_sum_approx
-    }
-
-    fn get_exact(&self) -> usize {
-        let shards_sum_exact = self
-            .shards
-            .iter()
-            .map(|shard| shard.load(Ordering::Relaxed))
-            .sum::<usize>();
-
-        self.global.load(Ordering::Relaxed) + shards_sum_exact
-    }
-
-    /// Returns the maximum possible error from the true value.
-    fn max_error(&self) -> usize {
-        self.max_inaccuracy
+    pub(super) fn exceeds_load_factor(&self) -> bool {
+        self.base.exceeds_load_factor()
     }
 }

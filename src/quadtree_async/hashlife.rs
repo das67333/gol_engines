@@ -504,7 +504,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
                 self.run_gc();
             }
         }
-        // let backup = self.current_state();
+        let backup = self.current_state();
         self.generations_per_update_log2 = Some(generations_log2);
 
         let frames_cnt = (generations_log2 + 2).max(self.size_log2 + 1) - self.size_log2;
@@ -513,25 +513,24 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
             self.add_frame(&mut dx, &mut dy);
         }
 
-        self.root = {
-            // let mut builder = tokio::runtime::Builder::new_multi_thread();
-            // if num_threads > 0 {
-            //     builder.worker_threads(num_threads as usize);
-            // }
-
-            // builder
-            //     .build()
-            //     .unwrap()
-            //     .block_on(async { self.update_node_async(self.root, self.size_log2).await })
-            HashLifeExecutor::new(self).run(self.threads_cnt)
-            // self.update_node_sync(self.root, self.size_log2)
-        };
-        // if ExecutionStatistics::is_poisoned() { TODO
-        //     self.load_pattern(&backup, self.topology)?;
-        //     return Err(anyhow!(
-        //         "HashLifeAsync: overfilled MemoryManager, try smaller step"
-        //     ));
+        // let mut builder = tokio::runtime::Builder::new_multi_thread();
+        // if num_threads > 0 {
+        //     builder.worker_threads(num_threads as usize);
         // }
+
+        // builder
+        //     .build()
+        //     .unwrap()
+        //     .block_on(async { self.update_node_async(self.root, self.size_log2).await })
+        // self.update_node_sync(self.root, self.size_log2)
+        self.root = if let Some(x) = HashLifeExecutor::new(self).run(self.threads_cnt) {
+            x
+        } else {
+            self.load_pattern(&backup, self.topology)?;
+            return Err(anyhow!(
+                "HashLifeAsync: overfilled MemoryManager, try smaller step"
+            ));
+        };
 
         self.size_log2 -= 1;
         dx -= BigInt::from(1) << (self.size_log2 - 1);
