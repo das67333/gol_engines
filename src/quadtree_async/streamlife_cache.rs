@@ -1,4 +1,4 @@
-use super::{node::NodeIdx, statistics::ExecutionStatistics};
+use super::node::NodeIdx;
 use std::{
     cell::UnsafeCell,
     hash::{Hash, Hasher},
@@ -97,7 +97,7 @@ impl StreamLifeCacheRaw {
                     c.value = (NodeIdx::default(), NodeIdx::default());
                     c.is_used = true;
 
-                    ExecutionStatistics::on_insertion::<1>();
+                    // ExecutionStatistics::on_insertion::<1>();
                     lock.store(false, Ordering::Release);
                     break;
                 }

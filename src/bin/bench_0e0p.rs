@@ -23,10 +23,6 @@ fn main() {
     );
 
     let updated = engine.current_state();
-    // println!(
-    //     "TASKS_SPAWNED_COUNT: {}",
-    //     TASKS_SPAWNED_COUNT.swap(0, Ordering::Relaxed)
-    // );
     println!("Population: {}", updated.population());
     println!("Hash: 0x{:016x}", updated.hash());
     assert_eq!(updated.hash(), 0x02dda802a893049e);
