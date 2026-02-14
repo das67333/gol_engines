@@ -78,10 +78,10 @@ static STEAL_ATTEMPTS_RETRY: AtomicU64 = AtomicU64::new(0);
 static STEAL_FROM_LAST_VICTIM_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static STEAL_FROM_LAST_VICTIM_FAIL: AtomicU64 = AtomicU64::new(0);
 
-struct TaskFetcher<'a, F: Fn() -> bool, C: Fn() -> bool> {
+pub(super) struct TaskFetcher<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> {
     thread_idx: usize,
-    queue: &'a Worker<Task>,
-    stealers: &'a [Stealer<Task>],
+    queue: &'a Worker<T>,
+    stealers: &'a [Stealer<T>],
     finish_condition: F,
     cancel_condition: C,
     last_victim: usize,
@@ -89,17 +89,17 @@ struct TaskFetcher<'a, F: Fn() -> bool, C: Fn() -> bool> {
     rng_buffer: Vec<u32>,
 }
 
-impl<'a, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, F, C> {
+impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
     /// Number of tasks to steal at once when work-stealing.
     const STEAL_BATCH_SIZE: usize = 1;
     const RNG_BUFFER_SIZE: usize = 256;
     const INITIAL_WAIT_DURATION: Duration = Duration::from_micros(100);
     const MAX_WAIT_DURATION: Duration = Duration::from_millis(100);
 
-    fn new(
+    pub(super) fn new(
         thread_idx: usize,
-        queue: &'a Worker<Task>,
-        stealers: &'a [Stealer<Task>],
+        queue: &'a Worker<T>,
+        stealers: &'a [Stealer<T>],
         finish_condition: F,
         cancel_condition: C,
     ) -> Self {
@@ -116,7 +116,7 @@ impl<'a, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, F, C> {
     }
 
     /// Fetch a task from local queue or steal from other threads.
-    fn fetch_task(&mut self) -> Option<Task> {
+    pub(super) fn fetch_task(&mut self) -> Option<T> {
         if (self.cancel_condition)() {
             return None;
         }
@@ -177,7 +177,7 @@ impl<'a, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, F, C> {
         self.rng_buffer.pop().unwrap() as usize
     }
 
-    fn try_steal(&self, victim_id: usize) -> Option<Task> {
+    fn try_steal(&self, victim_id: usize) -> Option<T> {
         loop {
             match self.stealers[victim_id]
                 .steal_batch_with_limit_and_pop(self.queue, Self::STEAL_BATCH_SIZE)
@@ -376,7 +376,7 @@ impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
                     }
                     let d = self.mem.get(*x);
                     match handle_dependency(d, task) {
-                        DependencyHandlingResult::DependencyIsReady => {
+                        DependencyHandlingResult::Ready => {
                             data.mask9_waiting &= !(1 << i);
                             *x = d.cache.get_node_idx();
                         }
@@ -408,7 +408,7 @@ impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
             }
             let d = self.mem.get(*x);
             match handle_dependency(d, task) {
-                DependencyHandlingResult::DependencyIsReady => {
+                DependencyHandlingResult::Ready => {
                     data.mask4_waiting &= !(1 << i);
                     *x = d.cache.get_node_idx();
                 }
@@ -661,8 +661,8 @@ impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
     }
 }
 
-/// Check if a node has finished processing.
-fn is_finished(status: &AtomicU8) -> bool {
+/// Check if a status field indicates FINISHED.
+pub(super) fn is_finished(status: &AtomicU8) -> bool {
     status.load(Ordering::Acquire) == status::FINISHED
 }
 
@@ -701,7 +701,7 @@ fn start_processing_node<Extra: Default + Sync>(
 }
 
 /// Atomically transition status from `from` to `to`, spinning until successful.
-fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8) {
+pub(super) fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8) {
     while a
         .compare_exchange_weak(from, to, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -717,14 +717,14 @@ fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8) {
 /// Acquires PROCESSING status on creation, releases it on drop.
 /// - If `finish()` called: transitions to FINISHED
 /// - If dropped without `finish()`: transitions back to PENDING
-struct ProcessingGuard<'a> {
+pub(super) struct ProcessingGuard<'a> {
     status: &'a AtomicU8,
     released: bool,
 }
 
 impl<'a> ProcessingGuard<'a> {
     /// Acquire PROCESSING status, spinning until PENDING.
-    fn new(status: &'a AtomicU8) -> Self {
+    pub(super) fn new(status: &'a AtomicU8) -> Self {
         atomic_transition_loop(status, status::PENDING, status::PROCESSING);
         Self {
             status,
@@ -735,7 +735,7 @@ impl<'a> ProcessingGuard<'a> {
 
 impl<'a> ProcessingGuard<'a> {
     /// Mark node as FINISHED and prevent drop from reverting to PENDING.
-    fn finish(&mut self) {
+    pub(super) fn finish(&mut self) {
         self.status.store(status::FINISHED, Ordering::Release);
         self.released = true;
     }
@@ -752,7 +752,7 @@ impl<'a> Drop for ProcessingGuard<'a> {
 /// Result of attempting to handle a dependency.
 enum DependencyHandlingResult {
     /// Dependency already computed, result available in cache
-    DependencyIsReady,
+    Ready,
     /// This thread successfully claimed the dependency for processing
     StartedByThisThread,
     /// Another thread is processing the dependency, we registered as dependent
@@ -766,7 +766,7 @@ fn handle_dependency<Extra: Default + Sync>(
 ) -> DependencyHandlingResult {
     let status = n.status.load(Ordering::Acquire);
     if status == status::FINISHED {
-        return DependencyHandlingResult::DependencyIsReady;
+        return DependencyHandlingResult::Ready;
     }
 
     if status == status::NOT_STARTED && start_processing_node(n, smallvec![task.idx]) {
@@ -785,7 +785,7 @@ fn handle_dependency<Extra: Default + Sync>(
                 n.status.store(status::PENDING, Ordering::Release);
                 return DependencyHandlingResult::StartedByOtherThread;
             }
-            Err(status::FINISHED) => return DependencyHandlingResult::DependencyIsReady,
+            Err(status::FINISHED) => return DependencyHandlingResult::Ready,
             Err(status::PROCESSING) => {
                 while n.status.load(Ordering::Relaxed) == status::PROCESSING {
                     hint::spin_loop()

@@ -4,6 +4,7 @@ use super::{
     node::{NodeIdx, QuadTreeNode},
     status,
     streamlife_cache::{CacheEntry, StreamLifeCache},
+    streamlife_executor::StreamLifeExecutor,
 };
 use crate::{GoLEngine, Pattern, Topology};
 use anyhow::Result;
@@ -18,10 +19,10 @@ type MemoryManager = super::memory::MemoryManager<u64>;
 /// and [StreamLifeEngineSync], it uses a static hashtable for caching results of
 /// `update_binode` function.
 pub struct StreamLifeEngineAsync {
-    base: HashLifeEngineAsync<u64>,
+    pub(super) base: HashLifeEngineAsync<u64>,
     // streamlife-specific
     biroot: Option<(NodeIdx, NodeIdx)>,
-    bicache: StreamLifeCache,
+    pub(super) bicache: StreamLifeCache,
 }
 
 impl StreamLifeEngineAsync {
@@ -81,6 +82,7 @@ impl StreamLifeEngineAsync {
         dmap | (lmask << 32)
     }
 
+    /// Compute lane descriptors for a node. Thread-safe (uses CAS on `status_extra`).
     fn node2lanes(&self, idx: NodeIdx, size_log2: u32) -> u64 {
         if idx == self.base.blank_nodes.get(size_log2) {
             // blank node
@@ -104,10 +106,6 @@ impl StreamLifeEngineAsync {
                 .is_ok())
         {
             while n.status_extra.load(Ordering::Acquire) != status::FINISHED {
-                // if ExecutionStatistics::is_poisoned() {
-                //     return 0;
-                // }
-                // tokio::task::yield_now().await;
                 spin_loop();
             }
             return unsafe { *n.extra.get() };
@@ -268,7 +266,9 @@ impl StreamLifeEngineAsync {
         extra
     }
 
-    fn is_solitonic(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> bool {
+    /// Check if two universes are provably non-interacting (solitonic).
+    /// Thread-safe.
+    pub(super) fn is_solitonic(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> bool {
         let lanes1 = self.node2lanes(idx.0, size_log2);
         if lanes1 & 255 == 0 {
             return false;
@@ -284,6 +284,7 @@ impl StreamLifeEngineAsync {
         (((lanes1 >> 4) & lanes2) | ((lanes2 >> 4) & lanes1)) & 15 != 0
     }
 
+    /// Merge two non-overlapping universes into a single node. Thread-safe.
     fn merge_universes(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> NodeIdx {
         let b = self.base.blank_nodes.get(size_log2);
         if idx.1 == b {
@@ -309,126 +310,48 @@ impl StreamLifeEngineAsync {
         }
     }
 
-    fn update_binode_inner(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> (NodeIdx, NodeIdx) {
-        let this = self as *const _ as usize;
-        let this = unsafe { &*(this as *const StreamLifeEngineAsync) };
-        let both_stages = this.base.generations_per_update_log2.unwrap() + 2 >= size_log2;
+    /// Compute solitonic case: two non-interacting universes updated independently.
+    /// Used by the parallel executor for the fast-path.
+    pub(super) fn compute_solitonic(
+        &self,
+        idx: (NodeIdx, NodeIdx),
+        size_log2: u32,
+    ) -> (NodeIdx, NodeIdx) {
+        let i1 = self.base.update_node_sync(idx.0, size_log2);
+        let i2 = self.base.update_node_sync(idx.1, size_log2);
 
-        let (mut arr90, mut arr91);
-        let n0 = this.base.mem.get(idx.0);
-        let n1 = this.base.mem.get(idx.1);
-        if both_stages {
-            arr90 = this
-                .base
-                .nine_children_overlapping(n0.nw, n0.ne, n0.sw, n0.se);
-            arr91 = this
-                .base
-                .nine_children_overlapping(n1.nw, n1.ne, n1.sw, n1.se);
-
-            for (l, r) in arr90.iter_mut().zip(arr91.iter_mut()) {
-                (*l, *r) = this.update_binode((*l, *r), size_log2 - 1);
-            }
+        let b = self.base.blank_nodes.get(size_log2);
+        if idx.0 == b || idx.1 == b {
+            let (i3, ind3) = if idx.0 == b {
+                (NodeIdx(i2.0), NodeIdx(idx.1.0))
+            } else {
+                (NodeIdx(i1.0), NodeIdx(idx.0.0))
+            };
+            let lanes = self.node2lanes(ind3, size_log2);
+            let b = self.base.blank_nodes.get(size_log2 - 1);
+            if lanes & 0xf0 != 0 { (b, i3) } else { (i3, b) }
         } else {
-            arr90 = this
-                .base
-                .nine_children_disjoint(n0.nw, n0.ne, n0.sw, n0.se, size_log2 - 1);
-            arr91 = this
-                .base
-                .nine_children_disjoint(n1.nw, n1.ne, n1.sw, n1.se, size_log2 - 1);
+            (i1, i2)
         }
-
-        let mut arr4: [(NodeIdx, NodeIdx); 4] = {
-            let arr40 = this.base.four_children_overlapping(&arr90);
-            let arr41 = this.base.four_children_overlapping(&arr91);
-            std::array::from_fn(|i| (arr40[i], arr41[i]))
-        };
-
-        for x in arr4.iter_mut() {
-            *x = this.update_binode(*x, size_log2 - 1);
-        }
-
-        (
-            this.base
-                .mem
-                .find_or_create_node(arr4[0].0, arr4[1].0, arr4[2].0, arr4[3].0),
-            this.base
-                .mem
-                .find_or_create_node(arr4[0].1, arr4[1].1, arr4[2].1, arr4[3].1),
-        )
     }
 
-    fn update_binode(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> (NodeIdx, NodeIdx) {
-        // if ExecutionStatistics::is_poisoned() {
-        //     return (NodeIdx::default(), NodeIdx::default());
-        // }
+    /// Compute base case: merge universes and run standard HashLife.
+    /// Used by the parallel executor for the smallest recursive level.
+    pub(super) fn compute_base_case(
+        &self,
+        idx: (NodeIdx, NodeIdx),
+        size_log2: u32,
+    ) -> (NodeIdx, NodeIdx) {
+        let hnode2 = self.merge_universes(idx, size_log2);
+        let i3 = self.base.update_node_sync(hnode2, size_log2);
+        let b = self.base.blank_nodes.get(size_log2 - 1);
 
-        let entry = self.bicache.entry(idx);
-        let status = unsafe { &(*entry).status };
-        let status_value = status.load(Ordering::Acquire);
-        if status_value == status::FINISHED {
-            return unsafe { (*entry).value };
-        }
-
-        let entry_usize = entry as usize;
-        if !(status_value == status::NOT_STARTED
-            && status
-                .compare_exchange(
-                    status::NOT_STARTED,
-                    status::PROCESSING,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok())
-        {
-            while status.load(Ordering::Acquire) != status::FINISHED {
-                // if ExecutionStatistics::is_poisoned() {
-                //     return (NodeIdx::default(), NodeIdx::default());
-                // }
-                panic!();
-            }
-            return unsafe { (*(entry_usize as *const CacheEntry)).value };
-        }
-
-        if self.is_solitonic(idx, size_log2) {
-            let i1 = self.base.update_node_sync(idx.0, size_log2);
-            let i2 = self.base.update_node_sync(idx.1, size_log2);
-
-            let b = self.base.blank_nodes.get(size_log2);
-            let res = if idx.0 == b || idx.1 == b {
-                let (i3, ind3) = if idx.0 == b {
-                    (NodeIdx(i2.0), NodeIdx(idx.1.0))
-                } else {
-                    (NodeIdx(i1.0), NodeIdx(idx.0.0))
-                };
-                let lanes = self.node2lanes(ind3, size_log2);
-                let b = self.base.blank_nodes.get(size_log2 - 1);
-                if lanes & 0xf0 != 0 { (b, i3) } else { (i3, b) }
-            } else {
-                (i1, i2)
-            };
-            unsafe { (*(entry_usize as *mut CacheEntry)).value = res };
-            status.store(status::FINISHED, Ordering::Release);
-            return res;
-        }
-
-        let result = if size_log2 == LEAF_SIZE_LOG2 + 2 {
-            let hnode2 = self.merge_universes(idx, size_log2);
-            let i3 = self.base.update_node_sync(hnode2, size_log2);
-            let b = self.base.blank_nodes.get(size_log2 - 1);
-
-            if i3 != b {
-                let lanes = self.node2lanes(hnode2, size_log2);
-                if lanes & 0xf0 != 0 { (b, i3) } else { (i3, b) }
-            } else {
-                (b, b)
-            }
+        if i3 != b {
+            let lanes = self.node2lanes(hnode2, size_log2);
+            if lanes & 0xf0 != 0 { (b, i3) } else { (i3, b) }
         } else {
-            self.update_binode_inner(idx, size_log2)
-        };
-
-        unsafe { (*(entry_usize as *mut CacheEntry)).value = result };
-        status.store(status::FINISHED, Ordering::Release);
-        result
+            (b, b)
+        }
     }
 
     fn add_frame(&mut self, dx: &mut BigInt, dy: &mut BigInt) {
@@ -505,7 +428,9 @@ impl GoLEngine for StreamLifeEngineAsync {
                 .blank_nodes
                 .get_mut(self.base.size_log2, &self.base.mem),
         ));
-        let biroot = self.update_binode(biroot, self.base.size_log2);
+
+        let biroot =
+            StreamLifeExecutor::new(self, biroot, self.base.size_log2).run(self.base.threads_cnt);
         // if ExecutionStatistics::is_poisoned() {
         //     self.load_pattern(&backup, self.base.topology)?;
         //     return Err(anyhow!(

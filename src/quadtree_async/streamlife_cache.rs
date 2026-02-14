@@ -12,13 +12,73 @@ pub(super) struct StreamLifeCache {
 
 unsafe impl Sync for StreamLifeCache {}
 
-#[derive(Default)]
+/// Union for the cache entry's data field: either the computed result or
+/// a pointer to processing data during parallel execution.
+///
+/// The active variant is determined by the entry's `status` field:
+/// - PROCESSING/PENDING: `ptr` is active (points to `BiProcessingData`)
+/// - FINISHED: `value` is active (the computed result)
+/// - NOT_STARTED: neither is meaningful
+#[derive(Clone, Copy)]
+pub(super) union CachePayload {
+    pub value: (NodeIdx, NodeIdx),
+    pub ptr: *mut u8,
+}
+
+impl Default for CachePayload {
+    fn default() -> Self {
+        CachePayload {
+            value: (NodeIdx::default(), NodeIdx::default()),
+        }
+    }
+}
+
 pub(super) struct CacheEntry {
     key: (NodeIdx, NodeIdx),
-    pub(super) value: (NodeIdx, NodeIdx),
+    pub(super) value: CachePayload,
     pub(super) status: AtomicU8,
     is_used: bool,
     lock: AtomicBool,
+}
+
+impl Default for CacheEntry {
+    fn default() -> Self {
+        Self {
+            key: (NodeIdx::default(), NodeIdx::default()),
+            value: CachePayload::default(),
+            status: AtomicU8::new(0),
+            is_used: false,
+            lock: AtomicBool::new(false),
+        }
+    }
+}
+
+impl CacheEntry {
+    pub(super) fn get_value(&self) -> (NodeIdx, NodeIdx) {
+        unsafe { self.value.value }
+    }
+
+    pub(super) fn set_value(&self, v: (NodeIdx, NodeIdx)) {
+        unsafe {
+            let p = &self.value as *const CachePayload as *mut CachePayload;
+            (*p).value = v;
+        }
+    }
+
+    pub(super) fn get_ptr<T>(&self) -> *mut T {
+        unsafe { self.value.ptr as *mut T }
+    }
+
+    pub(super) fn set_ptr<T>(&self, ptr: *mut T) {
+        unsafe {
+            let p = &self.value as *const CachePayload as *mut CachePayload;
+            (*p).ptr = ptr as *mut u8;
+        }
+    }
+
+    pub(super) fn key(&self) -> (NodeIdx, NodeIdx) {
+        self.key
+    }
 }
 
 impl StreamLifeCache {
@@ -94,7 +154,7 @@ impl StreamLifeCacheRaw {
 
                 if !c.is_used {
                     c.key = key;
-                    c.value = (NodeIdx::default(), NodeIdx::default());
+                    c.value = CachePayload::default();
                     c.is_used = true;
 
                     // ExecutionStatistics::on_insertion::<1>();

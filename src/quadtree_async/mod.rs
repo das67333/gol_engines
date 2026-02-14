@@ -6,6 +6,7 @@ mod node;
 mod sharded_length;
 mod streamlife;
 mod streamlife_cache;
+mod streamlife_executor;
 
 const LEAF_SIZE: u64 = 8;
 const LEAF_SIZE_LOG2: u32 = LEAF_SIZE.ilog2();
