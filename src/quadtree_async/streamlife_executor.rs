@@ -17,7 +17,7 @@ use super::{
     node::NodeIdx,
     status,
     streamlife::StreamLifeEngineAsync,
-    streamlife_cache::StreamLifeCache,
+    streamlife_cache::{StreamLifeCache, StreamLifeCacheRef},
 };
 use crossbeam::deque::{Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
@@ -106,6 +106,7 @@ impl<'a> StreamLifeExecutor<'a> {
             for (thread_idx, queue) in queues.into_iter().enumerate() {
                 let executor_thread = BiExecutorThread {
                     engine: self.engine,
+                    bicache_ref: bicache.create_ref(thread_idx),
                     root_status,
                     thread_idx,
                     queue,
@@ -128,6 +129,7 @@ impl<'a> StreamLifeExecutor<'a> {
 /// Per-thread worker for the StreamLife parallel executor.
 struct BiExecutorThread<'a> {
     engine: &'a StreamLifeEngineAsync,
+    bicache_ref: StreamLifeCacheRef<'a>,
     root_status: &'a AtomicU8,
     thread_idx: usize,
     queue: Worker<BiTask>,
@@ -157,8 +159,7 @@ impl<'a> BiExecutorThread<'a> {
     /// 3. If result ready: store it, notify dependents, mark FINISHED
     /// 4. If dependencies needed: guard drops, status returns to PENDING
     fn process_task(&self, task: BiTask) {
-        let bicache = &self.engine.bicache;
-        let entry = bicache.get(task.entry_idx);
+        let entry = self.bicache_ref.get(task.entry_idx);
         let status = &entry.status;
         let mut guard = ProcessingGuard::new(status);
         let data: &mut BiProcessingData = unsafe { &mut *entry.get_ptr::<BiProcessingData>() };
@@ -194,7 +195,6 @@ impl<'a> BiExecutorThread<'a> {
         data: &mut BiProcessingData,
     ) -> Option<(NodeIdx, NodeIdx)> {
         let engine = self.engine;
-        let bicache = &engine.bicache;
 
         // First entry into this task: check for synchronous fast-paths
         if data.mask4_waiting == 0 && data.mask9_waiting == 0 {
@@ -251,12 +251,13 @@ impl<'a> BiExecutorThread<'a> {
                     continue;
                 }
                 let child_key = (data.arr0[i], data.arr1[i]);
-                let child_idx = bicache.entry(child_key);
+                let child_idx = self.bicache_ref.entry(child_key);
 
-                match handle_bi_dependency(bicache, child_idx, parent_entry_idx, size_log2) {
+                match handle_bi_dependency(&engine.bicache, child_idx, parent_entry_idx, size_log2)
+                {
                     BiDependencyResult::Ready => {
                         data.mask9_waiting &= !(1 << i);
-                        let val = bicache.get(child_idx).get_value();
+                        let val = self.bicache_ref.get(child_idx).get_value();
                         data.arr0[i] = val.0;
                         data.arr1[i] = val.1;
                     }
@@ -296,12 +297,13 @@ impl<'a> BiExecutorThread<'a> {
                     continue;
                 }
                 let child_key = (data.arr0[i], data.arr1[i]);
-                let child_idx = bicache.entry(child_key);
+                let child_idx = self.bicache_ref.entry(child_key);
 
-                match handle_bi_dependency(bicache, child_idx, parent_entry_idx, size_log2) {
+                match handle_bi_dependency(&engine.bicache, child_idx, parent_entry_idx, size_log2)
+                {
                     BiDependencyResult::Ready => {
                         data.mask4_waiting &= !(1 << i);
-                        let val = bicache.get(child_idx).get_value();
+                        let val = self.bicache_ref.get(child_idx).get_value();
                         data.arr0[i] = val.0;
                         data.arr1[i] = val.1;
                     }
@@ -344,9 +346,8 @@ impl<'a> BiExecutorThread<'a> {
     /// 2. Decrement its `waiting_cnt`
     /// 3. If `waiting_cnt` reaches 0, re-queue for processing
     fn notify_dependents(&self, dependents: SmallVec<[BiTask; 2]>) {
-        let bicache = &self.engine.bicache;
         for dep in dependents {
-            let entry = bicache.get(dep.entry_idx);
+            let entry = self.bicache_ref.get(dep.entry_idx);
             let status = &entry.status;
             let waiting_cnt = {
                 let _guard = ProcessingGuard::new(status);

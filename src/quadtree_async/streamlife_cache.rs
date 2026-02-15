@@ -1,6 +1,7 @@
 use super::{
     memory::{ConcurrentHashTable, HashtableSlot, FLAG_USED},
     node::NodeIdx,
+    sharded_length::LengthShard,
 };
 use std::{
     hash::{Hash, Hasher},
@@ -99,14 +100,14 @@ impl StreamLifeCache {
     }
 
     /// Find or create a cache entry for the given binode key.
-    /// Returns the index of the entry in the hash table.
-    pub(super) fn entry(&self, key: (NodeIdx, NodeIdx)) -> u32 {
+    /// Returns `(index, was_inserted)`.
+    fn entry_inner(&self, key: (NodeIdx, NodeIdx)) -> (u32, bool) {
         let hash = {
             let mut hasher = self.hasher.clone();
             (key.0 .0, key.1 .0).hash(&mut hasher);
             hasher.finish() as usize
         };
-        let (idx, inserted) = self.inner.find_or_create(
+        self.inner.find_or_create(
             hash,
             FLAG_USED,
             |slot| unsafe { (*slot).key == key },
@@ -115,7 +116,14 @@ impl StreamLifeCache {
                 (*slot).payload = CachePayload::default();
                 (*slot).status = AtomicU8::new(0);
             },
-        );
+        )
+    }
+
+    /// Find or create a cache entry for the given binode key.
+    /// Returns the index of the entry in the hash table.
+    /// Uses the global (non-sharded) length counter.
+    pub(super) fn entry(&self, key: (NodeIdx, NodeIdx)) -> u32 {
+        let (idx, inserted) = self.entry_inner(key);
         if inserted {
             self.inner.increment_length();
         }
@@ -125,6 +133,14 @@ impl StreamLifeCache {
     /// Get a reference to the cache entry at the given index.
     pub(super) fn get(&self, idx: u32) -> &CacheEntry {
         self.inner.get(idx)
+    }
+
+    /// Create a per-thread reference with sharded length counting.
+    pub(super) fn create_ref(&self, shard_idx: usize) -> StreamLifeCacheRef<'_> {
+        StreamLifeCacheRef {
+            base: self,
+            length_shard: self.inner.get_shard(shard_idx),
+        }
     }
 
     pub(super) fn clear(&mut self) {
@@ -137,5 +153,29 @@ impl StreamLifeCache {
 
     pub(super) fn len(&self) -> usize {
         self.inner.len()
+    }
+}
+
+/// A per-thread reference to the StreamLifeCache that uses local sharding for length tracking.
+pub(super) struct StreamLifeCacheRef<'a> {
+    base: &'a StreamLifeCache,
+    length_shard: LengthShard<'a>,
+}
+
+impl<'a> StreamLifeCacheRef<'a> {
+    /// Find or create a cache entry for the given binode key.
+    /// Returns the index of the entry in the hash table.
+    /// Uses the per-thread sharded length counter.
+    pub(super) fn entry(&self, key: (NodeIdx, NodeIdx)) -> u32 {
+        let (idx, inserted) = self.base.entry_inner(key);
+        if inserted {
+            self.length_shard.increment();
+        }
+        idx
+    }
+
+    /// Get a reference to the cache entry at the given index.
+    pub(super) fn get(&self, idx: u32) -> &CacheEntry {
+        self.base.get(idx)
     }
 }
