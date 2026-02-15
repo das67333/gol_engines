@@ -1,9 +1,8 @@
-mod binode_cache;
 mod blank;
 mod hashlife;
 mod hashlife_executor;
+mod hashtable;
 mod node;
-mod node_store;
 mod sharded_length;
 mod streamlife;
 mod streamlife_executor;

@@ -45,9 +45,12 @@
 
 use super::{
     LEAF_SIZE, LEAF_SIZE_LOG2,
-    hashlife::HashLifeEngine,
-    node_store::{NodeStore, NodeStoreRef},
-    node::{Dependents, NodeIdx, ProcessingData, QuadTreeNode},
+    hashlife::{
+        HashLifeEngine, four_children_overlapping, nine_children_disjoint,
+        nine_children_overlapping, update_leaves,
+    },
+    hashtable::{Idx, NodeStore, NodeStoreRef},
+    node::QuadTreeNode,
     status,
 };
 use crossbeam::deque::{Steal, Stealer, Worker};
@@ -59,14 +62,40 @@ use std::{
     time::Duration,
 };
 
+/// List of nodes waiting for this node's result.
+///
+/// Optimized with `SmallVec<[_; 2]>` to avoid heap allocation in the common case,
+/// since almost every node (>>99.99%) has 1 dependent. A capacity of 2 is used
+/// because it does not increase the struct size compared to a capacity of 1.
+type Dependents = SmallVec<[Idx; 2]>;
+
+/// Temporary data allocated during node processing.
+///
+/// Heap-allocated when processing starts, freed when node reaches FINISHED state.
+/// Stored via pointer in the node's `cache` field.
+#[derive(Default)]
+struct ProcessingData {
+    /// Intermediate child node results (up to 9 for overlapping, 4 for final stage).
+    arr: [Idx; 9],
+    /// Bitmask: bit `i` set if `arr[i]` (among first 9) is not yet computed.
+    mask9_waiting: u32,
+    /// Bitmask: bit `i` set if `arr[i]` (among first 4) is not yet computed.
+    mask4_waiting: u32,
+    /// Count of dependencies still being computed. Node can resume when this reaches 0.
+    waiting_cnt: u32,
+    /// Nodes that registered as dependents of this node.
+    /// Notified when this node finishes.
+    dependents: Dependents,
+}
+
 /// A unit of work representing a node to be processed.
 struct Task {
-    idx: NodeIdx,
+    idx: Idx,
     size_log2: u32,
 }
 
 impl Task {
-    fn new(idx: NodeIdx, size_log2: u32) -> Self {
+    fn new(idx: Idx, size_log2: u32) -> Self {
         Self { idx, size_log2 }
     }
 }
@@ -200,15 +229,15 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
 }
 
 /// Parallel executor for Hashlife algorithm using work-stealing.
-pub(super) struct HashLifeExecutor<'a, Extra: Default + Sync> {
-    root: NodeIdx,
+pub(super) struct HashLifeExecutor<'a, Meta: Default + Sync> {
+    root: Idx,
     size_log2: u32,
     generations_log2: u32,
-    mem: &'a NodeStore<Extra>,
+    mem: &'a NodeStore<Meta>,
 }
 
-impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
-    pub(super) fn new(base: &'a HashLifeEngine<Extra>) -> Self {
+impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
+    pub(super) fn new(base: &'a HashLifeEngine<Meta>) -> Self {
         Self {
             root: base.root,
             size_log2: base.size_log2,
@@ -217,7 +246,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
         }
     }
 
-    pub(super) fn run(&self, num_threads: usize) -> Option<NodeIdx> {
+    pub(super) fn run(&self, num_threads: usize) -> Option<Idx> {
         // Create worker queues and stealers
         let mut queues = Vec::with_capacity(num_threads);
         let mut stealers = Vec::with_capacity(num_threads);
@@ -265,7 +294,6 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             "STEAL_ATTEMPTS_RETRY: {}",
             STEAL_ATTEMPTS_RETRY.load(Ordering::Relaxed)
         );
-
         println!(
             "STEAL_FROM_LAST_VICTIM_SUCCESS: {}",
             STEAL_FROM_LAST_VICTIM_SUCCESS.load(Ordering::Relaxed)
@@ -275,20 +303,20 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
             STEAL_FROM_LAST_VICTIM_FAIL.load(Ordering::Relaxed)
         );
 
-        Some(root_node.cache.get_node_idx())
+        Some(root_node.cache.get_value())
     }
 }
 
-struct ExecutorThread<'a, Extra: Default + Sync> {
-    root_node: &'a QuadTreeNode<Extra>,
+struct ExecutorThread<'a, Meta: Default + Sync> {
+    root_node: &'a QuadTreeNode<Meta>,
     generations_log2: u32,
-    mem: NodeStoreRef<'a, Extra>,
+    mem: NodeStoreRef<'a, Meta>,
     thread_idx: usize,
     queue: Worker<Task>,
     stealers: &'a [Stealer<Task>],
 }
 
-impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
+impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
     fn run(&self) {
         let mut fetcher = TaskFetcher::new(
             self.thread_idx,
@@ -313,13 +341,13 @@ impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
     fn process_task(&self, task: Task) {
         let n = self.mem.get(task.idx);
         let mut guard = ProcessingGuard::new(&n.status);
-        let data = n.cache.get_ref();
+        let data: &mut ProcessingData = n.cache.get_ref();
         if let Some(result) = self.update_node(&task, n.parts(), data) {
-            n.cache.set_node_idx(result);
+            n.cache.set_value(result);
             let mut dependents = SmallVec::new();
             mem::swap(&mut data.dependents, &mut dependents);
             guard.finish(); // Mark as FINISHED
-            unsafe { drop(Box::from_raw(data)) } // Free ProcessingData
+            unsafe { drop(Box::from_raw(data as *mut ProcessingData)) } // Free ProcessingData
             self.notify_dependents(&task, dependents);
         }
     }
@@ -341,12 +369,7 @@ impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
     /// - `DependencyIsReady`: Child already computed, use cached result
     /// - `StartedByThisThread`: We claimed the child, register as dependent, push to local queue
     /// - `StartedByOtherThread`: Another thread processing it, register as dependent
-    fn update_node(
-        &self,
-        task: &Task,
-        parts: [NodeIdx; 4],
-        data: &mut ProcessingData,
-    ) -> Option<NodeIdx> {
+    fn update_node(&self, task: &Task, parts: [Idx; 4], data: &mut ProcessingData) -> Option<Idx> {
         let both_stages = self.generations_log2 + 2 >= task.size_log2;
         let [nw, ne, sw, se] = parts;
         if task.size_log2 == LEAF_SIZE_LOG2 + 1 {
@@ -356,16 +379,16 @@ impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
             } else {
                 1 << self.generations_log2
             };
-            return Some(self.update_leaves(nw, ne, sw, se, steps));
+            return Some(update_leaves(&self.mem, nw, ne, sw, se, steps));
         }
 
         if data.mask4_waiting == 0 {
             // arr4 is not ready
             if !both_stages {
-                data.arr = self.nine_children_disjoint(nw, ne, sw, se, task.size_log2 - 1);
+                data.arr = nine_children_disjoint(&self.mem, nw, ne, sw, se, task.size_log2 - 1);
             } else {
                 if data.mask9_waiting == 0 {
-                    data.arr = self.nine_children_overlapping(nw, ne, sw, se);
+                    data.arr = nine_children_overlapping(&self.mem, nw, ne, sw, se);
                     data.mask9_waiting = 0b1_1111_1111;
                 }
 
@@ -378,7 +401,7 @@ impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
                     match handle_dependency(d, task) {
                         DependencyHandlingResult::Ready => {
                             data.mask9_waiting &= !(1 << i);
-                            *x = d.cache.get_node_idx();
+                            *x = d.cache.get_value();
                         }
                         DependencyHandlingResult::StartedByThisThread => {
                             self.queue.push(Task::new(*x, task.size_log2 - 1));
@@ -396,7 +419,7 @@ impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
                 }
             }
 
-            let arr4 = self.four_children_overlapping(&data.arr);
+            let arr4 = four_children_overlapping(&self.mem, &data.arr);
             data.arr[..4].copy_from_slice(&arr4);
             data.mask4_waiting = 0b1111;
         }
@@ -410,7 +433,7 @@ impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
             match handle_dependency(d, task) {
                 DependencyHandlingResult::Ready => {
                     data.mask4_waiting &= !(1 << i);
-                    *x = d.cache.get_node_idx();
+                    *x = d.cache.get_value();
                 }
                 DependencyHandlingResult::StartedByThisThread => {
                     self.queue.push(Task::new(*x, task.size_log2 - 1));
@@ -444,7 +467,7 @@ impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
             let n = self.mem.get(dependent);
             let waiting_cnt = {
                 let _guard = ProcessingGuard::new(&n.status);
-                let dep_data = n.cache.get_ref();
+                let dep_data: &mut ProcessingData = n.cache.get_ref();
                 dep_data.waiting_cnt -= 1;
                 dep_data.waiting_cnt
             };
@@ -452,212 +475,6 @@ impl<'a, Extra: Default + Sync> ExecutorThread<'a, Extra> {
                 self.queue.push(Task::new(dependent, task.size_log2 + 1));
             }
         }
-    }
-
-    /// Apply Conway's Game of Life rules to a row of cells.
-    ///
-    /// Uses bit-parallel computation to update 16 cells simultaneously.
-    /// Implements the standard B3/S23 rule (born with 3 neighbors, survive with 2-3).
-    fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {
-        let b = row_prev;
-        let a = b << 1;
-        let c = b >> 1;
-        let i = row_curr;
-        let h = i << 1;
-        let d = i >> 1;
-        let f = row_next;
-        let g = f << 1;
-        let e = f >> 1;
-
-        let ab0 = a ^ b;
-        let ab1 = a & b;
-        let cd0 = c ^ d;
-        let cd1 = c & d;
-
-        let ef0 = e ^ f;
-        let ef1 = e & f;
-        let gh0 = g ^ h;
-        let gh1 = g & h;
-
-        let ad0 = ab0 ^ cd0;
-        let ad1 = (ab1 ^ cd1) ^ (ab0 & cd0);
-        let ad2 = ab1 & cd1;
-
-        let eh0 = ef0 ^ gh0;
-        let eh1 = (ef1 ^ gh1) ^ (ef0 & gh0);
-        let eh2 = ef1 & gh1;
-
-        let ah0 = ad0 ^ eh0;
-        let xx = ad0 & eh0;
-        let yy = ad1 ^ eh1;
-        let ah1 = xx ^ yy;
-        let ah23 = (ad2 | eh2) | (ad1 & eh1) | (xx & yy);
-        let z = !ah23 & ah1;
-        let i2 = !ah0 & z;
-        let i3 = ah0 & z;
-        (i & i2) | i3
-    }
-
-    /// Update a 2x2 block of leaf nodes by simulating `steps` generations.
-    ///
-    /// This is the base case of Hashlife recursion. Combines 4 leaf nodes (8x8 each)
-    /// into a 16x16 grid, simulates forward, and extracts the center 8x8 result.
-    fn update_leaves(
-        &self,
-        nw: NodeIdx,
-        ne: NodeIdx,
-        sw: NodeIdx,
-        se: NodeIdx,
-        steps: u64,
-    ) -> NodeIdx {
-        let [nw, ne, sw, se] = [nw, ne, sw, se].map(|x| self.mem.get(x).leaf_cells());
-
-        let mut src = [0; 16];
-        for i in 0..8 {
-            src[i] = u16::from_le_bytes([nw[i], ne[i]]);
-            src[i + 8] = u16::from_le_bytes([sw[i], se[i]]);
-        }
-        let mut dst = [0; 16];
-
-        for t in 1..=steps as usize {
-            for y in t..16 - t {
-                dst[y] = Self::update_row(src[y - 1], src[y], src[y + 1]);
-            }
-            std::mem::swap(&mut src, &mut dst);
-        }
-
-        let arr: [u16; 8] = src[4..12].try_into().unwrap();
-        self.mem
-            .find_or_create_leaf_from_u64(u64::from_le_bytes(arr.map(|x| (x >> 4) as u8)))
-    }
-
-    /// Create 9 overlapping children from a 2×2 block of nodes.
-    ///
-    /// ```text
-    /// Input: 2×2 block         Output: 9 overlapping children
-    /// ┌─────┬─────┐            ┌─────┬─────┬─────┐
-    /// │ NW  │ NE  │            │  0  │  1  │  2  │
-    /// │     │     │            │(NW) │(mid)│(NE) │
-    /// ├─────┼─────┤            ├─────┼─────┼─────┤
-    /// │ SW  │ SE  │            │  3  │  4  │  5  │
-    /// │     │     │            │(mid)│(ctr)│(mid)│
-    /// └─────┴─────┘            ├─────┼─────┼─────┤
-    ///                          │  6  │  7  │  8  │
-    ///                          │(SW) │(mid)│(SE) │
-    ///                          └─────┴─────┴─────┘
-    ///
-    /// Children 0,2,6,8 are the original input nodes.
-    /// Children 1,3,5,7 are formed from overlapping edges.
-    /// Child 4 is formed from the center where all four inputs meet.
-    /// ```
-    fn nine_children_overlapping(
-        &self,
-        nw: NodeIdx,
-        ne: NodeIdx,
-        sw: NodeIdx,
-        se: NodeIdx,
-    ) -> [NodeIdx; 9] {
-        let [nw_, ne_, sw_, se_] = [nw, ne, sw, se].map(|x| self.mem.get(x));
-        [
-            nw,
-            self.mem.find_or_create_node(nw_.ne, ne_.nw, nw_.se, ne_.sw),
-            ne,
-            self.mem.find_or_create_node(nw_.sw, nw_.se, sw_.nw, sw_.ne),
-            self.mem.find_or_create_node(nw_.se, ne_.sw, sw_.ne, se_.nw),
-            self.mem.find_or_create_node(ne_.sw, ne_.se, se_.nw, se_.ne),
-            sw,
-            self.mem.find_or_create_node(sw_.ne, se_.nw, sw_.se, se_.sw),
-            se,
-        ]
-    }
-
-    /// Create 9 non-overlapping children from a 2×2 block of nodes.
-    ///
-    /// ```text
-    /// Input: 2×2 block          Each input node has 4 children:
-    /// ┌──────┬──────┐           ┌───┬───┐
-    /// │  NW  │  NE  │           │nw │ne │
-    /// │      │      │           ├───┼───┤
-    /// ├──────┼──────┤           │sw │se │
-    /// │  SW  │  SE  │           └───┴───┘
-    /// │      │      │
-    /// └──────┴──────┘
-    ///
-    /// Output: 9 non-overlapping children formed from centers:
-    /// ┌─────┬─────┬─────┐
-    /// │  0  │  1  │  2  │  ← 0: from NW's children, 1: from NW+NE, 2: from NE's children
-    /// ├─────┼─────┼─────┤
-    /// │  3  │  4  │  5  │  ← 3: from NW+SW, 4: from all four, 5: from NE+SE
-    /// ├─────┼─────┼─────┤
-    /// │  6  │  7  │  8  │  ← 6: from SW's children, 7: from SW+SE, 8: from SE's children
-    /// └─────┴─────┴─────┘
-    ///
-    /// Each output is formed by taking center regions from the input nodes' children.
-    /// ```
-    fn nine_children_disjoint(
-        &self,
-        nw: NodeIdx,
-        ne: NodeIdx,
-        sw: NodeIdx,
-        se: NodeIdx,
-        size_log2: u32,
-    ) -> [NodeIdx; 9] {
-        let [
-            [nwnw, nwne, nwsw, nwse],
-            [nenw, nene, nesw, nese],
-            [swnw, swne, swsw, swse],
-            [senw, sene, sesw, sese],
-        ] = [nw, ne, sw, se].map(|x| self.mem.get(x).parts().map(|y| self.mem.get(y)));
-
-        [
-            [nwnw, nwne, nwsw, nwse],
-            [nwne, nenw, nwse, nesw],
-            [nenw, nene, nesw, nese],
-            [nwsw, nwse, swnw, swne],
-            [nwse, nesw, swne, senw],
-            [nesw, nese, senw, sene],
-            [swnw, swne, swsw, swse],
-            [swne, senw, swse, sesw],
-            [senw, sene, sesw, sese],
-        ]
-        .map(|[nw, ne, sw, se]| {
-            if size_log2 >= LEAF_SIZE_LOG2 + 2 {
-                self.mem.find_or_create_node(nw.se, ne.sw, sw.ne, se.nw)
-            } else {
-                self.mem.find_or_create_leaf_from_parts(
-                    nw.leaf_se(),
-                    ne.leaf_sw(),
-                    sw.leaf_ne(),
-                    se.leaf_nw(),
-                )
-            }
-        })
-    }
-
-    /// Combine 9 overlapping children into 4 final children.
-    ///
-    /// ```text
-    /// Input:           Output:
-    /// ┌───┬───┬───┐    ┌─────┬─────┐
-    /// │ 0 │ 1 │ 2 │    │  A  │  B  │
-    /// ├───┼───┼───┤    │     │     │
-    /// │ 3 │ 4 │ 5 │    ├─────┼─────┤
-    /// ├───┼───┼───┤    │  C  │  D  │
-    /// │ 6 │ 7 │ 8 │    │     │     │
-    /// └───┴───┴───┘    └─────┴─────┘
-    ///
-    /// A = combine(0,1,3,4)
-    /// B = combine(1,2,4,5)
-    /// C = combine(3,4,6,7)
-    /// D = combine(4,5,7,8)
-    /// ```
-    fn four_children_overlapping(&self, arr: &[NodeIdx; 9]) -> [NodeIdx; 4] {
-        [
-            self.mem.find_or_create_node(arr[0], arr[1], arr[3], arr[4]),
-            self.mem.find_or_create_node(arr[1], arr[2], arr[4], arr[5]),
-            self.mem.find_or_create_node(arr[3], arr[4], arr[6], arr[7]),
-            self.mem.find_or_create_node(arr[4], arr[5], arr[7], arr[8]),
-        ]
     }
 }
 
@@ -674,8 +491,8 @@ pub(super) fn is_finished(status: &AtomicU8) -> bool {
 /// 1. CAS(NOT_STARTED → PROCESSING) to claim the node
 /// 2. Allocate and store ProcessingData
 /// 3. Store PENDING status (node ready to be processed)
-fn start_processing_node<Extra: Default + Sync>(
-    node: &QuadTreeNode<Extra>,
+fn start_processing_node<Meta: Default + Sync>(
+    node: &QuadTreeNode<Meta>,
     dependents: Dependents,
 ) -> bool {
     if node
@@ -701,7 +518,7 @@ fn start_processing_node<Extra: Default + Sync>(
 }
 
 /// Atomically transition status from `from` to `to`, spinning until successful.
-pub(super) fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8) {
+fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8) {
     while a
         .compare_exchange_weak(from, to, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -760,8 +577,8 @@ enum DependencyHandlingResult {
 }
 
 /// Handle a dependency: check if ready, start processing, or register as dependent.
-fn handle_dependency<Extra: Default + Sync>(
-    n: &QuadTreeNode<Extra>,
+fn handle_dependency<Meta: Default + Sync>(
+    n: &QuadTreeNode<Meta>,
     task: &Task,
 ) -> DependencyHandlingResult {
     let status = n.status.load(Ordering::Acquire);
@@ -781,7 +598,10 @@ fn handle_dependency<Extra: Default + Sync>(
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                n.cache.get_ref().dependents.push(task.idx);
+                n.cache
+                    .get_ref::<ProcessingData>()
+                    .dependents
+                    .push(task.idx);
                 n.status.store(status::PENDING, Ordering::Release);
                 return DependencyHandlingResult::StartedByOtherThread;
             }

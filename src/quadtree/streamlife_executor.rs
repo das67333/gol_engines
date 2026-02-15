@@ -2,7 +2,7 @@
 //!
 //! Work-stealing parallel executor for the StreamLife algorithm's `update_binode` operation.
 //! Follows the same architecture as `hashlife_executor`, but operates on pairs of nodes
-//! `(NodeIdx, NodeIdx)` with state tracked in `BinodeCache`'s `CacheEntry`.
+//! `(Idx, Idx)` with state tracked in `BinodeCache`'s `CacheEntry`.
 //!
 //! ## Differences from HashLife Executor
 //!
@@ -13,10 +13,10 @@
 
 use super::{
     LEAF_SIZE_LOG2,
+    hashlife::{four_children_overlapping, nine_children_disjoint, nine_children_overlapping},
     hashlife_executor::{ProcessingGuard, TaskFetcher, is_finished},
-    node::NodeIdx,
+    hashtable::{BinodeCache, BinodeCacheRef, Idx},
     status,
-    binode_cache::{BinodeCache, BinodeCacheRef},
     streamlife::StreamLifeEngine,
 };
 use crossbeam::deque::{Stealer, Worker};
@@ -31,7 +31,7 @@ use std::{
 #[derive(Clone, Copy)]
 struct BiTask {
     /// Index into the BinodeCache for this binode pair.
-    entry_idx: u32,
+    entry_idx: Idx,
     /// Size (log2) of the nodes in this pair.
     size_log2: u32,
 }
@@ -43,9 +43,9 @@ struct BiTask {
 #[derive(Default)]
 struct BiProcessingData {
     /// Intermediate child node results for universe 0 (BESZEL).
-    arr0: [NodeIdx; 9],
+    arr0: [Idx; 9],
     /// Intermediate child node results for universe 1 (ULQOMA).
-    arr1: [NodeIdx; 9],
+    arr1: [Idx; 9],
     /// Bitmask: bit `i` set if child pair `i` (among first 9) is not yet computed.
     mask9_waiting: u32,
     /// Bitmask: bit `i` set if child pair `i` (among first 4) is not yet computed.
@@ -60,16 +60,12 @@ struct BiProcessingData {
 /// Parallel executor for StreamLife's `update_binode` using work-stealing.
 pub(super) struct StreamLifeExecutor<'a> {
     engine: &'a StreamLifeEngine,
-    biroot: (NodeIdx, NodeIdx),
+    biroot: (Idx, Idx),
     size_log2: u32,
 }
 
 impl<'a> StreamLifeExecutor<'a> {
-    pub(super) fn new(
-        engine: &'a StreamLifeEngine,
-        biroot: (NodeIdx, NodeIdx),
-        size_log2: u32,
-    ) -> Self {
+    pub(super) fn new(engine: &'a StreamLifeEngine, biroot: (Idx, Idx), size_log2: u32) -> Self {
         Self {
             engine,
             biroot,
@@ -77,12 +73,12 @@ impl<'a> StreamLifeExecutor<'a> {
         }
     }
 
-    pub(super) fn run(&self, num_threads: usize) -> (NodeIdx, NodeIdx) {
+    pub(super) fn run(&self, num_threads: usize) -> Option<(Idx, Idx)> {
         let bicache = &self.engine.bicache;
 
         // Look up root entry
         let root_idx = bicache.entry(self.biroot);
-        let root_status = &bicache.get(root_idx).status;
+        let root_status = &bicache.get(root_idx).status();
 
         // Create worker queues and stealers
         let mut queues = Vec::with_capacity(num_threads);
@@ -116,13 +112,17 @@ impl<'a> StreamLifeExecutor<'a> {
             }
         });
 
+        if self.engine.base.mem.exceeds_load_factor() || bicache.exceeds_load_factor() {
+            return None;
+        }
+
         assert!(is_finished(root_status));
         println!(
             "(?) Nodes count: {}, BiCache count: {}",
             self.engine.base.mem.len(),
             bicache.len()
         );
-        bicache.get(root_idx).get_value()
+        Some(bicache.get(root_idx).payload.get_value())
     }
 }
 
@@ -143,7 +143,7 @@ impl<'a> BiExecutorThread<'a> {
             &self.queue,
             self.stealers,
             || is_finished(self.root_status),
-            || self.engine.base.mem.exceeds_load_factor(),
+            || self.engine.base.mem.exceeds_load_factor() || self.bicache_ref.exceeds_load_factor(),
         );
 
         while let Some(task) = fetcher.fetch_task() {
@@ -160,13 +160,13 @@ impl<'a> BiExecutorThread<'a> {
     /// 4. If dependencies needed: guard drops, status returns to PENDING
     fn process_task(&self, task: BiTask) {
         let entry = self.bicache_ref.get(task.entry_idx);
-        let status = &entry.status;
+        let status = entry.status();
         let mut guard = ProcessingGuard::new(status);
-        let data: &mut BiProcessingData = unsafe { &mut *entry.get_ptr::<BiProcessingData>() };
+        let data: &mut BiProcessingData = entry.payload.get_ref();
         let idx = entry.key();
 
         if let Some(result) = self.update_binode(task.entry_idx, idx, task.size_log2, data) {
-            entry.set_value(result);
+            entry.payload.set_value(result);
             let mut dependents = SmallVec::new();
             mem::swap(&mut data.dependents, &mut dependents);
             guard.finish(); // Mark as FINISHED
@@ -189,11 +189,11 @@ impl<'a> BiExecutorThread<'a> {
     ///    but with pairs).
     fn update_binode(
         &self,
-        parent_entry_idx: u32,
-        idx: (NodeIdx, NodeIdx),
+        parent_entry_idx: Idx,
+        idx: (Idx, Idx),
         size_log2: u32,
         data: &mut BiProcessingData,
-    ) -> Option<(NodeIdx, NodeIdx)> {
+    ) -> Option<(Idx, Idx)> {
         let engine = self.engine;
 
         // First entry into this task: check for synchronous fast-paths
@@ -215,24 +215,20 @@ impl<'a> BiExecutorThread<'a> {
             let n1 = engine.base.mem.get(idx.1);
 
             if both_stages {
-                data.arr0 =
-                    engine
-                        .base
-                        .nine_children_overlapping(n0.nw, n0.ne, n0.sw, n0.se);
-                data.arr1 =
-                    engine
-                        .base
-                        .nine_children_overlapping(n1.nw, n1.ne, n1.sw, n1.se);
+                data.arr0 = nine_children_overlapping(&engine.base.mem, n0.nw, n0.ne, n0.sw, n0.se);
+                data.arr1 = nine_children_overlapping(&engine.base.mem, n1.nw, n1.ne, n1.sw, n1.se);
                 data.mask9_waiting = 0b1_1111_1111;
             } else {
-                data.arr0 = engine.base.nine_children_disjoint(
+                data.arr0 = nine_children_disjoint(
+                    &engine.base.mem,
                     n0.nw,
                     n0.ne,
                     n0.sw,
                     n0.se,
                     size_log2 - 1,
                 );
-                data.arr1 = engine.base.nine_children_disjoint(
+                data.arr1 = nine_children_disjoint(
+                    &engine.base.mem,
                     n1.nw,
                     n1.ne,
                     n1.sw,
@@ -257,7 +253,7 @@ impl<'a> BiExecutorThread<'a> {
                 {
                     BiDependencyResult::Ready => {
                         data.mask9_waiting &= !(1 << i);
-                        let val = self.bicache_ref.get(child_idx).get_value();
+                        let val = self.bicache_ref.get(child_idx).payload.get_value();
                         data.arr0[i] = val.0;
                         data.arr1[i] = val.1;
                     }
@@ -282,8 +278,8 @@ impl<'a> BiExecutorThread<'a> {
 
         // Transition: compute arr4 from the 9 results (or from disjoint children)
         if data.mask4_waiting == 0 {
-            let arr40 = engine.base.four_children_overlapping(&data.arr0);
-            let arr41 = engine.base.four_children_overlapping(&data.arr1);
+            let arr40 = four_children_overlapping(&engine.base.mem, &data.arr0);
+            let arr41 = four_children_overlapping(&engine.base.mem, &data.arr1);
             data.arr0[..4].copy_from_slice(&arr40);
             data.arr1[..4].copy_from_slice(&arr41);
             data.mask4_waiting = 0b1111;
@@ -303,7 +299,7 @@ impl<'a> BiExecutorThread<'a> {
                 {
                     BiDependencyResult::Ready => {
                         data.mask4_waiting &= !(1 << i);
-                        let val = self.bicache_ref.get(child_idx).get_value();
+                        let val = self.bicache_ref.get(child_idx).payload.get_value();
                         data.arr0[i] = val.0;
                         data.arr1[i] = val.1;
                     }
@@ -328,14 +324,18 @@ impl<'a> BiExecutorThread<'a> {
 
         // Assemble final result from the 4 completed children
         Some((
-            engine
-                .base
-                .mem
-                .find_or_create_node(data.arr0[0], data.arr0[1], data.arr0[2], data.arr0[3]),
-            engine
-                .base
-                .mem
-                .find_or_create_node(data.arr1[0], data.arr1[1], data.arr1[2], data.arr1[3]),
+            engine.base.mem.find_or_create_node(
+                data.arr0[0],
+                data.arr0[1],
+                data.arr0[2],
+                data.arr0[3],
+            ),
+            engine.base.mem.find_or_create_node(
+                data.arr1[0],
+                data.arr1[1],
+                data.arr1[2],
+                data.arr1[3],
+            ),
         ))
     }
 
@@ -348,11 +348,10 @@ impl<'a> BiExecutorThread<'a> {
     fn notify_dependents(&self, dependents: SmallVec<[BiTask; 2]>) {
         for dep in dependents {
             let entry = self.bicache_ref.get(dep.entry_idx);
-            let status = &entry.status;
+            let status = entry.status();
             let waiting_cnt = {
                 let _guard = ProcessingGuard::new(status);
-                let dep_data: &mut BiProcessingData =
-                    unsafe { &mut *entry.get_ptr::<BiProcessingData>() };
+                let dep_data: &mut BiProcessingData = entry.payload.get_ref();
                 dep_data.waiting_cnt -= 1;
                 dep_data.waiting_cnt
             };
@@ -376,11 +375,11 @@ impl<'a> BiExecutorThread<'a> {
 /// 3. Store PENDING status (entry ready to be processed)
 fn start_processing_entry(
     bicache: &BinodeCache,
-    entry_idx: u32,
+    entry_idx: Idx,
     dependents: SmallVec<[BiTask; 2]>,
 ) -> bool {
     let entry = bicache.get(entry_idx);
-    let status = &entry.status;
+    let status = entry.status();
     if status
         .compare_exchange(
             status::NOT_STARTED,
@@ -397,7 +396,7 @@ fn start_processing_entry(
         dependents,
         ..Default::default()
     };
-    entry.set_ptr(Box::into_raw(Box::new(pd)));
+    entry.payload.set_ptr(Box::into_raw(Box::new(pd)));
     status.store(status::PENDING, Ordering::Release);
     true
 }
@@ -417,12 +416,12 @@ enum BiDependencyResult {
 /// The `parent_entry_idx` and `parent_size_log2` identify the parent task that depends on this child.
 fn handle_bi_dependency(
     bicache: &BinodeCache,
-    child_idx: u32,
-    parent_entry_idx: u32,
+    child_idx: Idx,
+    parent_entry_idx: Idx,
     parent_size_log2: u32,
 ) -> BiDependencyResult {
     let child_entry = bicache.get(child_idx);
-    let status = &child_entry.status;
+    let status = child_entry.status();
     let status_value = status.load(Ordering::Acquire);
 
     if status_value == status::FINISHED {
@@ -452,8 +451,7 @@ fn handle_bi_dependency(
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                let child_data: &mut BiProcessingData =
-                    unsafe { &mut *child_entry.get_ptr::<BiProcessingData>() };
+                let child_data: &mut BiProcessingData = child_entry.payload.get_ref();
                 child_data.dependents.push(BiTask {
                     entry_idx: parent_entry_idx,
                     size_log2: parent_size_log2,

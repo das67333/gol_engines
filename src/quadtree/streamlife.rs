@@ -1,17 +1,17 @@
 use super::{
     LEAF_SIZE_LOG2,
-    binode_cache::{BinodeCache, CacheEntry},
-    hashlife::HashLifeEngine,
-    node::{NodeIdx, QuadTreeNode},
+    hashlife::{HashLifeEngine, update_leaves},
+    hashtable::{BinodeCache, CacheEntry, Idx},
+    node::QuadTreeNode,
     status,
     streamlife_executor::StreamLifeExecutor,
 };
 use crate::{GoLEngine, Pattern, Topology};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
 use std::{hint::spin_loop, sync::atomic::Ordering};
 
-type NodeStore = super::node_store::NodeStore<u64>;
+type NodeStore = super::hashtable::NodeStore<u64>;
 
 /// Implementation of [StreamLife algorithm](https://conwaylife.com/wiki/StreamLife).
 ///
@@ -20,13 +20,13 @@ type NodeStore = super::node_store::NodeStore<u64>;
 pub struct StreamLifeEngine {
     pub(super) base: HashLifeEngine<u64>,
     // streamlife-specific
-    biroot: Option<(NodeIdx, NodeIdx)>,
+    biroot: Option<(Idx, Idx)>,
     pub(super) bicache: BinodeCache,
 }
 
 impl StreamLifeEngine {
-    fn determine_direction(&self, nw: NodeIdx, ne: NodeIdx, sw: NodeIdx, se: NodeIdx) -> u64 {
-        let m = self.base.update_leaves(nw, ne, sw, se, 4);
+    fn determine_direction(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> u64 {
+        let m = update_leaves(&self.base.mem, nw, ne, sw, se, 4);
         let centre = u64::from_le_bytes(self.base.mem.get(m).leaf_cells());
 
         let [nw, ne, sw, se] =
@@ -82,7 +82,7 @@ impl StreamLifeEngine {
     }
 
     /// Compute lane descriptors for a node. Thread-safe (uses CAS on `status_extra`).
-    fn node2lanes(&self, idx: NodeIdx, size_log2: u32) -> u64 {
+    fn node2lanes(&self, idx: Idx, size_log2: u32) -> u64 {
         if idx == self.base.blank_nodes.get(size_log2) {
             // blank node
             return 0xffff;
@@ -201,9 +201,8 @@ impl StreamLifeEngine {
             let cl = [pptr_tl.sw, pptr_tl.se, pptr_bl.nw, pptr_bl.ne];
             let cr = [pptr_tr.sw, pptr_tr.se, pptr_br.nw, pptr_br.ne];
 
-            let prepared = |mem: &NodeStore, x: &[NodeIdx; 4]| {
-                mem.find_or_create_node(x[0], x[1], x[2], x[3])
-            };
+            let prepared =
+                |mem: &NodeStore, x: &[Idx; 4]| mem.find_or_create_node(x[0], x[1], x[2], x[3]);
 
             for (i, x) in [(1, &tc), (3, &cl), (4, &cc), (5, &cr), (7, &bc)] {
                 childlanes[i] = self.node2lanes(prepared(&self.base.mem, x), size_log2 - 1);
@@ -267,7 +266,7 @@ impl StreamLifeEngine {
 
     /// Check if two universes are provably non-interacting (solitonic).
     /// Thread-safe.
-    pub(super) fn is_solitonic(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> bool {
+    pub(super) fn is_solitonic(&self, idx: (Idx, Idx), size_log2: u32) -> bool {
         let lanes1 = self.node2lanes(idx.0, size_log2);
         if lanes1 & 255 == 0 {
             return false;
@@ -284,7 +283,7 @@ impl StreamLifeEngine {
     }
 
     /// Merge two non-overlapping universes into a single node. Thread-safe.
-    fn merge_universes(&self, idx: (NodeIdx, NodeIdx), size_log2: u32) -> NodeIdx {
+    fn merge_universes(&self, idx: (Idx, Idx), size_log2: u32) -> Idx {
         let b = self.base.blank_nodes.get(size_log2);
         if idx.1 == b {
             return idx.0;
@@ -301,7 +300,7 @@ impl StreamLifeEngine {
             self.base.mem.find_or_create_leaf_from_u64(l0 | l1)
         } else {
             let (m0, m1) = (m0.parts(), m1.parts());
-            let mut r = [NodeIdx::default(); 4];
+            let mut r = [Idx::default(); 4];
             for i in 0..4 {
                 r[i] = self.merge_universes((m0[i], m1[i]), size_log2 - 1);
             }
@@ -311,21 +310,13 @@ impl StreamLifeEngine {
 
     /// Compute solitonic case: two non-interacting universes updated independently.
     /// Used by the parallel executor for the fast-path.
-    pub(super) fn compute_solitonic(
-        &self,
-        idx: (NodeIdx, NodeIdx),
-        size_log2: u32,
-    ) -> (NodeIdx, NodeIdx) {
+    pub(super) fn compute_solitonic(&self, idx: (Idx, Idx), size_log2: u32) -> (Idx, Idx) {
         let i1 = self.base.update_node_sync(idx.0, size_log2);
         let i2 = self.base.update_node_sync(idx.1, size_log2);
 
         let b = self.base.blank_nodes.get(size_log2);
         if idx.0 == b || idx.1 == b {
-            let (i3, ind3) = if idx.0 == b {
-                (NodeIdx(i2.0), NodeIdx(idx.1.0))
-            } else {
-                (NodeIdx(i1.0), NodeIdx(idx.0.0))
-            };
+            let (i3, ind3) = if idx.0 == b { (i2, idx.1) } else { (i1, idx.0) };
             let lanes = self.node2lanes(ind3, size_log2);
             let b = self.base.blank_nodes.get(size_log2 - 1);
             if lanes & 0xf0 != 0 { (b, i3) } else { (i3, b) }
@@ -336,11 +327,7 @@ impl StreamLifeEngine {
 
     /// Compute base case: merge universes and run standard HashLife.
     /// Used by the parallel executor for the smallest recursive level.
-    pub(super) fn compute_base_case(
-        &self,
-        idx: (NodeIdx, NodeIdx),
-        size_log2: u32,
-    ) -> (NodeIdx, NodeIdx) {
+    pub(super) fn compute_base_case(&self, idx: (Idx, Idx), size_log2: u32) -> (Idx, Idx) {
         let hnode2 = self.merge_universes(idx, size_log2);
         let i3 = self.base.update_node_sync(hnode2, size_log2);
         let b = self.base.blank_nodes.get(size_log2 - 1);
@@ -411,7 +398,7 @@ impl GoLEngine for StreamLifeEngine {
                 self.run_gc();
             }
         }
-        // let backup = self.current_state();
+        let backup = self.current_state();
         self.base.generations_per_update_log2 = Some(generations_log2);
 
         let frames_cnt = (generations_log2 + 2).max(self.base.size_log2 + 1) - self.base.size_log2;
@@ -428,14 +415,16 @@ impl GoLEngine for StreamLifeEngine {
                 .get_mut(self.base.size_log2, &self.base.mem),
         ));
 
-        let biroot =
-            StreamLifeExecutor::new(self, biroot, self.base.size_log2).run(self.base.threads_cnt);
-        // if ExecutionStatistics::is_poisoned() {
-        //     self.load_pattern(&backup, self.base.topology)?;
-        //     return Err(anyhow!(
-        //         "StreamLifeAsync: overfilled NodeStore, try smaller step"
-        //     ));
-        // }
+        let biroot = if let Some(x) =
+            StreamLifeExecutor::new(self, biroot, self.base.size_log2).run(self.base.threads_cnt)
+        {
+            x
+        } else {
+            self.load_pattern(&backup, self.base.topology)?;
+            return Err(anyhow!(
+                "StreamLife: overfilled NodeStore or BinodeCache, try smaller step"
+            ));
+        };
 
         self.base.size_log2 -= 1;
         self.biroot = Some(biroot);

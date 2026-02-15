@@ -1,9 +1,9 @@
 use super::{
-    LEAF_SIZE_LOG2, LEAF_SIZE,
+    LEAF_SIZE, LEAF_SIZE_LOG2,
     blank::BlankNodes,
     hashlife_executor::HashLifeExecutor,
-    node_store::NodeStore,
-    node::{NodeIdx, QuadTreeNode},
+    hashtable::{Idx, NodeAccess, NodeStore},
+    node::QuadTreeNode,
     status,
 };
 use crate::{GoLEngine, Pattern, PatternNode, Topology};
@@ -16,158 +16,233 @@ use std::{hint, sync::atomic::Ordering};
 ///
 /// Stores nodes in a single pre-allocated open-addressing hashtable with
 /// linear probing, and the hashtable never grows.
-pub struct HashLifeEngine<Extra> {
+pub struct HashLifeEngine<Meta> {
     pub(super) size_log2: u32,
-    pub(super) root: NodeIdx,
-    pub(super) mem: NodeStore<Extra>,
+    pub(super) root: Idx,
+    pub(super) mem: NodeStore<Meta>,
     pub(super) generations_per_update_log2: Option<u32>,
     pub(super) topology: Topology,
     pub(super) blank_nodes: BlankNodes,
     pub(super) threads_cnt: usize,
 }
 
-impl<Extra: Default + Sync> HashLifeEngine<Extra> {
-    fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {
-        let b = row_prev;
-        let a = b << 1;
-        let c = b >> 1;
-        let i = row_curr;
-        let h = i << 1;
-        let d = i >> 1;
-        let f = row_next;
-        let g = f << 1;
-        let e = f >> 1;
+// ---------------------------------------------------------------------------
+// Shared HashLife algorithm primitives (used by both sync and parallel paths)
+// ---------------------------------------------------------------------------
 
-        let ab0 = a ^ b;
-        let ab1 = a & b;
-        let cd0 = c ^ d;
-        let cd1 = c & d;
+/// Apply Conway's Game of Life rules to a row of cells.
+///
+/// Uses bit-parallel computation to update 16 cells simultaneously.
+/// Implements the standard B3/S23 rule (born with 3 neighbors, survive with 2-3).
+fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {
+    let b = row_prev;
+    let a = b << 1;
+    let c = b >> 1;
+    let i = row_curr;
+    let h = i << 1;
+    let d = i >> 1;
+    let f = row_next;
+    let g = f << 1;
+    let e = f >> 1;
 
-        let ef0 = e ^ f;
-        let ef1 = e & f;
-        let gh0 = g ^ h;
-        let gh1 = g & h;
+    let ab0 = a ^ b;
+    let ab1 = a & b;
+    let cd0 = c ^ d;
+    let cd1 = c & d;
 
-        let ad0 = ab0 ^ cd0;
-        let ad1 = (ab1 ^ cd1) ^ (ab0 & cd0);
-        let ad2 = ab1 & cd1;
+    let ef0 = e ^ f;
+    let ef1 = e & f;
+    let gh0 = g ^ h;
+    let gh1 = g & h;
 
-        let eh0 = ef0 ^ gh0;
-        let eh1 = (ef1 ^ gh1) ^ (ef0 & gh0);
-        let eh2 = ef1 & gh1;
+    let ad0 = ab0 ^ cd0;
+    let ad1 = (ab1 ^ cd1) ^ (ab0 & cd0);
+    let ad2 = ab1 & cd1;
 
-        let ah0 = ad0 ^ eh0;
-        let xx = ad0 & eh0;
-        let yy = ad1 ^ eh1;
-        let ah1 = xx ^ yy;
-        let ah23 = (ad2 | eh2) | (ad1 & eh1) | (xx & yy);
-        let z = !ah23 & ah1;
-        let i2 = !ah0 & z;
-        let i3 = ah0 & z;
-        (i & i2) | i3
+    let eh0 = ef0 ^ gh0;
+    let eh1 = (ef1 ^ gh1) ^ (ef0 & gh0);
+    let eh2 = ef1 & gh1;
+
+    let ah0 = ad0 ^ eh0;
+    let xx = ad0 & eh0;
+    let yy = ad1 ^ eh1;
+    let ah1 = xx ^ yy;
+    let ah23 = (ad2 | eh2) | (ad1 & eh1) | (xx & yy);
+    let z = !ah23 & ah1;
+    let i2 = !ah0 & z;
+    let i3 = ah0 & z;
+    (i & i2) | i3
+}
+
+/// Update a 2x2 block of leaf nodes by simulating `steps` generations.
+///
+/// This is the base case of Hashlife recursion. Combines 4 leaf nodes (8x8 each)
+/// into a 16x16 grid, simulates forward, and extracts the center 8x8 result.
+/// `nw`, `ne`, `sw`, `se` must be leaves.
+pub(super) fn update_leaves<Meta: Default + Sync>(
+    mem: &impl NodeAccess<Meta>,
+    nw: Idx,
+    ne: Idx,
+    sw: Idx,
+    se: Idx,
+    steps: u64,
+) -> Idx {
+    let [nw, ne, sw, se] = [nw, ne, sw, se].map(|x| mem.get(x).leaf_cells());
+
+    let mut src = [0; 16];
+    for i in 0..8 {
+        src[i] = u16::from_le_bytes([nw[i], ne[i]]);
+        src[i + 8] = u16::from_le_bytes([sw[i], se[i]]);
     }
+    let mut dst = [0; 16];
 
-    /// `nw`, `ne`, `sw`, `se` must be leaves
-    pub(super) fn update_leaves(
-        &self,
-        nw: NodeIdx,
-        ne: NodeIdx,
-        sw: NodeIdx,
-        se: NodeIdx,
-        steps: u64,
-    ) -> NodeIdx {
-        let [nw, ne, sw, se] = [nw, ne, sw, se].map(|x| self.mem.get(x).leaf_cells());
-
-        let mut src = [0; 16];
-        for i in 0..8 {
-            src[i] = u16::from_le_bytes([nw[i], ne[i]]);
-            src[i + 8] = u16::from_le_bytes([sw[i], se[i]]);
+    for t in 1..=steps as usize {
+        for y in t..16 - t {
+            dst[y] = update_row(src[y - 1], src[y], src[y + 1]);
         }
-        let mut dst = [0; 16];
+        std::mem::swap(&mut src, &mut dst);
+    }
 
-        for t in 1..=steps as usize {
-            for y in t..16 - t {
-                dst[y] = Self::update_row(src[y - 1], src[y], src[y + 1]);
-            }
-            std::mem::swap(&mut src, &mut dst);
+    let arr: [u16; 8] = src[4..12].try_into().unwrap();
+    mem.find_or_create_leaf_from_u64(u64::from_le_bytes(arr.map(|x| (x >> 4) as u8)))
+}
+
+/// Create 9 overlapping children from a 2x2 block of nodes.
+///
+/// ```text
+/// Input: 2×2 block         Output: 9 overlapping children
+/// ┌─────┬─────┐            ┌─────┬─────┬─────┐
+/// │ NW  │ NE  │            │  0  │  1  │  2  │
+/// │     │     │            │(NW) │(mid)│(NE) │
+/// ├─────┼─────┤            ├─────┼─────┼─────┤
+/// │ SW  │ SE  │            │  3  │  4  │  5  │
+/// │     │     │            │(mid)│(ctr)│(mid)│
+/// └─────┴─────┘            ├─────┼─────┼─────┤
+///                          │  6  │  7  │  8  │
+///                          │(SW) │(mid)│(SE) │
+///                          └─────┴─────┴─────┘
+///
+/// Children 0,2,6,8 are the original input nodes.
+/// Children 1,3,5,7 are formed from overlapping edges.
+/// Child 4 is formed from the center where all four inputs meet.
+/// ```
+pub(super) fn nine_children_overlapping<Meta: Default + Sync>(
+    mem: &impl NodeAccess<Meta>,
+    nw: Idx,
+    ne: Idx,
+    sw: Idx,
+    se: Idx,
+) -> [Idx; 9] {
+    let [nw_, ne_, sw_, se_] = [nw, ne, sw, se].map(|x| mem.get(x));
+    [
+        nw,
+        mem.find_or_create_node(nw_.ne, ne_.nw, nw_.se, ne_.sw),
+        ne,
+        mem.find_or_create_node(nw_.sw, nw_.se, sw_.nw, sw_.ne),
+        mem.find_or_create_node(nw_.se, ne_.sw, sw_.ne, se_.nw),
+        mem.find_or_create_node(ne_.sw, ne_.se, se_.nw, se_.ne),
+        sw,
+        mem.find_or_create_node(sw_.ne, se_.nw, sw_.se, se_.sw),
+        se,
+    ]
+}
+
+/// Create 9 non-overlapping children from a 2x2 block of nodes.
+///
+/// ```text
+/// Input: 2×2 block          Each input node has 4 children:
+/// ┌──────┬──────┐           ┌───┬───┐
+/// │  NW  │  NE  │           │nw │ne │
+/// │      │      │           ├───┼───┤
+/// ├──────┼──────┤           │sw │se │
+/// │  SW  │  SE  │           └───┴───┘
+/// │      │      │
+/// └──────┴──────┘
+///
+/// Output: 9 non-overlapping children formed from centers:
+/// ┌─────┬─────┬─────┐
+/// │  0  │  1  │  2  │  ← 0: from NW's children, 1: from NW+NE, 2: from NE's children
+/// ├─────┼─────┼─────┤
+/// │  3  │  4  │  5  │  ← 3: from NW+SW, 4: from all four, 5: from NE+SE
+/// ├─────┼─────┼─────┤
+/// │  6  │  7  │  8  │  ← 6: from SW's children, 7: from SW+SE, 8: from SE's children
+/// └─────┴─────┴─────┘
+///
+/// Each output is formed by taking center regions from the input nodes' children.
+/// ```
+pub(super) fn nine_children_disjoint<Meta: Default + Sync>(
+    mem: &impl NodeAccess<Meta>,
+    nw: Idx,
+    ne: Idx,
+    sw: Idx,
+    se: Idx,
+    size_log2: u32,
+) -> [Idx; 9] {
+    let [
+        [nwnw, nwne, nwsw, nwse],
+        [nenw, nene, nesw, nese],
+        [swnw, swne, swsw, swse],
+        [senw, sene, sesw, sese],
+    ] = [nw, ne, sw, se].map(|x| mem.get(x).parts().map(|y| mem.get(y)));
+
+    [
+        [nwnw, nwne, nwsw, nwse],
+        [nwne, nenw, nwse, nesw],
+        [nenw, nene, nesw, nese],
+        [nwsw, nwse, swnw, swne],
+        [nwse, nesw, swne, senw],
+        [nesw, nese, senw, sene],
+        [swnw, swne, swsw, swse],
+        [swne, senw, swse, sesw],
+        [senw, sene, sesw, sese],
+    ]
+    .map(|[nw, ne, sw, se]| {
+        if size_log2 >= LEAF_SIZE_LOG2 + 2 {
+            mem.find_or_create_node(nw.se, ne.sw, sw.ne, se.nw)
+        } else {
+            mem.find_or_create_leaf_from_parts(
+                nw.leaf_se(),
+                ne.leaf_sw(),
+                sw.leaf_ne(),
+                se.leaf_nw(),
+            )
         }
+    })
+}
 
-        let arr: [u16; 8] = src[4..12].try_into().unwrap();
-        self.mem
-            .find_or_create_leaf_from_u64(u64::from_le_bytes(arr.map(|x| (x >> 4) as u8)))
-    }
+/// Combine 9 overlapping children into 4 final children.
+///
+/// ```text
+/// Input:           Output:
+/// ┌───┬───┬───┐    ┌─────┬─────┐
+/// │ 0 │ 1 │ 2 │    │  A  │  B  │
+/// ├───┼───┼───┤    │     │     │
+/// │ 3 │ 4 │ 5 │    ├─────┼─────┤
+/// ├───┼───┼───┤    │  C  │  D  │
+/// │ 6 │ 7 │ 8 │    │     │     │
+/// └───┴───┴───┘    └─────┴─────┘
+///
+/// A = combine(0,1,3,4)
+/// B = combine(1,2,4,5)
+/// C = combine(3,4,6,7)
+/// D = combine(4,5,7,8)
+/// ```
+pub(super) fn four_children_overlapping<Meta: Default + Sync>(
+    mem: &impl NodeAccess<Meta>,
+    arr: &[Idx; 9],
+) -> [Idx; 4] {
+    [
+        mem.find_or_create_node(arr[0], arr[1], arr[3], arr[4]),
+        mem.find_or_create_node(arr[1], arr[2], arr[4], arr[5]),
+        mem.find_or_create_node(arr[3], arr[4], arr[6], arr[7]),
+        mem.find_or_create_node(arr[4], arr[5], arr[7], arr[8]),
+    ]
+}
 
-    pub(super) fn nine_children_overlapping(
-        &self,
-        nw: NodeIdx,
-        ne: NodeIdx,
-        sw: NodeIdx,
-        se: NodeIdx,
-    ) -> [NodeIdx; 9] {
-        let [nw_, ne_, sw_, se_] = [nw, ne, sw, se].map(|x| self.mem.get(x));
-        [
-            nw,
-            self.mem.find_or_create_node(nw_.ne, ne_.nw, nw_.se, ne_.sw),
-            ne,
-            self.mem.find_or_create_node(nw_.sw, nw_.se, sw_.nw, sw_.ne),
-            self.mem.find_or_create_node(nw_.se, ne_.sw, sw_.ne, se_.nw),
-            self.mem.find_or_create_node(ne_.sw, ne_.se, se_.nw, se_.ne),
-            sw,
-            self.mem.find_or_create_node(sw_.ne, se_.nw, sw_.se, se_.sw),
-            se,
-        ]
-    }
+// ---------------------------------------------------------------------------
 
-    pub(super) fn nine_children_disjoint(
-        &self,
-        nw: NodeIdx,
-        ne: NodeIdx,
-        sw: NodeIdx,
-        se: NodeIdx,
-        size_log2: u32,
-    ) -> [NodeIdx; 9] {
-        let [
-            [nwnw, nwne, nwsw, nwse],
-            [nenw, nene, nesw, nese],
-            [swnw, swne, swsw, swse],
-            [senw, sene, sesw, sese],
-        ] = [nw, ne, sw, se].map(|x| self.mem.get(x).parts().map(|y| self.mem.get(y)));
-
-        [
-            [nwnw, nwne, nwsw, nwse],
-            [nwne, nenw, nwse, nesw],
-            [nenw, nene, nesw, nese],
-            [nwsw, nwse, swnw, swne],
-            [nwse, nesw, swne, senw],
-            [nesw, nese, senw, sene],
-            [swnw, swne, swsw, swse],
-            [swne, senw, swse, sesw],
-            [senw, sene, sesw, sese],
-        ]
-        .map(|[nw, ne, sw, se]| {
-            if size_log2 >= LEAF_SIZE_LOG2 + 2 {
-                self.mem.find_or_create_node(nw.se, ne.sw, sw.ne, se.nw)
-            } else {
-                self.mem.find_or_create_leaf_from_parts(
-                    nw.leaf_se(),
-                    ne.leaf_sw(),
-                    sw.leaf_ne(),
-                    se.leaf_nw(),
-                )
-            }
-        })
-    }
-
-    pub(super) fn four_children_overlapping(&self, arr: &[NodeIdx; 9]) -> [NodeIdx; 4] {
-        [
-            self.mem.find_or_create_node(arr[0], arr[1], arr[3], arr[4]),
-            self.mem.find_or_create_node(arr[1], arr[2], arr[4], arr[5]),
-            self.mem.find_or_create_node(arr[3], arr[4], arr[6], arr[7]),
-            self.mem.find_or_create_node(arr[4], arr[5], arr[7], arr[8]),
-        ]
-    }
-
-    fn update_inner_sync(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
+impl<Meta: Default + Sync> HashLifeEngine<Meta> {
+    fn update_inner_sync(&self, node: Idx, size_log2: u32) -> Idx {
         let n = self.mem.get(node);
         let generations_log2 = self.generations_per_update_log2.unwrap();
         let both_stages = generations_log2 + 2 >= size_log2;
@@ -177,19 +252,19 @@ impl<Extra: Default + Sync> HashLifeEngine<Extra> {
             } else {
                 1 << generations_log2
             };
-            self.update_leaves(n.nw, n.ne, n.sw, n.se, steps)
+            update_leaves(&self.mem, n.nw, n.ne, n.sw, n.se, steps)
         } else {
             let mut arr9;
             if both_stages {
-                arr9 = self.nine_children_overlapping(n.nw, n.ne, n.sw, n.se);
+                arr9 = nine_children_overlapping(&self.mem, n.nw, n.ne, n.sw, n.se);
                 for x in arr9.iter_mut() {
                     *x = self.update_node_sync(*x, size_log2 - 1);
                 }
             } else {
-                arr9 = self.nine_children_disjoint(n.nw, n.ne, n.sw, n.se, size_log2 - 1);
+                arr9 = nine_children_disjoint(&self.mem, n.nw, n.ne, n.sw, n.se, size_log2 - 1);
             }
 
-            let mut arr4 = self.four_children_overlapping(&arr9);
+            let mut arr4 = four_children_overlapping(&self.mem, &arr9);
             for x in arr4.iter_mut() {
                 *x = self.update_node_sync(*x, size_log2 - 1);
             }
@@ -199,11 +274,11 @@ impl<Extra: Default + Sync> HashLifeEngine<Extra> {
         }
     }
 
-    pub(super) fn update_node_sync(&self, node: NodeIdx, size_log2: u32) -> NodeIdx {
+    pub(super) fn update_node_sync(&self, node: Idx, size_log2: u32) -> Idx {
         let n = self.mem.get(node);
         let status = n.status.load(Ordering::Acquire);
         if status == status::FINISHED {
-            return n.cache.get_node_idx();
+            return n.cache.get_value();
         }
 
         if status == status::NOT_STARTED
@@ -217,24 +292,24 @@ impl<Extra: Default + Sync> HashLifeEngine<Extra> {
                 .is_ok()
         {
             let cache = self.update_inner_sync(node, size_log2);
-            n.cache.set_node_idx(cache);
+            n.cache.set_value(cache);
             n.status.store(status::FINISHED, Ordering::Release);
             cache
         } else {
             while n.status.load(Ordering::Acquire) != status::FINISHED {
                 // if ExecutionStatistics::is_poisoned() {
-                //     return NodeIdx::default();
+                //     return Idx::default();
                 // }
                 hint::spin_loop();
             }
-            n.cache.get_node_idx()
+            n.cache.get_value()
         }
     }
 
     /// Add a frame around the field: if `self.topology` is Unbounded, frame is blank,
     /// and if `self.topology` is Torus, frame mirrors the field.
     /// The field becomes two times bigger.
-    pub(super) fn with_frame(&mut self, idx: NodeIdx, size_log2: u32) -> NodeIdx {
+    pub(super) fn with_frame(&mut self, idx: Idx, size_log2: u32) -> Idx {
         let n = self.mem.get(idx);
         let b = self.blank_nodes.get_mut(size_log2 - 1, &self.mem);
         let [nw, ne, sw, se] = match self.topology {
@@ -250,7 +325,7 @@ impl<Extra: Default + Sync> HashLifeEngine<Extra> {
     }
 
     /// Remove a frame around the field, making it two times smaller.
-    pub(super) fn without_frame(&self, idx: NodeIdx) -> NodeIdx {
+    pub(super) fn without_frame(&self, idx: Idx) -> Idx {
         let [nw, ne, sw, se] = self.mem.get(idx).parts().map(|x| self.mem.get(x));
         self.mem.find_or_create_node(nw.se, ne.sw, sw.ne, se.nw)
     }
@@ -292,9 +367,9 @@ impl<Extra: Default + Sync> HashLifeEngine<Extra> {
     fn init_pattern_recursive(
         idx: u32,
         pattern: &Pattern,
-        mem: &NodeStore<Extra>,
-        cache: &mut HashMap<u32, NodeIdx>,
-    ) -> NodeIdx {
+        mem: &NodeStore<Meta>,
+        cache: &mut HashMap<u32, Idx>,
+    ) -> Idx {
         if let Some(&cached) = cache.get(&idx) {
             return cached;
         }
@@ -325,10 +400,10 @@ impl<Extra: Default + Sync> HashLifeEngine<Extra> {
     }
 }
 
-impl<Extra: Default + Sync> GoLEngine for HashLifeEngine<Extra> {
+impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
     fn new(mem_limit_mib: u32, threads_cnt: usize) -> Self {
         let nodes =
-            ((mem_limit_mib as u64) << 20) / std::mem::size_of::<QuadTreeNode<Extra>>() as u64;
+            ((mem_limit_mib as u64) << 20) / std::mem::size_of::<QuadTreeNode<Meta>>() as u64;
         // previous power of two
         let cap_log2 = (nodes / 2 + 1)
             .checked_next_power_of_two()
@@ -355,12 +430,12 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngine<Extra> {
     }
 
     fn current_state(&self) -> Pattern {
-        fn inner<Extra: Default + Sync>(
-            idx: NodeIdx,
+        fn inner<Meta: Default + Sync>(
+            idx: Idx,
             size_log2: u32,
-            mem: &NodeStore<Extra>,
+            mem: &NodeStore<Meta>,
             pattern: &mut Pattern,
-            cache: &mut HashMap<NodeIdx, u32>,
+            cache: &mut HashMap<Idx, u32>,
         ) -> u32 {
             if let Some(&cached) = cache.get(&idx) {
                 return cached;

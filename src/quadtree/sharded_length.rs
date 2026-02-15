@@ -54,7 +54,8 @@ pub(super) struct LengthShard<'a> {
 
 impl<'a> LengthShard<'a> {
     pub(super) fn increment(&self) {
-        if self.local.fetch_add(1, Ordering::Relaxed) + 1 == FLUSH_THRESHOLD {
+        let new_value = self.local.fetch_add(1, Ordering::Relaxed) + 1;
+        if new_value == FLUSH_THRESHOLD {
             self.local.store(0, Ordering::Relaxed);
             self.global.fetch_add(FLUSH_THRESHOLD, Ordering::Relaxed);
         }
