@@ -383,6 +383,8 @@ impl GoLEngine for StreamLifeEngineAsync {
     fn new(mem_limit_mib: u32, threads_cnt: usize) -> Self {
         let nodes = ((mem_limit_mib as u64) << 20)
             / (std::mem::size_of::<QuadTreeNode<u64>>() + std::mem::size_of::<CacheEntry>()) as u64;
+        println!("QuadTreeNode size: {}", std::mem::size_of::<QuadTreeNode<u64>>());
+        println!("CacheEntry size: {}", std::mem::size_of::<CacheEntry>());
         // previous power of two
         let cap_log2 = (nodes / 2 + 1)
             .checked_next_power_of_two()
