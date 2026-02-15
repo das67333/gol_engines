@@ -117,6 +117,7 @@ impl<'a> StreamLifeExecutor<'a> {
         });
 
         assert!(is_finished(root_status));
+        println!("(?) Nodes count: {}", self.engine.base.mem.len());
         unsafe { (*root_entry).get_value() }
     }
 }
