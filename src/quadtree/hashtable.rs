@@ -78,6 +78,9 @@ impl<V: Copy> CacheField<V> {
         unsafe { (*self.0.get()).value = v }
     }
 
+    /// # Safety (interior mutability)
+    /// The status state machine guarantees only one thread accesses this at a time.
+    #[allow(clippy::mut_from_ref)]
     pub(super) fn get_ref<T>(&self) -> &mut T {
         unsafe { &mut *((*self.0.get()).ptr as *mut T) }
     }

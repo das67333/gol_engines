@@ -930,10 +930,8 @@ impl Pattern {
                 return x;
             }
             // if node is blank
-            if let Some(x) = this.kiv.find_blank_node(size_log2) {
-                if x == idx {
-                    return 0;
-                }
+            if this.kiv.find_blank_node(size_log2) == Some(idx) {
+                return 0;
             }
 
             match *this.get_node(idx) {
@@ -972,10 +970,8 @@ impl Pattern {
             codes.len()
         }
 
-        if let Some(x) = self.kiv.find_blank_node(self.size_log2) {
-            if x == self.root {
-                return Err(anyhow!("Cannot serialize blank pattern"));
-            }
+        if self.kiv.find_blank_node(self.size_log2) == Some(self.root) {
+            return Err(anyhow!("Cannot serialize blank pattern"));
         }
 
         let mut codes = HashMap::new();

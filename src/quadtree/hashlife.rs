@@ -189,10 +189,8 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
     }
 
     fn update(&mut self, generations_log2: u32) -> Result<[BigInt; 2]> {
-        if let Some(cached_generations_log2) = self.generations_per_update_log2 {
-            if cached_generations_log2 != generations_log2 {
-                self.run_gc();
-            }
+        if self.generations_per_update_log2 != Some(generations_log2) {
+            self.run_gc();
         }
         let backup = self.current_state();
         self.generations_per_update_log2 = Some(generations_log2);
