@@ -1,10 +1,10 @@
 use super::{
     LEAF_SIZE_LOG2,
+    executor::Executor,
     hashlife::{HashLifeEngine, update_leaves},
     hashtable::{BinodeCache, CacheEntry, Idx},
     node::QuadTreeNode,
     status,
-    streamlife_executor::StreamLifeExecutor,
 };
 use crate::{GoLEngine, Pattern, Topology};
 use anyhow::{Result, anyhow};
@@ -82,7 +82,7 @@ impl StreamLifeEngine {
     }
 
     /// Compute lane descriptors for a node. Thread-safe (uses CAS on `status_extra`).
-    fn node2lanes(&self, idx: Idx, size_log2: u32) -> u64 {
+    pub(super) fn node2lanes(&self, idx: Idx, size_log2: u32) -> u64 {
         if idx == self.base.blank_nodes.get(size_log2) {
             // blank node
             return 0xffff;
@@ -283,7 +283,7 @@ impl StreamLifeEngine {
     }
 
     /// Merge two non-overlapping universes into a single node. Thread-safe.
-    fn merge_universes(&self, idx: (Idx, Idx), size_log2: u32) -> Idx {
+    pub(super) fn merge_universes(&self, idx: (Idx, Idx), size_log2: u32) -> Idx {
         let b = self.base.blank_nodes.get(size_log2);
         if idx.1 == b {
             return idx.0;
@@ -309,7 +309,8 @@ impl StreamLifeEngine {
     }
 
     /// Compute solitonic case: two non-interacting universes updated independently.
-    /// Used by the parallel executor for the fast-path.
+    /// Reference implementation; the executor handles this path asynchronously.
+    #[allow(dead_code)]
     pub(super) fn compute_solitonic(&self, idx: (Idx, Idx), size_log2: u32) -> (Idx, Idx) {
         let i1 = self.base.update_node_sync(idx.0, size_log2);
         let i2 = self.base.update_node_sync(idx.1, size_log2);
@@ -326,7 +327,8 @@ impl StreamLifeEngine {
     }
 
     /// Compute base case: merge universes and run standard HashLife.
-    /// Used by the parallel executor for the smallest recursive level.
+    /// Reference implementation; the executor handles this path asynchronously.
+    #[allow(dead_code)]
     pub(super) fn compute_base_case(&self, idx: (Idx, Idx), size_log2: u32) -> (Idx, Idx) {
         let hnode2 = self.merge_universes(idx, size_log2);
         let i3 = self.base.update_node_sync(hnode2, size_log2);
@@ -416,7 +418,8 @@ impl GoLEngine for StreamLifeEngine {
         ));
 
         let biroot = if let Some(x) =
-            StreamLifeExecutor::new(self, biroot, self.base.size_log2).run(self.base.threads_cnt)
+            Executor::new_streamlife(self, biroot, self.base.size_log2)
+                .run_streamlife(self.base.threads_cnt)
         {
             x
         } else {
