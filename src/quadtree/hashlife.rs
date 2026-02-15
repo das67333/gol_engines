@@ -2,7 +2,7 @@ use super::{
     LEAF_SIZE_LOG2, LEAF_SIZE,
     blank::BlankNodes,
     hashlife_executor::HashLifeExecutor,
-    memory::MemoryManager,
+    node_store::NodeStore,
     node::{NodeIdx, QuadTreeNode},
     status,
 };
@@ -14,19 +14,19 @@ use std::{hint, sync::atomic::Ordering};
 
 /// Parallel implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife).
 ///
-/// Like [HashLifeEngineSync], it stores nodes in a single pre-allocated
-/// open-addressing hashtable with linear probing, and the hashtable never grows.
-pub struct HashLifeEngineAsync<Extra> {
+/// Stores nodes in a single pre-allocated open-addressing hashtable with
+/// linear probing, and the hashtable never grows.
+pub struct HashLifeEngine<Extra> {
     pub(super) size_log2: u32,
     pub(super) root: NodeIdx,
-    pub(super) mem: MemoryManager<Extra>,
+    pub(super) mem: NodeStore<Extra>,
     pub(super) generations_per_update_log2: Option<u32>,
     pub(super) topology: Topology,
     pub(super) blank_nodes: BlankNodes,
     pub(super) threads_cnt: usize,
 }
 
-impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
+impl<Extra: Default + Sync> HashLifeEngine<Extra> {
     fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {
         let b = row_prev;
         let a = b << 1;
@@ -292,7 +292,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
     fn init_pattern_recursive(
         idx: u32,
         pattern: &Pattern,
-        mem: &MemoryManager<Extra>,
+        mem: &NodeStore<Extra>,
         cache: &mut HashMap<u32, NodeIdx>,
     ) -> NodeIdx {
         if let Some(&cached) = cache.get(&idx) {
@@ -312,7 +312,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
     }
 
     pub(super) fn with_capacity(cap_log2: u32, threads_cnt: usize) -> Self {
-        let mem = MemoryManager::new(cap_log2, threads_cnt);
+        let mem = NodeStore::new(cap_log2, threads_cnt);
         Self {
             size_log2: LEAF_SIZE_LOG2,
             root: mem.find_or_create_leaf_from_u64(0),
@@ -325,7 +325,7 @@ impl<Extra: Default + Sync> HashLifeEngineAsync<Extra> {
     }
 }
 
-impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
+impl<Extra: Default + Sync> GoLEngine for HashLifeEngine<Extra> {
     fn new(mem_limit_mib: u32, threads_cnt: usize) -> Self {
         let nodes =
             ((mem_limit_mib as u64) << 20) / std::mem::size_of::<QuadTreeNode<Extra>>() as u64;
@@ -358,7 +358,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         fn inner<Extra: Default + Sync>(
             idx: NodeIdx,
             size_log2: u32,
-            mem: &MemoryManager<Extra>,
+            mem: &NodeStore<Extra>,
             pattern: &mut Pattern,
             cache: &mut HashMap<NodeIdx, u32>,
         ) -> u32 {
@@ -422,7 +422,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
         } else {
             self.load_pattern(&backup, self.topology)?;
             return Err(anyhow!(
-                "HashLifeAsync: overfilled MemoryManager, try smaller step"
+                "HashLifeAsync: overfilled NodeStore, try smaller step"
             ));
         };
 
@@ -471,7 +471,7 @@ mod tests {
     fn test_pattern_roundtrip() {
         for size_log2 in 3..10 {
             let original = Pattern::random(size_log2, Some(SEED)).unwrap();
-            let mut engine = HashLifeEngineAsync::<()>::new(1, 1);
+            let mut engine = HashLifeEngine::<()>::new(1, 1);
             engine.load_pattern(&original, Topology::Unbounded).unwrap();
             let converted = engine.current_state();
 

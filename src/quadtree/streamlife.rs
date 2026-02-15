@@ -1,9 +1,9 @@
 use super::{
     LEAF_SIZE_LOG2,
-    hashlife::HashLifeEngineAsync,
+    binode_cache::{BinodeCache, CacheEntry},
+    hashlife::HashLifeEngine,
     node::{NodeIdx, QuadTreeNode},
     status,
-    streamlife_cache::{CacheEntry, StreamLifeCache},
     streamlife_executor::StreamLifeExecutor,
 };
 use crate::{GoLEngine, Pattern, Topology};
@@ -11,21 +11,20 @@ use anyhow::Result;
 use num_bigint::BigInt;
 use std::{hint::spin_loop, sync::atomic::Ordering};
 
-type MemoryManager = super::memory::MemoryManager<u64>;
+type NodeStore = super::node_store::NodeStore<u64>;
 
 /// Implementation of [StreamLife algorithm](https://conwaylife.com/wiki/StreamLife).
 ///
-/// It is build on top of [HashLifeEngineAsync]. Unlike [StreamLifeEngineSmall]
-/// and [StreamLifeEngineSync], it uses a static hashtable for caching results of
-/// `update_binode` function.
-pub struct StreamLifeEngineAsync {
-    pub(super) base: HashLifeEngineAsync<u64>,
+/// Built on top of [`HashLifeEngine`]. Uses a static hashtable for caching
+/// results of `update_binode` function.
+pub struct StreamLifeEngine {
+    pub(super) base: HashLifeEngine<u64>,
     // streamlife-specific
     biroot: Option<(NodeIdx, NodeIdx)>,
-    pub(super) bicache: StreamLifeCache,
+    pub(super) bicache: BinodeCache,
 }
 
-impl StreamLifeEngineAsync {
+impl StreamLifeEngine {
     fn determine_direction(&self, nw: NodeIdx, ne: NodeIdx, sw: NodeIdx, se: NodeIdx) -> u64 {
         let m = self.base.update_leaves(nw, ne, sw, se, 4);
         let centre = u64::from_le_bytes(self.base.mem.get(m).leaf_cells());
@@ -179,7 +178,7 @@ impl StreamLifeEngineAsync {
             let cl = [tlx[2], tlx[3], blx[0], blx[1]];
             let cr = [trx[2], trx[3], brx[0], brx[1]];
 
-            let prepared = |mem: &MemoryManager, x: &[u64; 4]| {
+            let prepared = |mem: &NodeStore, x: &[u64; 4]| {
                 let nw = mem.find_or_create_leaf_from_u64(x[0]);
                 let ne = mem.find_or_create_leaf_from_u64(x[1]);
                 let sw = mem.find_or_create_leaf_from_u64(x[2]);
@@ -202,7 +201,7 @@ impl StreamLifeEngineAsync {
             let cl = [pptr_tl.sw, pptr_tl.se, pptr_bl.nw, pptr_bl.ne];
             let cr = [pptr_tr.sw, pptr_tr.se, pptr_br.nw, pptr_br.ne];
 
-            let prepared = |mem: &MemoryManager, x: &[NodeIdx; 4]| {
+            let prepared = |mem: &NodeStore, x: &[NodeIdx; 4]| {
                 mem.find_or_create_node(x[0], x[1], x[2], x[3])
             };
 
@@ -379,7 +378,7 @@ impl StreamLifeEngineAsync {
     }
 }
 
-impl GoLEngine for StreamLifeEngineAsync {
+impl GoLEngine for StreamLifeEngine {
     fn new(mem_limit_mib: u32, threads_cnt: usize) -> Self {
         let nodes = ((mem_limit_mib as u64) << 20)
             / (std::mem::size_of::<QuadTreeNode<u64>>() + std::mem::size_of::<CacheEntry>()) as u64;
@@ -389,9 +388,9 @@ impl GoLEngine for StreamLifeEngineAsync {
             .unwrap()
             .trailing_zeros();
         Self {
-            base: HashLifeEngineAsync::<u64>::with_capacity(cap_log2, threads_cnt),
+            base: HashLifeEngine::<u64>::with_capacity(cap_log2, threads_cnt),
             biroot: None,
-            bicache: StreamLifeCache::new(cap_log2, threads_cnt),
+            bicache: BinodeCache::new(cap_log2, threads_cnt),
         }
     }
 
@@ -434,7 +433,7 @@ impl GoLEngine for StreamLifeEngineAsync {
         // if ExecutionStatistics::is_poisoned() {
         //     self.load_pattern(&backup, self.base.topology)?;
         //     return Err(anyhow!(
-        //         "StreamLifeAsync: overfilled MemoryManager, try smaller step"
+        //         "StreamLifeAsync: overfilled NodeStore, try smaller step"
         //     ));
         // }
 
@@ -480,7 +479,7 @@ mod tests {
     fn test_pattern_roundtrip() {
         for size_log2 in 3..10 {
             let original = Pattern::random(size_log2, Some(SEED)).unwrap();
-            let mut engine = StreamLifeEngineAsync::new(1, 1);
+            let mut engine = StreamLifeEngine::new(1, 1);
             engine.load_pattern(&original, Topology::Unbounded).unwrap();
             let converted = engine.current_state();
 

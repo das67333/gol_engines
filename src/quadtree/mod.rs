@@ -1,11 +1,11 @@
+mod binode_cache;
 mod blank;
 mod hashlife;
 mod hashlife_executor;
-mod memory;
 mod node;
+mod node_store;
 mod sharded_length;
 mod streamlife;
-mod streamlife_cache;
 mod streamlife_executor;
 
 const LEAF_SIZE: u64 = 8;
@@ -18,5 +18,5 @@ mod status {
     pub(super) const FINISHED: u8 = 3;
 }
 
-pub use streamlife::StreamLifeEngineAsync;
-pub type HashLifeEngineAsync = hashlife::HashLifeEngineAsync<()>;
+pub use streamlife::StreamLifeEngine;
+pub type HashLifeEngine = hashlife::HashLifeEngine<()>;

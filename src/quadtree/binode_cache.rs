@@ -1,5 +1,5 @@
 use super::{
-    memory::{ConcurrentHashTable, HashtableSlot, FLAG_USED},
+    node_store::{ConcurrentHashTable, HashtableSlot, FLAG_USED},
     node::NodeIdx,
     sharded_length::LengthShard,
 };
@@ -86,12 +86,12 @@ impl CacheEntry {
     }
 }
 
-pub(super) struct StreamLifeCache {
+pub(super) struct BinodeCache {
     inner: ConcurrentHashTable<CacheEntry>,
     hasher: ahash::AHasher,
 }
 
-impl StreamLifeCache {
+impl BinodeCache {
     pub(super) fn new(cap_log2: u32, threads_cnt: usize) -> Self {
         Self {
             inner: ConcurrentHashTable::new(cap_log2, threads_cnt),
@@ -136,8 +136,8 @@ impl StreamLifeCache {
     }
 
     /// Create a per-thread reference with sharded length counting.
-    pub(super) fn create_ref(&self, shard_idx: usize) -> StreamLifeCacheRef<'_> {
-        StreamLifeCacheRef {
+    pub(super) fn create_ref(&self, shard_idx: usize) -> BinodeCacheRef<'_> {
+        BinodeCacheRef {
             base: self,
             length_shard: self.inner.get_shard(shard_idx),
         }
@@ -156,13 +156,13 @@ impl StreamLifeCache {
     }
 }
 
-/// A per-thread reference to the StreamLifeCache that uses local sharding for length tracking.
-pub(super) struct StreamLifeCacheRef<'a> {
-    base: &'a StreamLifeCache,
+/// A per-thread reference to the BinodeCache that uses local sharding for length tracking.
+pub(super) struct BinodeCacheRef<'a> {
+    base: &'a BinodeCache,
     length_shard: LengthShard<'a>,
 }
 
-impl<'a> StreamLifeCacheRef<'a> {
+impl<'a> BinodeCacheRef<'a> {
     /// Find or create a cache entry for the given binode key.
     /// Returns the index of the entry in the hash table.
     /// Uses the per-thread sharded length counter.

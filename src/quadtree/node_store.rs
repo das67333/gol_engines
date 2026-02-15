@@ -166,17 +166,17 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
 }
 
 // ---------------------------------------------------------------------------
-// MemoryManager: wraps ConcurrentHashTable<QuadTreeNode<Extra>>
+// NodeStore: wraps ConcurrentHashTable<QuadTreeNode<Extra>>
 // ---------------------------------------------------------------------------
 
 /// Stores the nodes of the quadtree.
-pub(super) struct MemoryManager<Extra> {
+pub(super) struct NodeStore<Extra> {
     inner: ConcurrentHashTable<QuadTreeNode<Extra>>,
 }
 
-unsafe impl<Extra: Sync> Sync for MemoryManager<Extra> {}
+unsafe impl<Extra: Sync> Sync for NodeStore<Extra> {}
 
-impl<Extra: Default + Sync> MemoryManager<Extra> {
+impl<Extra: Default + Sync> NodeStore<Extra> {
     /// Create a new memory manager with capacity of `1 << cap_log2`.
     pub(super) fn new(cap_log2: u32, threads_cnt: usize) -> Self {
         Self {
@@ -308,8 +308,8 @@ impl<Extra: Default + Sync> MemoryManager<Extra> {
     }
 
     /// Create a per-thread reference to this memory manager.
-    pub(super) fn create_ref(&self, shard_idx: usize) -> MemoryManagerRef<'_, Extra> {
-        MemoryManagerRef {
+    pub(super) fn create_ref(&self, shard_idx: usize) -> NodeStoreRef<'_, Extra> {
+        NodeStoreRef {
             base: self,
             length_shard: self.inner.get_shard(shard_idx),
         }
@@ -343,12 +343,12 @@ fn compute_hash(nw: NodeIdx, ne: NodeIdx, sw: NodeIdx, se: NodeIdx) -> usize {
 }
 
 /// A per-thread reference to the memory manager that uses local sharding for length tracking.
-pub(super) struct MemoryManagerRef<'a, Extra> {
-    base: &'a MemoryManager<Extra>,
+pub(super) struct NodeStoreRef<'a, Extra> {
+    base: &'a NodeStore<Extra>,
     length_shard: LengthShard<'a>,
 }
 
-impl<'a, Extra: Default + Sync> MemoryManagerRef<'a, Extra> {
+impl<'a, Extra: Default + Sync> NodeStoreRef<'a, Extra> {
     /// Get a const reference to the node at the given index.
     pub(super) fn get(&self, idx: NodeIdx) -> &QuadTreeNode<Extra> {
         self.base.get(idx)

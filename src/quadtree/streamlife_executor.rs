@@ -2,11 +2,11 @@
 //!
 //! Work-stealing parallel executor for the StreamLife algorithm's `update_binode` operation.
 //! Follows the same architecture as `hashlife_executor`, but operates on pairs of nodes
-//! `(NodeIdx, NodeIdx)` with state tracked in `StreamLifeCache`'s `CacheEntry`.
+//! `(NodeIdx, NodeIdx)` with state tracked in `BinodeCache`'s `CacheEntry`.
 //!
 //! ## Differences from HashLife Executor
 //!
-//! - Tasks are identified by `u32` indices into the `StreamLifeCache` (binode pairs)
+//! - Tasks are identified by `u32` indices into the `BinodeCache` (binode pairs)
 //! - Processing data (`BiProcessingData`) is stored in the cache entry's payload union
 //! - Solitonic and base cases are computed synchronously via `update_node_sync`
 //! - Two parallel arrays (`arr0`, `arr1`) track the two universes
@@ -16,8 +16,8 @@ use super::{
     hashlife_executor::{ProcessingGuard, TaskFetcher, is_finished},
     node::NodeIdx,
     status,
-    streamlife::StreamLifeEngineAsync,
-    streamlife_cache::{StreamLifeCache, StreamLifeCacheRef},
+    binode_cache::{BinodeCache, BinodeCacheRef},
+    streamlife::StreamLifeEngine,
 };
 use crossbeam::deque::{Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
@@ -30,7 +30,7 @@ use std::{
 /// A unit of work representing a binode pair to be processed.
 #[derive(Clone, Copy)]
 struct BiTask {
-    /// Index into the StreamLifeCache for this binode pair.
+    /// Index into the BinodeCache for this binode pair.
     entry_idx: u32,
     /// Size (log2) of the nodes in this pair.
     size_log2: u32,
@@ -59,14 +59,14 @@ struct BiProcessingData {
 
 /// Parallel executor for StreamLife's `update_binode` using work-stealing.
 pub(super) struct StreamLifeExecutor<'a> {
-    engine: &'a StreamLifeEngineAsync,
+    engine: &'a StreamLifeEngine,
     biroot: (NodeIdx, NodeIdx),
     size_log2: u32,
 }
 
 impl<'a> StreamLifeExecutor<'a> {
     pub(super) fn new(
-        engine: &'a StreamLifeEngineAsync,
+        engine: &'a StreamLifeEngine,
         biroot: (NodeIdx, NodeIdx),
         size_log2: u32,
     ) -> Self {
@@ -128,8 +128,8 @@ impl<'a> StreamLifeExecutor<'a> {
 
 /// Per-thread worker for the StreamLife parallel executor.
 struct BiExecutorThread<'a> {
-    engine: &'a StreamLifeEngineAsync,
-    bicache_ref: StreamLifeCacheRef<'a>,
+    engine: &'a StreamLifeEngine,
+    bicache_ref: BinodeCacheRef<'a>,
     root_status: &'a AtomicU8,
     thread_idx: usize,
     queue: Worker<BiTask>,
@@ -375,7 +375,7 @@ impl<'a> BiExecutorThread<'a> {
 /// 2. Allocate and store BiProcessingData
 /// 3. Store PENDING status (entry ready to be processed)
 fn start_processing_entry(
-    bicache: &StreamLifeCache,
+    bicache: &BinodeCache,
     entry_idx: u32,
     dependents: SmallVec<[BiTask; 2]>,
 ) -> bool {
@@ -416,7 +416,7 @@ enum BiDependencyResult {
 ///
 /// The `parent_entry_idx` and `parent_size_log2` identify the parent task that depends on this child.
 fn handle_bi_dependency(
-    bicache: &StreamLifeCache,
+    bicache: &BinodeCache,
     child_idx: u32,
     parent_entry_idx: u32,
     parent_size_log2: u32,

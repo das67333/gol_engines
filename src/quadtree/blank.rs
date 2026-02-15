@@ -1,4 +1,4 @@
-use super::{LEAF_SIZE_LOG2, memory::MemoryManager, node::NodeIdx};
+use super::{LEAF_SIZE_LOG2, node::NodeIdx, node_store::NodeStore};
 
 pub(super) struct BlankNodes {
     data: Vec<NodeIdx>,
@@ -12,7 +12,7 @@ impl BlankNodes {
     pub(super) fn get_mut<Extra: Default + Sync>(
         &mut self,
         size_log2: u32,
-        mem: &MemoryManager<Extra>,
+        mem: &NodeStore<Extra>,
     ) -> NodeIdx {
         let i = (size_log2 - LEAF_SIZE_LOG2) as usize;
         let v = &mut self.data;

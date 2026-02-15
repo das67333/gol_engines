@@ -134,7 +134,7 @@ pub(super) struct QuadTreeNode<Extra> {
     pub(super) cache: PtrOrNodeIdxMut,
     /// Processing status (see hashlife_executor for state machine)
     pub(super) status: AtomicU8,
-    /// Flags are used in [`MemoryManager::find_or_create_inner`]
+    /// Flags are used in [`NodeStore::find_or_create_inner`]
     pub(super) flags: AtomicU8,
     /// Extra data for StreamLife (unused in Hashlife)
     pub(super) extra: UnsafeCell<Extra>,

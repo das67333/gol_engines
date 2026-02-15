@@ -45,8 +45,8 @@
 
 use super::{
     LEAF_SIZE, LEAF_SIZE_LOG2,
-    hashlife::HashLifeEngineAsync,
-    memory::{MemoryManager, MemoryManagerRef},
+    hashlife::HashLifeEngine,
+    node_store::{NodeStore, NodeStoreRef},
     node::{Dependents, NodeIdx, ProcessingData, QuadTreeNode},
     status,
 };
@@ -204,11 +204,11 @@ pub(super) struct HashLifeExecutor<'a, Extra: Default + Sync> {
     root: NodeIdx,
     size_log2: u32,
     generations_log2: u32,
-    mem: &'a MemoryManager<Extra>,
+    mem: &'a NodeStore<Extra>,
 }
 
 impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
-    pub(super) fn new(base: &'a HashLifeEngineAsync<Extra>) -> Self {
+    pub(super) fn new(base: &'a HashLifeEngine<Extra>) -> Self {
         Self {
             root: base.root,
             size_log2: base.size_log2,
@@ -282,7 +282,7 @@ impl<'a, Extra: Default + Sync> HashLifeExecutor<'a, Extra> {
 struct ExecutorThread<'a, Extra: Default + Sync> {
     root_node: &'a QuadTreeNode<Extra>,
     generations_log2: u32,
-    mem: MemoryManagerRef<'a, Extra>,
+    mem: NodeStoreRef<'a, Extra>,
     thread_idx: usize,
     queue: Worker<Task>,
     stealers: &'a [Stealer<Task>],
