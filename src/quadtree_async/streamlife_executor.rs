@@ -6,7 +6,7 @@
 //!
 //! ## Differences from HashLife Executor
 //!
-//! - Tasks are identified by `*mut CacheEntry` (binode pairs) instead of `NodeIdx`
+//! - Tasks are identified by `u32` indices into the `StreamLifeCache` (binode pairs)
 //! - Processing data (`BiProcessingData`) is stored in the cache entry's payload union
 //! - Solitonic and base cases are computed synchronously via `update_node_sync`
 //! - Two parallel arrays (`arr0`, `arr1`) track the two universes
@@ -17,7 +17,7 @@ use super::{
     node::NodeIdx,
     status,
     streamlife::StreamLifeEngineAsync,
-    streamlife_cache::CacheEntry,
+    streamlife_cache::StreamLifeCache,
 };
 use crossbeam::deque::{Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
@@ -28,16 +28,13 @@ use std::{
 };
 
 /// A unit of work representing a binode pair to be processed.
+#[derive(Clone, Copy)]
 struct BiTask {
-    /// Pointer to the cache entry for this binode pair.
-    entry: *mut CacheEntry,
+    /// Index into the StreamLifeCache for this binode pair.
+    entry_idx: u32,
     /// Size (log2) of the nodes in this pair.
     size_log2: u32,
 }
-
-// SAFETY: CacheEntry pointers point into a pre-allocated, non-moving Vec.
-// The executor guarantees entries are accessed according to the status state machine.
-unsafe impl Send for BiTask {}
 
 /// Temporary data allocated during binode processing.
 ///
@@ -81,9 +78,11 @@ impl<'a> StreamLifeExecutor<'a> {
     }
 
     pub(super) fn run(&self, num_threads: usize) -> (NodeIdx, NodeIdx) {
+        let bicache = &self.engine.bicache;
+
         // Look up root entry
-        let root_entry = self.engine.bicache.entry(self.biroot);
-        let root_status = unsafe { &(*root_entry).status };
+        let root_idx = bicache.entry(self.biroot);
+        let root_status = &bicache.get(root_idx).status;
 
         // Create worker queues and stealers
         let mut queues = Vec::with_capacity(num_threads);
@@ -97,9 +96,9 @@ impl<'a> StreamLifeExecutor<'a> {
         }
 
         // Claim root entry and push initial task
-        start_processing_entry(root_entry, smallvec![]);
+        start_processing_entry(bicache, root_idx, smallvec![]);
         queues[0].push(BiTask {
-            entry: root_entry,
+            entry_idx: root_idx,
             size_log2: self.size_log2,
         });
 
@@ -117,8 +116,12 @@ impl<'a> StreamLifeExecutor<'a> {
         });
 
         assert!(is_finished(root_status));
-        println!("(?) Nodes count: {}", self.engine.base.mem.len());
-        unsafe { (*root_entry).get_value() }
+        println!(
+            "(?) Nodes count: {}, BiCache count: {}",
+            self.engine.base.mem.len(),
+            bicache.len()
+        );
+        bicache.get(root_idx).get_value()
     }
 }
 
@@ -154,15 +157,15 @@ impl<'a> BiExecutorThread<'a> {
     /// 3. If result ready: store it, notify dependents, mark FINISHED
     /// 4. If dependencies needed: guard drops, status returns to PENDING
     fn process_task(&self, task: BiTask) {
-        let entry = task.entry;
-        let status = unsafe { &(*entry).status };
+        let bicache = &self.engine.bicache;
+        let entry = bicache.get(task.entry_idx);
+        let status = &entry.status;
         let mut guard = ProcessingGuard::new(status);
-        let data: &mut BiProcessingData =
-            unsafe { &mut *(*entry).get_ptr::<BiProcessingData>() };
-        let idx = unsafe { (*entry).key() };
+        let data: &mut BiProcessingData = unsafe { &mut *entry.get_ptr::<BiProcessingData>() };
+        let idx = entry.key();
 
-        if let Some(result) = self.update_binode(entry, idx, task.size_log2, data) {
-            unsafe { (*entry).set_value(result) };
+        if let Some(result) = self.update_binode(task.entry_idx, idx, task.size_log2, data) {
+            entry.set_value(result);
             let mut dependents = SmallVec::new();
             mem::swap(&mut data.dependents, &mut dependents);
             guard.finish(); // Mark as FINISHED
@@ -185,12 +188,13 @@ impl<'a> BiExecutorThread<'a> {
     ///    but with pairs).
     fn update_binode(
         &self,
-        parent_entry: *mut CacheEntry,
+        parent_entry_idx: u32,
         idx: (NodeIdx, NodeIdx),
         size_log2: u32,
         data: &mut BiProcessingData,
     ) -> Option<(NodeIdx, NodeIdx)> {
         let engine = self.engine;
+        let bicache = &engine.bicache;
 
         // First entry into this task: check for synchronous fast-paths
         if data.mask4_waiting == 0 && data.mask9_waiting == 0 {
@@ -247,18 +251,18 @@ impl<'a> BiExecutorThread<'a> {
                     continue;
                 }
                 let child_key = (data.arr0[i], data.arr1[i]);
-                let child_entry = engine.bicache.entry(child_key);
+                let child_idx = bicache.entry(child_key);
 
-                match handle_bi_dependency(child_entry, parent_entry, size_log2) {
+                match handle_bi_dependency(bicache, child_idx, parent_entry_idx, size_log2) {
                     BiDependencyResult::Ready => {
                         data.mask9_waiting &= !(1 << i);
-                        let val = unsafe { (*child_entry).get_value() };
+                        let val = bicache.get(child_idx).get_value();
                         data.arr0[i] = val.0;
                         data.arr1[i] = val.1;
                     }
                     BiDependencyResult::StartedByThisThread => {
                         self.queue.push(BiTask {
-                            entry: child_entry,
+                            entry_idx: child_idx,
                             size_log2: size_log2 - 1,
                         });
                         waiting_cnt += 1;
@@ -292,18 +296,18 @@ impl<'a> BiExecutorThread<'a> {
                     continue;
                 }
                 let child_key = (data.arr0[i], data.arr1[i]);
-                let child_entry = engine.bicache.entry(child_key);
+                let child_idx = bicache.entry(child_key);
 
-                match handle_bi_dependency(child_entry, parent_entry, size_log2) {
+                match handle_bi_dependency(bicache, child_idx, parent_entry_idx, size_log2) {
                     BiDependencyResult::Ready => {
                         data.mask4_waiting &= !(1 << i);
-                        let val = unsafe { (*child_entry).get_value() };
+                        let val = bicache.get(child_idx).get_value();
                         data.arr0[i] = val.0;
                         data.arr1[i] = val.1;
                     }
                     BiDependencyResult::StartedByThisThread => {
                         self.queue.push(BiTask {
-                            entry: child_entry,
+                            entry_idx: child_idx,
                             size_log2: size_log2 - 1,
                         });
                         waiting_cnt += 1;
@@ -340,19 +344,20 @@ impl<'a> BiExecutorThread<'a> {
     /// 2. Decrement its `waiting_cnt`
     /// 3. If `waiting_cnt` reaches 0, re-queue for processing
     fn notify_dependents(&self, dependents: SmallVec<[BiTask; 2]>) {
+        let bicache = &self.engine.bicache;
         for dep in dependents {
-            let entry = dep.entry;
-            let status = unsafe { &(*entry).status };
+            let entry = bicache.get(dep.entry_idx);
+            let status = &entry.status;
             let waiting_cnt = {
                 let _guard = ProcessingGuard::new(status);
                 let dep_data: &mut BiProcessingData =
-                    unsafe { &mut *(*entry).get_ptr::<BiProcessingData>() };
+                    unsafe { &mut *entry.get_ptr::<BiProcessingData>() };
                 dep_data.waiting_cnt -= 1;
                 dep_data.waiting_cnt
             };
             if waiting_cnt == 0 {
                 self.queue.push(BiTask {
-                    entry: dep.entry,
+                    entry_idx: dep.entry_idx,
                     size_log2: dep.size_log2,
                 });
             }
@@ -368,8 +373,13 @@ impl<'a> BiExecutorThread<'a> {
 /// 1. CAS(NOT_STARTED -> PROCESSING) to claim the entry
 /// 2. Allocate and store BiProcessingData
 /// 3. Store PENDING status (entry ready to be processed)
-fn start_processing_entry(entry: *mut CacheEntry, dependents: SmallVec<[BiTask; 2]>) -> bool {
-    let status = unsafe { &(*entry).status };
+fn start_processing_entry(
+    bicache: &StreamLifeCache,
+    entry_idx: u32,
+    dependents: SmallVec<[BiTask; 2]>,
+) -> bool {
+    let entry = bicache.get(entry_idx);
+    let status = &entry.status;
     if status
         .compare_exchange(
             status::NOT_STARTED,
@@ -386,7 +396,7 @@ fn start_processing_entry(entry: *mut CacheEntry, dependents: SmallVec<[BiTask; 
         dependents,
         ..Default::default()
     };
-    unsafe { (*entry).set_ptr(Box::into_raw(Box::new(pd))) };
+    entry.set_ptr(Box::into_raw(Box::new(pd)));
     status.store(status::PENDING, Ordering::Release);
     true
 }
@@ -403,13 +413,15 @@ enum BiDependencyResult {
 
 /// Handle a binode dependency: check if ready, claim for processing, or register as dependent.
 ///
-/// The `parent_entry` and `parent_size_log2` identify the parent task that depends on this child.
+/// The `parent_entry_idx` and `parent_size_log2` identify the parent task that depends on this child.
 fn handle_bi_dependency(
-    child_entry: *mut CacheEntry,
-    parent_entry: *mut CacheEntry,
+    bicache: &StreamLifeCache,
+    child_idx: u32,
+    parent_entry_idx: u32,
     parent_size_log2: u32,
 ) -> BiDependencyResult {
-    let status = unsafe { &(*child_entry).status };
+    let child_entry = bicache.get(child_idx);
+    let status = &child_entry.status;
     let status_value = status.load(Ordering::Acquire);
 
     if status_value == status::FINISHED {
@@ -418,9 +430,10 @@ fn handle_bi_dependency(
 
     if status_value == status::NOT_STARTED
         && start_processing_entry(
-            child_entry,
+            bicache,
+            child_idx,
             smallvec![BiTask {
-                entry: parent_entry,
+                entry_idx: parent_entry_idx,
                 size_log2: parent_size_log2,
             }],
         )
@@ -439,9 +452,9 @@ fn handle_bi_dependency(
         ) {
             Ok(_) => {
                 let child_data: &mut BiProcessingData =
-                    unsafe { &mut *(*child_entry).get_ptr::<BiProcessingData>() };
+                    unsafe { &mut *child_entry.get_ptr::<BiProcessingData>() };
                 child_data.dependents.push(BiTask {
-                    entry: parent_entry,
+                    entry_idx: parent_entry_idx,
                     size_log2: parent_size_log2,
                 });
                 status.store(status::PENDING, Ordering::Release);

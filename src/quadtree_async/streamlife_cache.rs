@@ -1,16 +1,11 @@
-use super::node::NodeIdx;
-use std::{
-    cell::UnsafeCell,
-    hash::{Hash, Hasher},
-    hint::spin_loop,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+use super::{
+    memory::{ConcurrentHashTable, HashtableSlot, FLAG_USED},
+    node::NodeIdx,
 };
-
-pub(super) struct StreamLifeCache {
-    base: UnsafeCell<StreamLifeCacheRaw>,
-}
-
-unsafe impl Sync for StreamLifeCache {}
+use std::{
+    hash::{Hash, Hasher},
+    sync::atomic::AtomicU8,
+};
 
 /// Union for the cache entry's data field: either the computed result or
 /// a pointer to processing data during parallel execution.
@@ -35,43 +30,52 @@ impl Default for CachePayload {
 
 pub(super) struct CacheEntry {
     key: (NodeIdx, NodeIdx),
-    pub(super) value: CachePayload,
+    pub(super) payload: CachePayload,
     pub(super) status: AtomicU8,
-    is_used: bool,
-    lock: AtomicBool,
+    /// Slot flags for ConcurrentHashTable (IS_USED, IS_LOCKED, etc.)
+    pub(super) flags: AtomicU8,
 }
 
 impl Default for CacheEntry {
     fn default() -> Self {
         Self {
             key: (NodeIdx::default(), NodeIdx::default()),
-            value: CachePayload::default(),
+            payload: CachePayload::default(),
             status: AtomicU8::new(0),
-            is_used: false,
-            lock: AtomicBool::new(false),
+            flags: AtomicU8::new(0),
         }
+    }
+}
+
+// SAFETY: Concurrent access is protected by the status state machine
+// and the per-slot flags in ConcurrentHashTable.
+unsafe impl Sync for CacheEntry {}
+
+impl HashtableSlot for CacheEntry {
+    fn flags(&self) -> &AtomicU8 {
+        &self.flags
     }
 }
 
 impl CacheEntry {
     pub(super) fn get_value(&self) -> (NodeIdx, NodeIdx) {
-        unsafe { self.value.value }
+        unsafe { self.payload.value }
     }
 
     pub(super) fn set_value(&self, v: (NodeIdx, NodeIdx)) {
         unsafe {
-            let p = &self.value as *const CachePayload as *mut CachePayload;
+            let p = &self.payload as *const CachePayload as *mut CachePayload;
             (*p).value = v;
         }
     }
 
     pub(super) fn get_ptr<T>(&self) -> *mut T {
-        unsafe { self.value.ptr as *mut T }
+        unsafe { self.payload.ptr as *mut T }
     }
 
     pub(super) fn set_ptr<T>(&self, ptr: *mut T) {
         unsafe {
-            let p = &self.value as *const CachePayload as *mut CachePayload;
+            let p = &self.payload as *const CachePayload as *mut CachePayload;
             (*p).ptr = ptr as *mut u8;
         }
     }
@@ -81,96 +85,57 @@ impl CacheEntry {
     }
 }
 
-impl StreamLifeCache {
-    pub(super) fn with_capacity(cap_log2: u32) -> Self {
-        Self {
-            base: UnsafeCell::new(StreamLifeCacheRaw::with_capacity(cap_log2)),
-        }
-    }
-
-    #[allow(clippy::mut_from_ref)]
-    pub(super) fn entry(&self, key: (NodeIdx, NodeIdx)) -> *mut CacheEntry {
-        unsafe { (*self.base.get()).find_or_create_entry(key) }
-    }
-
-    pub(super) fn clear(&mut self) {
-        self.base.get_mut().hashtable.fill_with(CacheEntry::default);
-    }
-
-    pub(super) fn bytes_total(&self) -> usize {
-        unsafe { (*self.base.get()).bytes_total() }
-    }
-}
-
-struct StreamLifeCacheRaw {
-    hashtable: Vec<CacheEntry>,
+pub(super) struct StreamLifeCache {
+    inner: ConcurrentHashTable<CacheEntry>,
     hasher: ahash::AHasher,
 }
 
-impl StreamLifeCacheRaw {
-    fn with_capacity(cap_log2: u32) -> Self {
-        assert!(
-            cap_log2 <= 32,
-            "Hashtables bigger than 2^32 are not supported"
-        );
+impl StreamLifeCache {
+    pub(super) fn new(cap_log2: u32, threads_cnt: usize) -> Self {
         Self {
-            hashtable: (0..1u64 << cap_log2)
-                .map(|_| CacheEntry::default())
-                .collect(),
+            inner: ConcurrentHashTable::new(cap_log2, threads_cnt),
             hasher: ahash::AHasher::default(),
         }
     }
 
-    unsafe fn find_or_create_entry(&mut self, key: (NodeIdx, NodeIdx)) -> *mut CacheEntry {
-        unsafe {
-            let hash = {
-                let mut hasher = self.hasher.clone();
-                (key.0.0, key.1.0).hash(&mut hasher);
-                hasher.finish() as usize
-            };
-            let mask = self.hashtable.len() - 1;
-            let mut index = hash & mask;
-
-            loop {
-                // First check if we can acquire the lock for this index
-                let lock = &(*self.hashtable.as_mut_ptr().add(index)).lock;
-
-                while lock
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_err()
-                {
-                    while lock.load(Ordering::Relaxed) {
-                        spin_loop();
-                    }
-                }
-
-                // Now safely get the mutable reference after acquiring the lock
-                let c = self.hashtable.get_unchecked_mut(index);
-
-                if c.key == key && c.is_used {
-                    lock.store(false, Ordering::Release);
-                    break;
-                }
-
-                if !c.is_used {
-                    c.key = key;
-                    c.value = CachePayload::default();
-                    c.is_used = true;
-
-                    // ExecutionStatistics::on_insertion::<1>();
-                    lock.store(false, Ordering::Release);
-                    break;
-                }
-
-                lock.store(false, Ordering::Release);
-                index = index.wrapping_add(1) & mask;
-            }
-
-            self.hashtable.get_unchecked_mut(index)
+    /// Find or create a cache entry for the given binode key.
+    /// Returns the index of the entry in the hash table.
+    pub(super) fn entry(&self, key: (NodeIdx, NodeIdx)) -> u32 {
+        let hash = {
+            let mut hasher = self.hasher.clone();
+            (key.0 .0, key.1 .0).hash(&mut hasher);
+            hasher.finish() as usize
+        };
+        let (idx, inserted) = self.inner.find_or_create(
+            hash,
+            FLAG_USED,
+            |slot| unsafe { (*slot).key == key },
+            |slot| unsafe {
+                (*slot).key = key;
+                (*slot).payload = CachePayload::default();
+                (*slot).status = AtomicU8::new(0);
+            },
+        );
+        if inserted {
+            self.inner.increment_length();
         }
+        idx
     }
 
-    fn bytes_total(&self) -> usize {
-        self.hashtable.capacity() * std::mem::size_of::<CacheEntry>()
+    /// Get a reference to the cache entry at the given index.
+    pub(super) fn get(&self, idx: u32) -> &CacheEntry {
+        self.inner.get(idx)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    pub(super) fn bytes_total(&self) -> usize {
+        self.inner.bytes_total()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.inner.len()
     }
 }

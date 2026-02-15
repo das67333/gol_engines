@@ -9,7 +9,7 @@ impl BlankNodes {
         Self { data: vec![] }
     }
 
-    pub(super) fn get_mut<Extra: Default>(
+    pub(super) fn get_mut<Extra: Default + Sync>(
         &mut self,
         size_log2: u32,
         mem: &MemoryManager<Extra>,

@@ -3,7 +3,7 @@ use num_bigint::BigInt;
 
 fn main() {
     let timer = std::time::Instant::now();
-    let mut engine = HashLifeEngineAsync::new(18 << 10, 4);
+    let mut engine = StreamLifeEngineAsync::new(18 << 10, 4);
     println!("Time spent on initializing engine: {:?}", timer.elapsed());
 
     let timer = std::time::Instant::now();
@@ -14,7 +14,7 @@ fn main() {
     println!("Time spent on loading pattern: {:?}", timer.elapsed());
 
     let timer = std::time::Instant::now();
-    let gens_log2 = 12;
+    let gens_log2 = 16;
     engine.update(gens_log2).unwrap();
     println!(
         "Time on updating pattern by 2^{} generations: {:?}",
@@ -25,5 +25,5 @@ fn main() {
     let updated = engine.current_state();
     println!("Population: {}", updated.population());
     println!("Hash: 0x{:016x}", updated.hash());
-    assert_eq!(updated.hash(), 0x02dda802a893049e);
+    assert_eq!(updated.hash(), 0x49f6e99dbd45761b);
 }

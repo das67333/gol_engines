@@ -355,7 +355,7 @@ impl<Extra: Default + Sync> GoLEngine for HashLifeEngineAsync<Extra> {
     }
 
     fn current_state(&self) -> Pattern {
-        fn inner<Extra: Default>(
+        fn inner<Extra: Default + Sync>(
             idx: NodeIdx,
             size_log2: u32,
             mem: &MemoryManager<Extra>,
