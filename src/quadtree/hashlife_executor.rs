@@ -44,11 +44,8 @@
 //! - `PROCESSING → FINISHED`: Computation complete, result cached
 
 use super::{
-    LEAF_SIZE, LEAF_SIZE_LOG2,
-    hashlife::{
-        HashLifeEngine, four_children_overlapping, nine_children_disjoint,
-        nine_children_overlapping, update_leaves,
-    },
+    LEAF_SIZE, LEAF_SIZE_LOG2, algorithm,
+    hashlife::HashLifeEngine,
     hashtable::{Idx, NodeStore, NodeStoreRef},
     node::QuadTreeNode,
     status,
@@ -379,16 +376,23 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
             } else {
                 1 << self.generations_log2
             };
-            return Some(update_leaves(&self.mem, nw, ne, sw, se, steps));
+            return Some(algorithm::update_leaves(&self.mem, nw, ne, sw, se, steps));
         }
 
         if data.mask4_waiting == 0 {
             // arr4 is not ready
             if !both_stages {
-                data.arr = nine_children_disjoint(&self.mem, nw, ne, sw, se, task.size_log2 - 1);
+                data.arr = algorithm::nine_children_disjoint(
+                    &self.mem,
+                    nw,
+                    ne,
+                    sw,
+                    se,
+                    task.size_log2 - 1,
+                );
             } else {
                 if data.mask9_waiting == 0 {
-                    data.arr = nine_children_overlapping(&self.mem, nw, ne, sw, se);
+                    data.arr = algorithm::nine_children_overlapping(&self.mem, nw, ne, sw, se);
                     data.mask9_waiting = 0b1_1111_1111;
                 }
 
@@ -419,7 +423,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
                 }
             }
 
-            let arr4 = four_children_overlapping(&self.mem, &data.arr);
+            let arr4 = algorithm::four_children_overlapping(&self.mem, &data.arr);
             data.arr[..4].copy_from_slice(&arr4);
             data.mask4_waiting = 0b1111;
         }

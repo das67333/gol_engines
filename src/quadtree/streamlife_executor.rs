@@ -13,7 +13,7 @@
 
 use super::{
     LEAF_SIZE_LOG2,
-    hashlife::{four_children_overlapping, nine_children_disjoint, nine_children_overlapping},
+    algorithm,
     hashlife_executor::{ProcessingGuard, TaskFetcher, is_finished},
     hashtable::{BinodeCache, BinodeCacheRef, Idx},
     status,
@@ -199,13 +199,13 @@ impl<'a> BiExecutorThread<'a> {
         // First entry into this task: check for synchronous fast-paths
         if data.mask4_waiting == 0 && data.mask9_waiting == 0 {
             // Solitonic: two universes don't interact, compute independently
-            if engine.is_solitonic(idx, size_log2) {
-                return Some(engine.compute_solitonic(idx, size_log2));
+            if algorithm::is_solitonic(&engine.base.mem, &engine.base.blank_nodes, idx, size_log2) {
+                return Some(algorithm::compute_solitonic(&engine.base.mem, &engine.base.blank_nodes, self.engine.base.generations_per_update_log2.unwrap(), idx, size_log2));
             }
 
             // Base case: merge universes and run standard HashLife
             if size_log2 == LEAF_SIZE_LOG2 + 2 {
-                return Some(engine.compute_base_case(idx, size_log2));
+                return Some(algorithm::compute_base_case(&engine.base.mem, &engine.base.blank_nodes, self.engine.base.generations_per_update_log2.unwrap(), idx, size_log2));
             }
 
             // Recursive case: set up children for both universes
@@ -215,11 +215,11 @@ impl<'a> BiExecutorThread<'a> {
             let n1 = engine.base.mem.get(idx.1);
 
             if both_stages {
-                data.arr0 = nine_children_overlapping(&engine.base.mem, n0.nw, n0.ne, n0.sw, n0.se);
-                data.arr1 = nine_children_overlapping(&engine.base.mem, n1.nw, n1.ne, n1.sw, n1.se);
+                data.arr0 = algorithm::nine_children_overlapping(&engine.base.mem, n0.nw, n0.ne, n0.sw, n0.se);
+                data.arr1 = algorithm::nine_children_overlapping(&engine.base.mem, n1.nw, n1.ne, n1.sw, n1.se);
                 data.mask9_waiting = 0b1_1111_1111;
             } else {
-                data.arr0 = nine_children_disjoint(
+                data.arr0 = algorithm::nine_children_disjoint(
                     &engine.base.mem,
                     n0.nw,
                     n0.ne,
@@ -227,7 +227,7 @@ impl<'a> BiExecutorThread<'a> {
                     n0.se,
                     size_log2 - 1,
                 );
-                data.arr1 = nine_children_disjoint(
+                data.arr1 = algorithm::nine_children_disjoint(
                     &engine.base.mem,
                     n1.nw,
                     n1.ne,
@@ -278,8 +278,8 @@ impl<'a> BiExecutorThread<'a> {
 
         // Transition: compute arr4 from the 9 results (or from disjoint children)
         if data.mask4_waiting == 0 {
-            let arr40 = four_children_overlapping(&engine.base.mem, &data.arr0);
-            let arr41 = four_children_overlapping(&engine.base.mem, &data.arr1);
+            let arr40 = algorithm::four_children_overlapping(&engine.base.mem, &data.arr0);
+            let arr41 = algorithm::four_children_overlapping(&engine.base.mem, &data.arr1);
             data.arr0[..4].copy_from_slice(&arr40);
             data.arr1[..4].copy_from_slice(&arr41);
             data.mask4_waiting = 0b1111;

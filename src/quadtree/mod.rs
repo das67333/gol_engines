@@ -1,3 +1,4 @@
+mod algorithm;
 mod blank;
 mod hashlife;
 mod hashlife_executor;

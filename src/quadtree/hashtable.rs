@@ -219,11 +219,6 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
 // ---------------------------------------------------------------------------
 
 /// Shared interface for accessing nodes in a [`NodeStore`] or [`NodeStoreRef`].
-///
-/// This trait allows HashLife algorithm methods (e.g. `update_leaves`,
-/// `nine_children_overlapping`) to be written once as free functions generic
-/// over `impl NodeAccess<Meta>`, avoiding duplication between the sync and
-/// parallel code paths.
 pub(super) trait NodeAccess<Meta: Default + Sync> {
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta>;
     fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx;
