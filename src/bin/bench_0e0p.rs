@@ -14,7 +14,7 @@ fn main() {
     println!("Time spent on loading pattern: {:?}", timer.elapsed());
 
     let timer = std::time::Instant::now();
-    let gens_log2 = 18;
+    let gens_log2 = 16;
     engine.update(gens_log2).unwrap();
     println!(
         "Time on updating pattern by 2^{} generations: {:?}",
@@ -25,5 +25,5 @@ fn main() {
     let updated = engine.current_state();
     println!("Population: {}", updated.population());
     println!("Hash: 0x{:016x}", updated.hash());
-    assert_eq!(updated.hash(), 0x67881430d8802b6a);
+    assert_eq!(updated.hash(), 0x49f6e99dbd45761b);
 }

@@ -1,7 +1,7 @@
 use super::{
     LEAF_SIZE, LEAF_SIZE_LOG2,
     blank::BlankNodes,
-    executor::Executor,
+    hashlife_executor::HashLifeExecutor,
     hashtable::{Idx, NodeAccess, NodeStore},
     node::QuadTreeNode,
     status,
@@ -242,7 +242,6 @@ pub(super) fn four_children_overlapping<Meta: Default + Sync>(
 // ---------------------------------------------------------------------------
 
 impl<Meta: Default + Sync> HashLifeEngine<Meta> {
-    #[allow(dead_code)]
     fn update_inner_sync(&self, node: Idx, size_log2: u32) -> Idx {
         let n = self.mem.get(node);
         let generations_log2 = self.generations_per_update_log2.unwrap();
@@ -275,7 +274,6 @@ impl<Meta: Default + Sync> HashLifeEngine<Meta> {
         }
     }
 
-    #[allow(dead_code)]
     pub(super) fn update_node_sync(&self, node: Idx, size_log2: u32) -> Idx {
         let n = self.mem.get(node);
         let status = n.status.load(Ordering::Acquire);
@@ -492,7 +490,7 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
         //     .unwrap()
         //     .block_on(async { self.update_node_async(self.root, self.size_log2).await })
         // self.update_node_sync(self.root, self.size_log2)
-        self.root = if let Some(x) = Executor::new_hashlife(self).run_hashlife(self.threads_cnt) {
+        self.root = if let Some(x) = HashLifeExecutor::new(self).run(self.threads_cnt) {
             x
         } else {
             self.load_pattern(&backup, self.topology)?;
