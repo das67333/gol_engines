@@ -1,6 +1,6 @@
 use super::{
     node::QuadTreeNode,
-    sharded_length::{LengthShard, ShardedLength},
+    sharded_statistics::{LengthShard, ShardedLength},
 };
 use std::{
     cell::UnsafeCell,
@@ -8,10 +8,6 @@ use std::{
     hint, mem, ptr,
     sync::atomic::{AtomicU8, Ordering},
 };
-
-// ---------------------------------------------------------------------------
-// Common types and constants
-// ---------------------------------------------------------------------------
 
 /// Index into a [`ConcurrentHashTable`].
 pub(super) type Idx = u32;
@@ -31,10 +27,6 @@ const FLAG_LEAF: u8 = 1 << 0;
 pub(super) trait HashtableSlot: Default + Sync {
     fn flags(&self) -> &AtomicU8;
 }
-
-// ---------------------------------------------------------------------------
-// CacheField: unified dual-purpose field (pointer or inline value)
-// ---------------------------------------------------------------------------
 
 /// Union that stores either a type-erased pointer or an inline value.
 union PtrOrValue<V: Copy> {
@@ -89,10 +81,6 @@ impl<V: Copy> CacheField<V> {
         unsafe { (*self.0.get()).ptr = ptr as *mut u8 }
     }
 }
-
-// ---------------------------------------------------------------------------
-// ConcurrentHashTable
-// ---------------------------------------------------------------------------
 
 /// A concurrent open-addressing hashtable with linear probing.
 ///
@@ -214,11 +202,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// NodeAccess: trait abstracting node store access for algorithm methods
-// ---------------------------------------------------------------------------
-
-/// Shared interface for accessing nodes in a [`NodeStore`] or [`NodeStoreRef`].
+/// Shared interface for accessing nodes.
 pub(super) trait NodeAccess<Meta: Default + Sync> {
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta>;
     fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx;
@@ -241,10 +225,6 @@ impl<Meta: Default + Sync> NodeAccess<Meta> for NodeStore<Meta> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ShardedRef: generic per-thread reference with sharded length counting
-// ---------------------------------------------------------------------------
-
 /// A per-thread reference to a store that uses local sharding for length tracking.
 pub(super) struct ShardedRef<'a, S> {
     base: &'a S,
@@ -256,10 +236,6 @@ pub(super) type NodeStoreRef<'a, Meta> = ShardedRef<'a, NodeStore<Meta>>;
 
 /// Type alias for per-thread BinodeCache references.
 pub(super) type BinodeCacheRef<'a> = ShardedRef<'a, BinodeCache>;
-
-// ---------------------------------------------------------------------------
-// NodeStore: stores QuadTreeNode entries
-// ---------------------------------------------------------------------------
 
 /// Stores the nodes of the quadtree.
 pub(super) struct NodeStore<Meta> {
@@ -402,8 +378,6 @@ fn compute_hash(nw: Idx, ne: Idx, sw: Idx, se: Idx) -> usize {
     h.wrapping_add(h >> 11) as usize
 }
 
-// -- NodeStoreRef methods --
-
 impl<'a, Meta: Default + Sync> NodeStoreRef<'a, Meta> {
     pub(super) fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
         self.base.get(idx)
@@ -454,10 +428,6 @@ impl<'a, Meta: Default + Sync> NodeAccess<Meta> for NodeStoreRef<'a, Meta> {
         self.find_or_create_leaf_from_parts(nw, ne, sw, se)
     }
 }
-
-// ---------------------------------------------------------------------------
-// BinodeCache: stores CacheEntry entries for StreamLife binode memoization
-// ---------------------------------------------------------------------------
 
 pub(super) struct CacheEntry {
     key: (Idx, Idx),

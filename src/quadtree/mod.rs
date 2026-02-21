@@ -4,7 +4,7 @@ mod hashlife;
 mod hashlife_executor;
 mod hashtable;
 mod node;
-mod sharded_length;
+mod sharded_statistics;
 mod streamlife;
 mod streamlife_executor;
 

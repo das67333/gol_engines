@@ -24,8 +24,6 @@ pub struct HashLifeEngine<Meta> {
     pub(super) threads_cnt: usize,
 }
 
-// ---------------------------------------------------------------------------
-
 impl<Meta: Default + Sync> HashLifeEngine<Meta> {
     /// Add a frame around the field: if `self.topology` is Unbounded, frame is blank,
     /// and if `self.topology` is Torus, frame mirrors the field.

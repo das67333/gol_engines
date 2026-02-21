@@ -6,14 +6,10 @@ use super::{
 };
 use std::{hint, sync::atomic::Ordering};
 
-// ---------------------------------------------------------------------------
-// Shared HashLife algorithm primitives (used by both sync and parallel paths)
-// ---------------------------------------------------------------------------
-
 /// Apply Conway's Game of Life rules to a row of cells.
 ///
 /// Uses bit-parallel computation to update 16 cells simultaneously.
-/// Implements the standard B3/S23 rule (born with 3 neighbors, survive with 2-3).
+/// Implements the standard B3/S23 rule.
 fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {
     let b = row_prev;
     let a = b << 1;

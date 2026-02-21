@@ -48,13 +48,14 @@ use super::{
     hashlife::HashLifeEngine,
     hashtable::{Idx, NodeStore, NodeStoreRef},
     node::QuadTreeNode,
+    sharded_statistics::ExecutionStatistics,
     status,
 };
 use crossbeam::deque::{Steal, Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
 use std::{
     hint, mem,
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
     thread,
     time::Duration,
 };
@@ -97,13 +98,6 @@ impl Task {
     }
 }
 
-static STEAL_ATTEMPTS_SUCCESS: AtomicU64 = AtomicU64::new(0);
-static STEAL_ATTEMPTS_EMPTY: AtomicU64 = AtomicU64::new(0);
-static STEAL_ATTEMPTS_RETRY: AtomicU64 = AtomicU64::new(0);
-
-static STEAL_FROM_LAST_VICTIM_SUCCESS: AtomicU64 = AtomicU64::new(0);
-static STEAL_FROM_LAST_VICTIM_FAIL: AtomicU64 = AtomicU64::new(0);
-
 pub(super) struct TaskFetcher<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> {
     thread_idx: usize,
     queue: &'a Worker<T>,
@@ -112,13 +106,11 @@ pub(super) struct TaskFetcher<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> {
     cancel_condition: C,
     last_victim: usize,
     rng: rand_chacha::ChaCha8Rng,
-    rng_buffer: Vec<u32>,
 }
 
 impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
     /// Number of tasks to steal at once when work-stealing.
     const STEAL_BATCH_SIZE: usize = 1;
-    const RNG_BUFFER_SIZE: usize = 256;
     const INITIAL_WAIT_DURATION: Duration = Duration::from_micros(100);
     const MAX_WAIT_DURATION: Duration = Duration::from_millis(100);
 
@@ -137,12 +129,11 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
             cancel_condition,
             last_victim: 0,
             rng: <rand_chacha::ChaCha8Rng as rand::SeedableRng>::from_os_rng(),
-            rng_buffer: Vec::with_capacity(Self::RNG_BUFFER_SIZE),
         }
     }
 
     /// Fetch a task from local queue or steal from other threads.
-    pub(super) fn fetch_task(&mut self) -> Option<T> {
+    pub(super) fn fetch_task(&mut self, stats: &mut ExecutionStatistics) -> Option<T> {
         if (self.cancel_condition)() {
             return None;
         }
@@ -157,11 +148,11 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
         }
 
         // repeat last successful steal
-        if let Some(task) = self.try_steal(self.last_victim) {
-            STEAL_FROM_LAST_VICTIM_SUCCESS.fetch_add(1, Ordering::Relaxed);
-            return Some(task);
+        let result = self.try_steal(self.last_victim, stats);
+        stats.on_steal_from_last_victim(&result);
+        if result.is_some() {
+            return result;
         }
-        STEAL_FROM_LAST_VICTIM_FAIL.fetch_add(1, Ordering::Relaxed);
 
         let mut duration = Self::INITIAL_WAIT_DURATION;
         while !(self.finish_condition)() && !(self.cancel_condition)() {
@@ -174,7 +165,7 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
                 (j, len_j)
             };
             if victim_len > 0
-                && let Some(task) = self.try_steal(victim_id)
+                && let Some(task) = self.try_steal(victim_id, stats)
             {
                 self.last_victim = victim_id;
                 return Some(task);
@@ -188,38 +179,24 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
     }
 
     fn generate_random_index(&mut self) -> usize {
-        if let Some(x) = self.rng_buffer.pop() {
-            return x as usize;
+        use rand::Rng;
+        // don't steal from yourself
+        let mut i = self.rng.random_range(0..self.stealers.len() - 1);
+        if i >= self.thread_idx {
+            i += 1;
         }
-        self.rng_buffer.resize(Self::RNG_BUFFER_SIZE, 0);
-        rand::Rng::fill(&mut self.rng, &mut self.rng_buffer[..]);
-        for i in self.rng_buffer.iter_mut() {
-            *i %= self.stealers.len() as u32 - 1;
-            // skip current index
-            if *i >= self.thread_idx as u32 {
-                *i += 1;
-            }
-        }
-        self.rng_buffer.pop().unwrap() as usize
+        i
     }
 
-    fn try_steal(&self, victim_id: usize) -> Option<T> {
+    fn try_steal(&mut self, victim_id: usize, stats: &mut ExecutionStatistics) -> Option<T> {
         loop {
-            match self.stealers[victim_id]
-                .steal_batch_with_limit_and_pop(self.queue, Self::STEAL_BATCH_SIZE)
-            {
-                Steal::Success(task) => {
-                    STEAL_ATTEMPTS_SUCCESS.fetch_add(1, Ordering::Relaxed);
-                    return Some(task);
-                }
-                Steal::Empty => {
-                    STEAL_ATTEMPTS_EMPTY.fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
-                Steal::Retry => {
-                    STEAL_ATTEMPTS_RETRY.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
+            let result = self.stealers[victim_id]
+                .steal_batch_with_limit_and_pop(self.queue, Self::STEAL_BATCH_SIZE);
+            stats.on_steal_attempt(&result);
+            match result {
+                Steal::Success(task) => return Some(task),
+                Steal::Empty => return None,
+                Steal::Retry => continue,
             }
         }
     }
@@ -259,7 +236,9 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
         start_processing_node(root_node, smallvec![]);
         queues[0].push(Task::new(self.root, self.size_log2));
 
+        let mut total_stats = ExecutionStatistics::new();
         thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
             for (thread_idx, queue) in queues.into_iter().enumerate() {
                 let executor_thread = ExecutorThread {
                     root_node,
@@ -269,7 +248,11 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
                     queue,
                     stealers: &stealers,
                 };
-                scope.spawn(move || executor_thread.run());
+                handles.push(scope.spawn(move || executor_thread.run()));
+            }
+
+            for handle in handles {
+                total_stats.merge(&handle.join().unwrap());
             }
         });
 
@@ -279,26 +262,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
 
         assert!(is_finished(&self.mem.get(self.root).status));
         println!("Nodes count: {}", self.mem.len());
-        println!(
-            "STEAL_ATTEMPTS_SUCCESS: {}",
-            STEAL_ATTEMPTS_SUCCESS.load(Ordering::Relaxed)
-        );
-        println!(
-            "STEAL_ATTEMPTS_EMPTY: {}",
-            STEAL_ATTEMPTS_EMPTY.load(Ordering::Relaxed)
-        );
-        println!(
-            "STEAL_ATTEMPTS_RETRY: {}",
-            STEAL_ATTEMPTS_RETRY.load(Ordering::Relaxed)
-        );
-        println!(
-            "STEAL_FROM_LAST_VICTIM_SUCCESS: {}",
-            STEAL_FROM_LAST_VICTIM_SUCCESS.load(Ordering::Relaxed)
-        );
-        println!(
-            "STEAL_FROM_LAST_VICTIM_FAIL: {}",
-            STEAL_FROM_LAST_VICTIM_FAIL.load(Ordering::Relaxed)
-        );
+        total_stats.print();
 
         Some(root_node.cache.get_value())
     }
@@ -314,7 +278,7 @@ struct ExecutorThread<'a, Meta: Default + Sync> {
 }
 
 impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
-    fn run(&self) {
+    fn run(&self) -> ExecutionStatistics {
         let mut fetcher = TaskFetcher::new(
             self.thread_idx,
             &self.queue,
@@ -322,10 +286,12 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
             || is_finished(&self.root_node.status),
             || self.mem.exceeds_load_factor(),
         );
+        let mut stats = ExecutionStatistics::new();
 
-        while let Some(task) = fetcher.fetch_task() {
+        while let Some(task) = fetcher.fetch_task(&mut stats) {
             self.process_task(task);
         }
+        stats
     }
 
     /// Process a single task: compute the node's result or wait for dependencies.

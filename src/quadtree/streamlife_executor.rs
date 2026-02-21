@@ -12,10 +12,10 @@
 //! - Two parallel arrays (`arr0`, `arr1`) track the two universes
 
 use super::{
-    LEAF_SIZE_LOG2,
-    algorithm,
+    LEAF_SIZE_LOG2, algorithm,
     hashlife_executor::{ProcessingGuard, TaskFetcher, is_finished},
     hashtable::{BinodeCache, BinodeCacheRef, Idx},
+    sharded_statistics::ExecutionStatistics,
     status,
     streamlife::StreamLifeEngine,
 };
@@ -98,7 +98,9 @@ impl<'a> StreamLifeExecutor<'a> {
             size_log2: self.size_log2,
         });
 
+        let mut total_stats = ExecutionStatistics::new();
         thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
             for (thread_idx, queue) in queues.into_iter().enumerate() {
                 let executor_thread = BiExecutorThread {
                     engine: self.engine,
@@ -108,7 +110,11 @@ impl<'a> StreamLifeExecutor<'a> {
                     queue,
                     stealers: &stealers,
                 };
-                scope.spawn(move || executor_thread.run());
+                handles.push(scope.spawn(move || executor_thread.run()));
+            }
+
+            for handle in handles {
+                total_stats.merge(&handle.join().unwrap());
             }
         });
 
@@ -118,10 +124,11 @@ impl<'a> StreamLifeExecutor<'a> {
 
         assert!(is_finished(root_status));
         println!(
-            "(?) Nodes count: {}, BiCache count: {}",
+            "Nodes count: {}, BiCache count: {}",
             self.engine.base.mem.len(),
             bicache.len()
         );
+        total_stats.print();
         Some(bicache.get(root_idx).payload.get_value())
     }
 }
@@ -137,7 +144,7 @@ struct BiExecutorThread<'a> {
 }
 
 impl<'a> BiExecutorThread<'a> {
-    fn run(&self) {
+    fn run(&self) -> ExecutionStatistics {
         let mut fetcher = TaskFetcher::new(
             self.thread_idx,
             &self.queue,
@@ -145,10 +152,12 @@ impl<'a> BiExecutorThread<'a> {
             || is_finished(self.root_status),
             || self.engine.base.mem.exceeds_load_factor() || self.bicache_ref.exceeds_load_factor(),
         );
+        let mut stats = ExecutionStatistics::new();
 
-        while let Some(task) = fetcher.fetch_task() {
+        while let Some(task) = fetcher.fetch_task(&mut stats) {
             self.process_task(task);
         }
+        stats
     }
 
     /// Process a single binode task.
@@ -200,12 +209,24 @@ impl<'a> BiExecutorThread<'a> {
         if data.mask4_waiting == 0 && data.mask9_waiting == 0 {
             // Solitonic: two universes don't interact, compute independently
             if algorithm::is_solitonic(&engine.base.mem, &engine.base.blank_nodes, idx, size_log2) {
-                return Some(algorithm::compute_solitonic(&engine.base.mem, &engine.base.blank_nodes, self.engine.base.generations_per_update_log2.unwrap(), idx, size_log2));
+                return Some(algorithm::compute_solitonic(
+                    &engine.base.mem,
+                    &engine.base.blank_nodes,
+                    self.engine.base.generations_per_update_log2.unwrap(),
+                    idx,
+                    size_log2,
+                ));
             }
 
             // Base case: merge universes and run standard HashLife
             if size_log2 == LEAF_SIZE_LOG2 + 2 {
-                return Some(algorithm::compute_base_case(&engine.base.mem, &engine.base.blank_nodes, self.engine.base.generations_per_update_log2.unwrap(), idx, size_log2));
+                return Some(algorithm::compute_base_case(
+                    &engine.base.mem,
+                    &engine.base.blank_nodes,
+                    self.engine.base.generations_per_update_log2.unwrap(),
+                    idx,
+                    size_log2,
+                ));
             }
 
             // Recursive case: set up children for both universes
@@ -215,8 +236,20 @@ impl<'a> BiExecutorThread<'a> {
             let n1 = engine.base.mem.get(idx.1);
 
             if both_stages {
-                data.arr0 = algorithm::nine_children_overlapping(&engine.base.mem, n0.nw, n0.ne, n0.sw, n0.se);
-                data.arr1 = algorithm::nine_children_overlapping(&engine.base.mem, n1.nw, n1.ne, n1.sw, n1.se);
+                data.arr0 = algorithm::nine_children_overlapping(
+                    &engine.base.mem,
+                    n0.nw,
+                    n0.ne,
+                    n0.sw,
+                    n0.se,
+                );
+                data.arr1 = algorithm::nine_children_overlapping(
+                    &engine.base.mem,
+                    n1.nw,
+                    n1.ne,
+                    n1.sw,
+                    n1.se,
+                );
                 data.mask9_waiting = 0b1_1111_1111;
             } else {
                 data.arr0 = algorithm::nine_children_disjoint(
