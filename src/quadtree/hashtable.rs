@@ -178,11 +178,11 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     }
 
     fn increment_length(&self) {
-        self.length.increment();
+        self.length.inc_global();
     }
 
-    fn get_shard(&self, shard_idx: usize) -> LengthShard<'_> {
-        self.length.get_shard(shard_idx)
+    fn shard(&self, shard_idx: usize) -> LengthShard<'_> {
+        self.length.shard(shard_idx)
     }
 
     fn clear(&mut self) {
@@ -194,11 +194,11 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     }
 
     fn len(&self) -> usize {
-        self.length.get()
+        self.length.len_exact()
     }
 
     fn exceeds_load_factor(&self) -> bool {
-        self.length.get_upper_bound() > self.length_limit
+        self.length.len_upper_bound() > self.length_limit
     }
 }
 
@@ -347,7 +347,7 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
     pub(super) fn create_ref(&self, shard_idx: usize) -> NodeStoreRef<'_, Meta> {
         ShardedRef {
             base: self,
-            length_shard: self.inner.get_shard(shard_idx),
+            length_shard: self.inner.shard(shard_idx),
         }
     }
 
@@ -519,7 +519,7 @@ impl BinodeCache {
     pub(super) fn create_ref(&self, shard_idx: usize) -> BinodeCacheRef<'_> {
         ShardedRef {
             base: self,
-            length_shard: self.inner.get_shard(shard_idx),
+            length_shard: self.inner.shard(shard_idx),
         }
     }
 

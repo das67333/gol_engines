@@ -21,11 +21,11 @@ impl ShardedLength {
         }
     }
 
-    pub(super) fn increment(&self) {
+    pub(super) fn inc_global(&self) {
         self.global.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn get(&self) -> usize {
+    pub(super) fn len_exact(&self) -> usize {
         let shards_sum_exact = self
             .shards
             .iter()
@@ -35,14 +35,14 @@ impl ShardedLength {
         self.global.load(Ordering::Relaxed) + shards_sum_exact
     }
 
-    pub(super) fn get_shard(&self, shard_idx: usize) -> LengthShard<'_> {
+    pub(super) fn shard(&self, shard_idx: usize) -> LengthShard<'_> {
         LengthShard {
             local: &self.shards[shard_idx],
             global: &self.global,
         }
     }
 
-    pub(super) fn get_upper_bound(&self) -> usize {
+    pub(super) fn len_upper_bound(&self) -> usize {
         self.global.load(Ordering::Relaxed) + self.max_underestimation
     }
 }
@@ -62,68 +62,55 @@ impl<'a> LengthShard<'a> {
     }
 }
 
-// static STEAL_ATTEMPTS_SUCCESS: AtomicU64 = AtomicU64::new(0);
-// static STEAL_ATTEMPTS_EMPTY: AtomicU64 = AtomicU64::new(0);
-// static STEAL_ATTEMPTS_RETRY: AtomicU64 = AtomicU64::new(0);
-
-// static STEAL_FROM_LAST_VICTIM_SUCCESS: AtomicU64 = AtomicU64::new(0);
-// static STEAL_FROM_LAST_VICTIM_FAIL: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Default)]
 pub(super) struct ExecutionStatistics {
-    steal_attempts_success: u64,
-    steal_attempts_empty: u64,
-    steal_attempts_retry: u64,
-    steal_from_last_victim_success: u64,
-    steal_from_last_victim_fail: u64,
+    steal_success: u64,
+    steal_empty: u64,
+    steal_retry: u64,
+    last_victim_steal_success: u64,
+    last_victim_steal_fail: u64,
 }
 
 impl ExecutionStatistics {
-    pub(super) fn new() -> Self {
-        Self {
-            steal_attempts_success: 0,
-            steal_attempts_empty: 0,
-            steal_attempts_retry: 0,
-            steal_from_last_victim_success: 0,
-            steal_from_last_victim_fail: 0,
-        }
-    }
-
-    pub(super) fn on_steal_attempt<T>(&mut self, result: &Steal<T>) {
+    pub(super) fn record_steal_attempt<T>(&mut self, result: &Steal<T>) {
         match result {
-            Steal::Success(_) => self.steal_attempts_success += 1,
-            Steal::Empty => self.steal_attempts_empty += 1,
-            Steal::Retry => self.steal_attempts_retry += 1,
+            Steal::Success(_) => self.steal_success += 1,
+            Steal::Empty => self.steal_empty += 1,
+            Steal::Retry => self.steal_retry += 1,
         }
     }
 
-    pub(super) fn on_steal_from_last_victim<T>(&mut self, task: &Option<T>) {
+    pub(super) fn record_last_victim_steal<T>(&mut self, task: &Option<T>) {
         if task.is_some() {
-            self.steal_from_last_victim_success += 1;
+            self.last_victim_steal_success += 1;
         } else {
-            self.steal_from_last_victim_fail += 1;
+            self.last_victim_steal_fail += 1;
         }
     }
 
-    pub(super) fn merge(&mut self, other: &ExecutionStatistics) {
-        self.steal_attempts_success += other.steal_attempts_success;
-        self.steal_attempts_empty += other.steal_attempts_empty;
-        self.steal_attempts_retry += other.steal_attempts_retry;
-        self.steal_from_last_victim_success += other.steal_from_last_victim_success;
-        self.steal_from_last_victim_fail += other.steal_from_last_victim_fail;
+    pub(super) fn merge_from(&mut self, other: &ExecutionStatistics) {
+        self.steal_success += other.steal_success;
+        self.steal_empty += other.steal_empty;
+        self.steal_retry += other.steal_retry;
+        self.last_victim_steal_success += other.last_victim_steal_success;
+        self.last_victim_steal_fail += other.last_victim_steal_fail;
     }
+}
 
-    pub(super) fn print(&self) {
-        println!("Steal attempts success: {}", self.steal_attempts_success);
-        println!("Steal attempts empty: {}", self.steal_attempts_empty);
-        println!("Steal attempts retry: {}", self.steal_attempts_retry);
-        println!(
+impl std::fmt::Display for ExecutionStatistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Steal attempts success: {}", self.steal_success)?;
+        writeln!(f, "Steal attempts empty: {}", self.steal_empty)?;
+        writeln!(f, "Steal attempts retry: {}", self.steal_retry)?;
+        writeln!(
+            f,
             "Steal from last victim success: {}",
-            self.steal_from_last_victim_success
-        );
-        println!(
+            self.last_victim_steal_success
+        )?;
+        write!(
+            f,
             "Steal from last victim fail: {}",
-            self.steal_from_last_victim_fail
-        );
+            self.last_victim_steal_fail
+        )
     }
 }

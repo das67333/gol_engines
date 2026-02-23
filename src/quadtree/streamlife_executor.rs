@@ -98,7 +98,7 @@ impl<'a> StreamLifeExecutor<'a> {
             size_log2: self.size_log2,
         });
 
-        let mut total_stats = ExecutionStatistics::new();
+        let mut total_stats = ExecutionStatistics::default();
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(num_threads);
             for (thread_idx, queue) in queues.into_iter().enumerate() {
@@ -114,7 +114,7 @@ impl<'a> StreamLifeExecutor<'a> {
             }
 
             for handle in handles {
-                total_stats.merge(&handle.join().unwrap());
+                total_stats.merge_from(&handle.join().unwrap());
             }
         });
 
@@ -128,7 +128,8 @@ impl<'a> StreamLifeExecutor<'a> {
             self.engine.base.mem.len(),
             bicache.len()
         );
-        total_stats.print();
+        println!("{total_stats}");
+
         Some(bicache.get(root_idx).payload.get_value())
     }
 }
@@ -152,7 +153,7 @@ impl<'a> BiExecutorThread<'a> {
             || is_finished(self.root_status),
             || self.engine.base.mem.exceeds_load_factor() || self.bicache_ref.exceeds_load_factor(),
         );
-        let mut stats = ExecutionStatistics::new();
+        let mut stats = ExecutionStatistics::default();
 
         while let Some(task) = fetcher.fetch_task(&mut stats) {
             self.process_task(task);

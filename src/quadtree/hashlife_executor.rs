@@ -149,7 +149,7 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
 
         // repeat last successful steal
         let result = self.try_steal(self.last_victim, stats);
-        stats.on_steal_from_last_victim(&result);
+        stats.record_last_victim_steal(&result);
         if result.is_some() {
             return result;
         }
@@ -192,7 +192,7 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
         loop {
             let result = self.stealers[victim_id]
                 .steal_batch_with_limit_and_pop(self.queue, Self::STEAL_BATCH_SIZE);
-            stats.on_steal_attempt(&result);
+            stats.record_steal_attempt(&result);
             match result {
                 Steal::Success(task) => return Some(task),
                 Steal::Empty => return None,
@@ -236,7 +236,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
         start_processing_node(root_node, smallvec![]);
         queues[0].push(Task::new(self.root, self.size_log2));
 
-        let mut total_stats = ExecutionStatistics::new();
+        let mut total_stats = ExecutionStatistics::default();
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(num_threads);
             for (thread_idx, queue) in queues.into_iter().enumerate() {
@@ -252,7 +252,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
             }
 
             for handle in handles {
-                total_stats.merge(&handle.join().unwrap());
+                total_stats.merge_from(&handle.join().unwrap());
             }
         });
 
@@ -262,7 +262,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
 
         assert!(is_finished(&self.mem.get(self.root).status));
         println!("Nodes count: {}", self.mem.len());
-        total_stats.print();
+        println!("{total_stats}");
 
         Some(root_node.cache.get_value())
     }
@@ -286,7 +286,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
             || is_finished(&self.root_node.status),
             || self.mem.exceeds_load_factor(),
         );
-        let mut stats = ExecutionStatistics::new();
+        let mut stats = ExecutionStatistics::default();
 
         while let Some(task) = fetcher.fetch_task(&mut stats) {
             self.process_task(task);
