@@ -48,7 +48,7 @@ use super::{
     hashlife::HashLifeEngine,
     hashtable::{Idx, NodeStore, NodeStoreRef},
     node::QuadTreeNode,
-    sharded_statistics::ExecutionStatistics,
+    sharded_statistics::*,
     status,
 };
 use crossbeam::deque::{Steal, Stealer, Worker};
@@ -133,7 +133,8 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
     }
 
     /// Fetch a task from local queue or steal from other threads.
-    pub(super) fn fetch_task(&mut self, stats: &mut ExecutionStatistics) -> Option<T> {
+    /// Records steal/last-victim stats via thread-local execution statistics.
+    pub(super) fn fetch_task(&mut self) -> Option<T> {
         if (self.cancel_condition)() {
             return None;
         }
@@ -148,11 +149,12 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
         }
 
         // repeat last successful steal
-        let result = self.try_steal(self.last_victim, stats);
-        stats.record_last_victim_steal(&result);
+        let result = self.try_steal(self.last_victim);
         if result.is_some() {
+            record_last_victim_steal_success();
             return result;
         }
+        record_last_victim_steal_fail();
 
         let mut duration = Self::INITIAL_WAIT_DURATION;
         while !(self.finish_condition)() && !(self.cancel_condition)() {
@@ -164,11 +166,11 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
             } else {
                 (j, len_j)
             };
-            if victim_len > 0
-                && let Some(task) = self.try_steal(victim_id, stats)
-            {
-                self.last_victim = victim_id;
-                return Some(task);
+            if victim_len > 0 {
+                if let Some(task) = self.try_steal(victim_id) {
+                    self.last_victim = victim_id;
+                    return Some(task);
+                }
             }
 
             thread::sleep(duration);
@@ -188,15 +190,20 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
         i
     }
 
-    fn try_steal(&mut self, victim_id: usize, stats: &mut ExecutionStatistics) -> Option<T> {
+    fn try_steal(&mut self, victim_id: usize) -> Option<T> {
         loop {
             let result = self.stealers[victim_id]
                 .steal_batch_with_limit_and_pop(self.queue, Self::STEAL_BATCH_SIZE);
-            stats.record_steal_attempt(&result);
             match result {
-                Steal::Success(task) => return Some(task),
-                Steal::Empty => return None,
-                Steal::Retry => continue,
+                Steal::Success(task) => {
+                    record_steal_success();
+                    return Some(task);
+                }
+                Steal::Empty => {
+                    record_steal_empty();
+                    return None;
+                }
+                Steal::Retry => record_steal_retry(),
             }
         }
     }
@@ -236,7 +243,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
         start_processing_node(root_node, smallvec![]);
         queues[0].push(Task::new(self.root, self.size_log2));
 
-        let mut total_stats = ExecutionStatistics::default();
+        let mut total_stats = ExecutionStatistics::new();
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(num_threads);
             for (thread_idx, queue) in queues.into_iter().enumerate() {
@@ -286,12 +293,13 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
             || is_finished(&self.root_node.status),
             || self.mem.exceeds_load_factor(),
         );
-        let mut stats = ExecutionStatistics::default();
+        set_current_execution_stats();
 
-        while let Some(task) = fetcher.fetch_task(&mut stats) {
+        while let Some(task) = fetcher.fetch_task() {
             self.process_task(task);
         }
-        stats
+
+        take_current_execution_stats().unwrap()
     }
 
     /// Process a single task: compute the node's result or wait for dependencies.
@@ -475,6 +483,7 @@ fn start_processing_node<Meta: Default + Sync>(
         )
         .is_err()
     {
+        record_status_claim_fail();
         return false;
     }
 
@@ -484,16 +493,22 @@ fn start_processing_node<Meta: Default + Sync>(
     };
     node.cache.set_ptr(Box::into_raw(Box::new(pd)));
     node.status.store(status::PENDING, Ordering::Release);
+    record_status_claim_success();
     true
 }
 
 /// Atomically transition status from `from` to `to`, spinning until successful.
 fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8) {
-    while a
-        .compare_exchange_weak(from, to, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    loop {
+        if a.compare_exchange_weak(from, to, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            record_status_acquire_success();
+            return;
+        }
+        record_status_acquire_cmpxchg_fail();
         while a.load(Ordering::Relaxed) != from {
+            record_status_spin_on_processing();
             hint::spin_loop();
         }
     }
@@ -568,6 +583,7 @@ fn handle_dependency<Meta: Default + Sync>(
             Ordering::Acquire,
         ) {
             Ok(_) => {
+                record_status_acquire_success();
                 n.cache
                     .get_ref::<ProcessingData>()
                     .dependents
@@ -577,7 +593,9 @@ fn handle_dependency<Meta: Default + Sync>(
             }
             Err(status::FINISHED) => return DependencyHandlingResult::Ready,
             Err(status::PROCESSING) => {
+                record_status_acquire_cmpxchg_fail();
                 while n.status.load(Ordering::Relaxed) == status::PROCESSING {
+                    record_status_spin_on_processing();
                     hint::spin_loop()
                 }
             }

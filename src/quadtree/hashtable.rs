@@ -1,7 +1,4 @@
-use super::{
-    node::QuadTreeNode,
-    sharded_statistics::{LengthShard, ShardedLength},
-};
+use super::{node::QuadTreeNode, sharded_statistics::*};
 use std::{
     cell::UnsafeCell,
     hash::{Hash, Hasher},
@@ -142,8 +139,10 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
             }
 
             // STEP 2: Acquire slot lock
+            let mut spin_count = 0;
             loop {
                 while current_flags & FLAG_LOCKED != 0 {
+                    spin_count += 1;
                     current_flags = flags.load(Ordering::Relaxed);
                     hint::spin_loop();
                 }
@@ -153,8 +152,14 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => break,
-                    Err(value) => current_flags = value,
+                    Ok(_) => {
+                        record_hashtable_lock_acquired(spin_count);
+                        break;
+                    }
+                    Err(value) => {
+                        record_hashtable_cmpxchg_fail();
+                        current_flags = value;
+                    }
                 }
             }
 

@@ -230,7 +230,7 @@ fn determine_direction<Meta: Default + Sync>(
     let z64_centre_to_u64 = |x, y| {
         let xs = (4 + x) as u64;
         let ys = ((4 + y) << 3) as u64;
-        let bitmask: u64 = (0x0101010101010101 << xs) - 0x0101010101010101;
+        let bitmask = (0x0101010101010101 << xs) - 0x0101010101010101;
         let left = (nw >> ys) | (sw << (64 - ys));
         let right = (ne >> ys) | (se << (64 - ys));
         ((right & bitmask) << (8 - xs)) | ((left & (!bitmask)) >> xs)
@@ -323,7 +323,7 @@ fn node2lanes(
     };
 
     let mut childlanes = [0u64; 9];
-    let mut adml: u64 = 0xff;
+    let mut adml = 0xff;
     /*
      * Short-circuit evaluation using the corner children
      * This will handle the vast majority of random tiles.

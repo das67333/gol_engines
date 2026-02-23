@@ -15,7 +15,7 @@ use super::{
     LEAF_SIZE_LOG2, algorithm,
     hashlife_executor::{ProcessingGuard, TaskFetcher, is_finished},
     hashtable::{BinodeCache, BinodeCacheRef, Idx},
-    sharded_statistics::ExecutionStatistics,
+    sharded_statistics::*,
     status,
     streamlife::StreamLifeEngine,
 };
@@ -98,7 +98,7 @@ impl<'a> StreamLifeExecutor<'a> {
             size_log2: self.size_log2,
         });
 
-        let mut total_stats = ExecutionStatistics::default();
+        let mut total_stats = ExecutionStatistics::new();
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(num_threads);
             for (thread_idx, queue) in queues.into_iter().enumerate() {
@@ -153,12 +153,13 @@ impl<'a> BiExecutorThread<'a> {
             || is_finished(self.root_status),
             || self.engine.base.mem.exceeds_load_factor() || self.bicache_ref.exceeds_load_factor(),
         );
-        let mut stats = ExecutionStatistics::default();
+        set_current_execution_stats();
 
-        while let Some(task) = fetcher.fetch_task(&mut stats) {
+        while let Some(task) = fetcher.fetch_task() {
             self.process_task(task);
         }
-        stats
+
+        take_current_execution_stats().unwrap()
     }
 
     /// Process a single binode task.
@@ -423,9 +424,11 @@ fn start_processing_entry(
         )
         .is_err()
     {
+        record_status_claim_fail();
         return false;
     }
 
+    record_status_claim_success();
     let pd = BiProcessingData {
         dependents,
         ..Default::default()
@@ -485,6 +488,7 @@ fn handle_bi_dependency(
             Ordering::Acquire,
         ) {
             Ok(_) => {
+                record_status_acquire_success();
                 let child_data: &mut BiProcessingData = child_entry.payload.get_ref();
                 child_data.dependents.push(BiTask {
                     entry_idx: parent_entry_idx,
@@ -495,7 +499,9 @@ fn handle_bi_dependency(
             }
             Err(status::FINISHED) => return BiDependencyResult::Ready,
             Err(status::PROCESSING) => {
+                record_status_acquire_cmpxchg_fail();
                 while status.load(Ordering::Relaxed) == status::PROCESSING {
+                    record_status_spin_on_processing();
                     hint::spin_loop()
                 }
             }
