@@ -1,4 +1,4 @@
-use crossbeam::utils::CachePadded;
+use crossbeam::{deque::Steal, utils::CachePadded};
 use std::{
     cell::RefCell,
     sync::atomic::{AtomicUsize, Ordering},
@@ -65,6 +65,49 @@ impl<'a> LengthShard<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub(super) enum SpinlockKind {
+    // Hashtable slot locks
+    NodeStoreLock = 0,
+    BinodeCacheLock = 1,
+    // PENDING -> PROCESSING status acquire
+    ProcessTask = 2,
+    NotifyDep = 3,
+    HandleDep = 4,
+    HandleBiDep = 5,
+    // Algorithm spin-wait on FINISHED
+    Node2Lanes = 6,
+    UpdateNodeSync = 7,
+}
+
+impl SpinlockKind {
+    const COUNT: usize = 8;
+    const ALL: [Self; Self::COUNT] = [
+        Self::NodeStoreLock,
+        Self::BinodeCacheLock,
+        Self::ProcessTask,
+        Self::NotifyDep,
+        Self::HandleDep,
+        Self::HandleBiDep,
+        Self::Node2Lanes,
+        Self::UpdateNodeSync,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NodeStoreLock => "node_store_lock",
+            Self::BinodeCacheLock => "binode_cache_lock",
+            Self::ProcessTask => "process_task",
+            Self::NotifyDep => "notify_dep",
+            Self::HandleDep => "handle_dep",
+            Self::HandleBiDep => "handle_bi_dep",
+            Self::Node2Lanes => "node2lanes",
+            Self::UpdateNodeSync => "update_node_sync",
+        }
+    }
+}
+
 pub(super) struct ExecutionStatistics {
     // Steal attempts
     steal_success: u64,
@@ -72,17 +115,13 @@ pub(super) struct ExecutionStatistics {
     steal_retry: u64,
     last_victim_steal_success: u64,
     last_victim_steal_fail: u64,
-    // Hashtable slot lock (find_or_create)
-    hashtable_lock_acquire_success: u64,
+    // Hashtable CAS failures (across all hashtable types)
     hashtable_cmpxchg_fail: u64,
-    /// Approximate distribution: bucket i counts acquisitions with spin_count in (2^(i-1), 2^i] (bucket 0 = 0 spins).
-    hashtable_lock_spin_distribution: [u64; Self::SPIN_DISTRIBUTION_BUCKETS],
-    // Status transitions (NOT_STARTED -> PROCESSING claim, PENDING -> PROCESSING acquire)
+    // Status transitions (NOT_STARTED -> PROCESSING claim)
     status_claim_success: u64,
     status_claim_fail: u64,
-    status_acquire_success: u64,
-    status_acquire_cmpxchg_fail: u64,
-    status_spin_on_processing: u64,
+    /// Per-spinlock-kind spin distributions.
+    spinlock_distributions: [[u64; Self::SPIN_DISTRIBUTION_BUCKETS]; SpinlockKind::COUNT],
 }
 
 thread_local! {
@@ -108,14 +147,18 @@ fn spin_count_to_bucket(spin_count: u64) -> usize {
     (i as usize).min(ExecutionStatistics::SPIN_DISTRIBUTION_BUCKETS - 1)
 }
 
-/// Record successful hashtable lock acquisition with the given number of spin iterations.
-/// Stored in buckets by (spin_count + 1).next_power_of_two() (approximate).
-pub(super) fn record_hashtable_lock_acquired(spin_count: u64) {
-    with_current_stats(|st| {
-        st.hashtable_lock_acquire_success += 1;
-        let b = spin_count_to_bucket(spin_count);
-        st.hashtable_lock_spin_distribution[b] += 1;
-    });
+fn fmt_spin_distribution(
+    f: &mut std::fmt::Formatter<'_>,
+    label: &str,
+    dist: &[u64],
+) -> std::fmt::Result {
+    writeln!(f, "{label} (by spins, count):")?;
+    for (i, &v) in dist.iter().enumerate().filter(|(_, v)| **v != 0) {
+        let min_spin = if i == 0 { 0 } else { 1u64 << (i - 1) };
+        let max_spin = (1u64 << i) - 1;
+        writeln!(f, "\t{}..={} -> {}", min_spin, max_spin, v)?;
+    }
+    Ok(())
 }
 
 /// Record one failed compare_exchange when acquiring hashtable slot lock.
@@ -133,40 +176,31 @@ pub(super) fn record_status_claim_fail() {
     with_current_stats(|st| st.status_claim_fail += 1);
 }
 
-/// Record PENDING -> PROCESSING acquire success.
-pub(super) fn record_status_acquire_success() {
-    with_current_stats(|st| st.status_acquire_success += 1);
-}
-
-/// Record one failed compare_exchange in PENDING -> PROCESSING acquire.
-pub(super) fn record_status_acquire_cmpxchg_fail() {
-    with_current_stats(|st| st.status_acquire_cmpxchg_fail += 1);
-}
-
-/// Record one spin iteration waiting for PROCESSING to end.
-pub(super) fn record_status_spin_on_processing() {
-    with_current_stats(|st| st.status_spin_on_processing += 1);
+/// Record successful spinlock acquisition with the given number of spin iterations.
+pub(super) fn record_spinlock_acquired(spin_count: u64, kind: SpinlockKind) {
+    with_current_stats(|st| {
+        let dist = &mut st.spinlock_distributions[kind as usize];
+        dist[spin_count_to_bucket(spin_count)] += 1;
+    });
 }
 
 /// Record steal attempt outcome (thread-local).
-pub(super) fn record_steal_success() {
-    with_current_stats(|st| st.steal_success += 1);
+pub(super) fn record_steal<Task>(result: &Steal<Task>) {
+    with_current_stats(|st| match result {
+        Steal::Success(_) => st.steal_success += 1,
+        Steal::Empty => st.steal_empty += 1,
+        Steal::Retry => st.steal_retry += 1,
+    });
 }
 
-pub(super) fn record_steal_empty() {
-    with_current_stats(|st| st.steal_empty += 1);
-}
-
-pub(super) fn record_steal_retry() {
-    with_current_stats(|st| st.steal_retry += 1);
-}
-
-pub(super) fn record_last_victim_steal_success() {
-    with_current_stats(|st| st.last_victim_steal_success += 1);
-}
-
-pub(super) fn record_last_victim_steal_fail() {
-    with_current_stats(|st| st.last_victim_steal_fail += 1);
+pub(super) fn record_last_victim_steal<Task>(result: &Option<Task>) {
+    with_current_stats(|st| {
+        if result.is_some() {
+            st.last_victim_steal_success += 1
+        } else {
+            st.last_victim_steal_fail += 1
+        }
+    });
 }
 
 impl ExecutionStatistics {
@@ -179,14 +213,10 @@ impl ExecutionStatistics {
             steal_retry: 0,
             last_victim_steal_success: 0,
             last_victim_steal_fail: 0,
-            hashtable_lock_acquire_success: 0,
             hashtable_cmpxchg_fail: 0,
-            hashtable_lock_spin_distribution: [0; Self::SPIN_DISTRIBUTION_BUCKETS],
             status_claim_success: 0,
             status_claim_fail: 0,
-            status_acquire_success: 0,
-            status_acquire_cmpxchg_fail: 0,
-            status_spin_on_processing: 0,
+            spinlock_distributions: [[0; Self::SPIN_DISTRIBUTION_BUCKETS]; SpinlockKind::COUNT],
         }
     }
 
@@ -196,16 +226,18 @@ impl ExecutionStatistics {
         self.steal_retry += other.steal_retry;
         self.last_victim_steal_success += other.last_victim_steal_success;
         self.last_victim_steal_fail += other.last_victim_steal_fail;
-        self.hashtable_lock_acquire_success += other.hashtable_lock_acquire_success;
         self.hashtable_cmpxchg_fail += other.hashtable_cmpxchg_fail;
-        for (i, v) in other.hashtable_lock_spin_distribution.iter().enumerate() {
-            self.hashtable_lock_spin_distribution[i] += v;
-        }
         self.status_claim_success += other.status_claim_success;
         self.status_claim_fail += other.status_claim_fail;
-        self.status_acquire_success += other.status_acquire_success;
-        self.status_acquire_cmpxchg_fail += other.status_acquire_cmpxchg_fail;
-        self.status_spin_on_processing += other.status_spin_on_processing;
+        for (dst_dist, src_dist) in self
+            .spinlock_distributions
+            .iter_mut()
+            .zip(other.spinlock_distributions.iter())
+        {
+            for (dst, src) in dst_dist.iter_mut().zip(src_dist.iter()) {
+                *dst += *src;
+            }
+        }
     }
 }
 
@@ -226,43 +258,26 @@ impl std::fmt::Display for ExecutionStatistics {
         )?;
         writeln!(
             f,
-            "Hashtable lock acquire success: {}",
-            self.hashtable_lock_acquire_success
-        )?;
-        writeln!(
-            f,
             "Hashtable cmpxchg fail (lock acquire): {}",
             self.hashtable_cmpxchg_fail
         )?;
-        {
-            writeln!(f, "Hashtable lock spin distribution (by spins, count):")?;
-            for (i, &v) in self
-                .hashtable_lock_spin_distribution
-                .iter()
-                .filter(|&v| *v != 0)
-                .enumerate()
-            {
-                let min_spin = if i == 0 { 0 } else { 1u64 << (i - 1) };
-                let max_spin = (1u64 << i) - 1;
-                writeln!(f, "\t{}..={} -> {}", min_spin, max_spin, v)?;
-            }
-        }
         writeln!(f, "Status claim success: {}", self.status_claim_success)?;
         writeln!(
             f,
             "Status claim fail (NOT_STARTED->PROCESSING): {}",
             self.status_claim_fail
         )?;
-        writeln!(f, "Status acquire success: {}", self.status_acquire_success)?;
-        writeln!(
-            f,
-            "Status acquire cmpxchg fail (PENDING->PROCESSING): {}",
-            self.status_acquire_cmpxchg_fail
-        )?;
-        write!(
-            f,
-            "Status spin on PROCESSING: {}",
-            self.status_spin_on_processing
-        )
+        for kind in SpinlockKind::ALL {
+            let dist = &self.spinlock_distributions[kind as usize];
+            let total: u64 = dist.iter().sum();
+            if total > 0 {
+                fmt_spin_distribution(
+                    f,
+                    &format!("Spinlock [{}] ({} total)", kind.label(), total),
+                    dist,
+                )?;
+            }
+        }
+        Ok(())
     }
 }

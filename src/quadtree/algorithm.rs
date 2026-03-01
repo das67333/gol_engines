@@ -2,6 +2,7 @@ use super::{
     LEAF_SIZE, LEAF_SIZE_LOG2,
     blank::BlankNodes,
     hashtable::{Idx, NodeAccess},
+    sharded_statistics::{SpinlockKind, record_spinlock_acquired},
     status,
 };
 use std::{hint, sync::atomic::Ordering};
@@ -304,9 +305,12 @@ fn node2lanes(
             )
             .is_ok())
     {
+        let mut spin_count = 0u64;
         while n.status_extra.load(Ordering::Acquire) != status::FINISHED {
+            spin_count += 1;
             hint::spin_loop();
         }
+        record_spinlock_acquired(spin_count, SpinlockKind::Node2Lanes);
         return unsafe { *n.extra.get() };
     }
 
@@ -583,12 +587,15 @@ pub(super) fn update_node_sync(
         n.status.store(status::FINISHED, Ordering::Release);
         cache
     } else {
+        let mut spin_count = 0u64;
         while n.status.load(Ordering::Acquire) != status::FINISHED {
             // if ExecutionStatistics::is_poisoned() {
             //     return Idx::default();
             // }
+            spin_count += 1;
             hint::spin_loop();
         }
+        record_spinlock_acquired(spin_count, SpinlockKind::UpdateNodeSync);
         n.cache.get_value()
     }
 }

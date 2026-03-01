@@ -150,11 +150,10 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
 
         // repeat last successful steal
         let result = self.try_steal(self.last_victim);
+        record_last_victim_steal(&result);
         if result.is_some() {
-            record_last_victim_steal_success();
             return result;
         }
-        record_last_victim_steal_fail();
 
         let mut duration = Self::INITIAL_WAIT_DURATION;
         while !(self.finish_condition)() && !(self.cancel_condition)() {
@@ -194,16 +193,11 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
         loop {
             let result = self.stealers[victim_id]
                 .steal_batch_with_limit_and_pop(self.queue, Self::STEAL_BATCH_SIZE);
+            record_steal(&result);
             match result {
-                Steal::Success(task) => {
-                    record_steal_success();
-                    return Some(task);
-                }
-                Steal::Empty => {
-                    record_steal_empty();
-                    return None;
-                }
-                Steal::Retry => record_steal_retry(),
+                Steal::Success(task) => return Some(task),
+                Steal::Empty => return None,
+                Steal::Retry => continue,
             }
         }
     }
@@ -311,7 +305,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
     /// 4. If dependencies needed: guard drops, status returns to PENDING
     fn process_task(&self, task: Task) {
         let n = self.mem.get(task.idx);
-        let mut guard = ProcessingGuard::new(&n.status);
+        let mut guard = ProcessingGuard::new(&n.status, SpinlockKind::ProcessTask);
         let data: &mut ProcessingData = n.cache.get_ref();
         if let Some(result) = self.update_node(&task, n.parts(), data) {
             n.cache.set_value(result);
@@ -444,7 +438,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
         for &dependent in dependents.iter() {
             let n = self.mem.get(dependent);
             let waiting_cnt = {
-                let _guard = ProcessingGuard::new(&n.status);
+                let _guard = ProcessingGuard::new(&n.status, SpinlockKind::NotifyDep);
                 let dep_data: &mut ProcessingData = n.cache.get_ref();
                 dep_data.waiting_cnt -= 1;
                 dep_data.waiting_cnt
@@ -498,17 +492,17 @@ fn start_processing_node<Meta: Default + Sync>(
 }
 
 /// Atomically transition status from `from` to `to`, spinning until successful.
-fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8) {
+fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8, kind: SpinlockKind) {
+    let mut spin_count = 0u64;
     loop {
         if a.compare_exchange_weak(from, to, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            record_status_acquire_success();
+            record_spinlock_acquired(spin_count, kind);
             return;
         }
-        record_status_acquire_cmpxchg_fail();
         while a.load(Ordering::Relaxed) != from {
-            record_status_spin_on_processing();
+            spin_count += 1;
             hint::spin_loop();
         }
     }
@@ -526,8 +520,8 @@ pub(super) struct ProcessingGuard<'a> {
 
 impl<'a> ProcessingGuard<'a> {
     /// Acquire PROCESSING status, spinning until PENDING.
-    pub(super) fn new(status: &'a AtomicU8) -> Self {
-        atomic_transition_loop(status, status::PENDING, status::PROCESSING);
+    pub(super) fn new(status: &'a AtomicU8, kind: SpinlockKind) -> Self {
+        atomic_transition_loop(status, status::PENDING, status::PROCESSING, kind);
         Self {
             status,
             released: false,
@@ -575,6 +569,7 @@ fn handle_dependency<Meta: Default + Sync>(
         return DependencyHandlingResult::StartedByThisThread;
     }
 
+    let mut spin_count = 0u64;
     loop {
         match n.status.compare_exchange_weak(
             status::PENDING,
@@ -583,7 +578,7 @@ fn handle_dependency<Meta: Default + Sync>(
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                record_status_acquire_success();
+                record_spinlock_acquired(spin_count, SpinlockKind::HandleDep);
                 n.cache
                     .get_ref::<ProcessingData>()
                     .dependents
@@ -593,9 +588,8 @@ fn handle_dependency<Meta: Default + Sync>(
             }
             Err(status::FINISHED) => return DependencyHandlingResult::Ready,
             Err(status::PROCESSING) => {
-                record_status_acquire_cmpxchg_fail();
                 while n.status.load(Ordering::Relaxed) == status::PROCESSING {
-                    record_status_spin_on_processing();
+                    spin_count += 1;
                     hint::spin_loop()
                 }
             }

@@ -122,6 +122,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         &self,
         hash: usize,
         target_flags: u8,
+        kind: SpinlockKind,
         key_matches: impl Fn(*const E) -> bool,
         init: impl FnOnce(*mut E),
     ) -> (Idx, bool) {
@@ -153,7 +154,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        record_hashtable_lock_acquired(spin_count);
+                        record_spinlock_acquired(spin_count, kind);
                         break;
                     }
                     Err(value) => {
@@ -320,6 +321,7 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
         self.inner.find_or_create(
             hash,
             target_flags,
+            SpinlockKind::NodeStoreLock,
             |slot| unsafe { ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) == (nw, ne, sw, se) },
             |slot| unsafe {
                 ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) = (nw, ne, sw, se);
@@ -342,6 +344,7 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
         self.inner.find_or_create(
             hash,
             target_flags,
+            SpinlockKind::NodeStoreLock,
             |slot| unsafe { ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) == (nw, ne, sw, se) },
             |slot| unsafe {
                 ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) = (nw, ne, sw, se);
@@ -499,6 +502,7 @@ impl BinodeCache {
         self.inner.find_or_create(
             hash,
             FLAG_USED,
+            SpinlockKind::BinodeCacheLock,
             |slot| unsafe { (*slot).key == key },
             |slot| unsafe {
                 (*slot).key = key;

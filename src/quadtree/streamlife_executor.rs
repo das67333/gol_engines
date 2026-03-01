@@ -172,7 +172,7 @@ impl<'a> BiExecutorThread<'a> {
     fn process_task(&self, task: BiTask) {
         let entry = self.bicache_ref.get(task.entry_idx);
         let status = entry.status();
-        let mut guard = ProcessingGuard::new(status);
+        let mut guard = ProcessingGuard::new(status, SpinlockKind::ProcessTask);
         let data: &mut BiProcessingData = entry.payload.get_ref();
         let idx = entry.key();
 
@@ -385,7 +385,7 @@ impl<'a> BiExecutorThread<'a> {
             let entry = self.bicache_ref.get(dep.entry_idx);
             let status = entry.status();
             let waiting_cnt = {
-                let _guard = ProcessingGuard::new(status);
+                let _guard = ProcessingGuard::new(status, SpinlockKind::NotifyDep);
                 let dep_data: &mut BiProcessingData = entry.payload.get_ref();
                 dep_data.waiting_cnt -= 1;
                 dep_data.waiting_cnt
@@ -480,6 +480,7 @@ fn handle_bi_dependency(
 
     // Entry is being processed by another thread (or just claimed above by a racing thread).
     // Spin until we can register as dependent.
+    let mut spin_count = 0u64;
     loop {
         match status.compare_exchange_weak(
             status::PENDING,
@@ -488,7 +489,7 @@ fn handle_bi_dependency(
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                record_status_acquire_success();
+                record_spinlock_acquired(spin_count, SpinlockKind::HandleBiDep);
                 let child_data: &mut BiProcessingData = child_entry.payload.get_ref();
                 child_data.dependents.push(BiTask {
                     entry_idx: parent_entry_idx,
@@ -499,9 +500,8 @@ fn handle_bi_dependency(
             }
             Err(status::FINISHED) => return BiDependencyResult::Ready,
             Err(status::PROCESSING) => {
-                record_status_acquire_cmpxchg_fail();
                 while status.load(Ordering::Relaxed) == status::PROCESSING {
-                    record_status_spin_on_processing();
+                    spin_count += 1;
                     hint::spin_loop()
                 }
             }
