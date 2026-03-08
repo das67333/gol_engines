@@ -156,7 +156,9 @@ impl<'a> BiExecutorThread<'a> {
         set_current_execution_stats();
 
         while let Some(task) = fetcher.fetch_task() {
+            let start = Ticks::now();
             self.process_task(task);
+            record_task_duration(Ticks::now().elapsed_since(start));
         }
 
         take_current_execution_stats().unwrap()
@@ -172,7 +174,7 @@ impl<'a> BiExecutorThread<'a> {
     fn process_task(&self, task: BiTask) {
         let entry = self.bicache_ref.get(task.entry_idx);
         let status = entry.status();
-        let mut guard = ProcessingGuard::new(status, SpinlockKind::ProcessTask);
+        let mut guard = ProcessingGuard::new(status, MetricKind::ProcessTask);
         let data: &mut BiProcessingData = entry.payload.get_ref();
         let idx = entry.key();
 
@@ -385,7 +387,7 @@ impl<'a> BiExecutorThread<'a> {
             let entry = self.bicache_ref.get(dep.entry_idx);
             let status = entry.status();
             let waiting_cnt = {
-                let _guard = ProcessingGuard::new(status, SpinlockKind::NotifyDep);
+                let _guard = ProcessingGuard::new(status, MetricKind::NotifyDep);
                 let dep_data: &mut BiProcessingData = entry.payload.get_ref();
                 dep_data.waiting_cnt -= 1;
                 dep_data.waiting_cnt
@@ -489,7 +491,7 @@ fn handle_bi_dependency(
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                record_spinlock_acquired(spin_count, SpinlockKind::HandleBiDep);
+                record_metric(spin_count, MetricKind::HandleBiDep);
                 let child_data: &mut BiProcessingData = child_entry.payload.get_ref();
                 child_data.dependents.push(BiTask {
                     entry_idx: parent_entry_idx,

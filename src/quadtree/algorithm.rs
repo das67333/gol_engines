@@ -2,7 +2,7 @@ use super::{
     LEAF_SIZE, LEAF_SIZE_LOG2,
     blank::BlankNodes,
     hashtable::{Idx, NodeAccess},
-    sharded_statistics::{SpinlockKind, record_spinlock_acquired},
+    sharded_statistics::{MetricKind, record_metric},
     status,
 };
 use std::{hint, sync::atomic::Ordering};
@@ -310,7 +310,7 @@ fn node2lanes(
             spin_count += 1;
             hint::spin_loop();
         }
-        record_spinlock_acquired(spin_count, SpinlockKind::Node2Lanes);
+        record_metric(spin_count, MetricKind::Node2Lanes);
         return unsafe { *n.extra.get() };
     }
 
@@ -595,7 +595,7 @@ pub(super) fn update_node_sync(
             spin_count += 1;
             hint::spin_loop();
         }
-        record_spinlock_acquired(spin_count, SpinlockKind::UpdateNodeSync);
+        record_metric(spin_count, MetricKind::UpdateNodeSync);
         n.cache.get_value()
     }
 }

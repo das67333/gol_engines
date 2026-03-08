@@ -290,7 +290,9 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
         set_current_execution_stats();
 
         while let Some(task) = fetcher.fetch_task() {
+            let start = Ticks::now();
             self.process_task(task);
+            record_task_duration(Ticks::now().elapsed_since(start));
         }
 
         take_current_execution_stats().unwrap()
@@ -305,7 +307,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
     /// 4. If dependencies needed: guard drops, status returns to PENDING
     fn process_task(&self, task: Task) {
         let n = self.mem.get(task.idx);
-        let mut guard = ProcessingGuard::new(&n.status, SpinlockKind::ProcessTask);
+        let mut guard = ProcessingGuard::new(&n.status, MetricKind::ProcessTask);
         let data: &mut ProcessingData = n.cache.get_ref();
         if let Some(result) = self.update_node(&task, n.parts(), data) {
             n.cache.set_value(result);
@@ -438,7 +440,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
         for &dependent in dependents.iter() {
             let n = self.mem.get(dependent);
             let waiting_cnt = {
-                let _guard = ProcessingGuard::new(&n.status, SpinlockKind::NotifyDep);
+                let _guard = ProcessingGuard::new(&n.status, MetricKind::NotifyDep);
                 let dep_data: &mut ProcessingData = n.cache.get_ref();
                 dep_data.waiting_cnt -= 1;
                 dep_data.waiting_cnt
@@ -492,13 +494,13 @@ fn start_processing_node<Meta: Default + Sync>(
 }
 
 /// Atomically transition status from `from` to `to`, spinning until successful.
-fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8, kind: SpinlockKind) {
+fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8, kind: MetricKind) {
     let mut spin_count = 0u64;
     loop {
         if a.compare_exchange_weak(from, to, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            record_spinlock_acquired(spin_count, kind);
+            record_metric(spin_count, kind);
             return;
         }
         while a.load(Ordering::Relaxed) != from {
@@ -520,7 +522,7 @@ pub(super) struct ProcessingGuard<'a> {
 
 impl<'a> ProcessingGuard<'a> {
     /// Acquire PROCESSING status, spinning until PENDING.
-    pub(super) fn new(status: &'a AtomicU8, kind: SpinlockKind) -> Self {
+    pub(super) fn new(status: &'a AtomicU8, kind: MetricKind) -> Self {
         atomic_transition_loop(status, status::PENDING, status::PROCESSING, kind);
         Self {
             status,
@@ -578,7 +580,7 @@ fn handle_dependency<Meta: Default + Sync>(
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                record_spinlock_acquired(spin_count, SpinlockKind::HandleDep);
+                record_metric(spin_count, MetricKind::HandleDep);
                 n.cache
                     .get_ref::<ProcessingData>()
                     .dependents
