@@ -165,11 +165,11 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
             } else {
                 (j, len_j)
             };
-            if victim_len > 0 {
-                if let Some(task) = self.try_steal(victim_id) {
-                    self.last_victim = victim_id;
-                    return Some(task);
-                }
+            if victim_len > 0
+                && let Some(task) = self.try_steal(victim_id)
+            {
+                self.last_victim = victim_id;
+                return Some(task);
             }
 
             thread::sleep(duration);

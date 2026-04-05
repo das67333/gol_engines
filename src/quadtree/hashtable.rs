@@ -157,10 +157,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
                         record_metric(spin_count, kind);
                         break;
                     }
-                    Err(value) => {
-                        record_hashtable_cmpxchg_fail();
-                        current_flags = value;
-                    }
+                    Err(value) => current_flags = value,
                 }
             }
 

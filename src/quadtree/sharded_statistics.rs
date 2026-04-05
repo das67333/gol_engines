@@ -150,8 +150,6 @@ pub(super) struct ExecutionStatistics {
     steal_retry: u64,
     last_victim_steal_success: u64,
     last_victim_steal_fail: u64,
-    // Hashtable CAS failures (across all hashtable types)
-    hashtable_cmpxchg_fail: u64,
     // Status transitions (NOT_STARTED -> PROCESSING claim)
     status_claim_success: u64,
     status_claim_fail: u64,
@@ -160,7 +158,7 @@ pub(super) struct ExecutionStatistics {
 }
 
 thread_local! {
-    static CURRENT_STATS: RefCell<Option<Box<ExecutionStatistics>>> = RefCell::new(None);
+    static CURRENT_STATS: RefCell<Option<Box<ExecutionStatistics>>> = const { RefCell::new(None) };
 }
 
 /// Set the current thread's execution statistics sink (owned by the thread-local).
@@ -177,19 +175,19 @@ fn with_current_stats<R>(f: impl FnOnce(&mut ExecutionStatistics) -> R) {
     CURRENT_STATS.with(|cell| cell.borrow_mut().as_deref_mut().map(f));
 }
 
-/// Log2 bucket assignment. Bucket 0 = [0, 1), bucket i (i>=1) = [2^(i-1), 2^i).
+/// Log2 bucket assignment. Bucket 0 = {0}, bucket i (i>=1) = [2^(i-1), 2^i - 1].
 fn value_to_bucket(value: u64) -> usize {
     let i = (value + 1).next_power_of_two().trailing_zeros();
     (i as usize).min(ExecutionStatistics::DISTRIBUTION_BUCKETS - 1)
 }
 
-/// Bin range for bucket i: [lo, hi).
-/// Bucket 0 = [0, 1), bucket i (i>=1) = [2^(i-1), 2^i).
+/// Inclusive bin range for bucket i: [lo, hi].
+/// Bucket 0 = {0}, bucket i (i>=1) = [2^(i-1), 2^i - 1].
 fn bin_range(i: usize) -> (f64, f64) {
     if i == 0 {
-        (0.0, 1.0)
+        (0.0, 0.0)
     } else {
-        (2f64.powi(i as i32 - 1), 2f64.powi(i as i32))
+        (2f64.powi(i as i32 - 1), 2f64.powi(i as i32) - 1.0)
     }
 }
 
@@ -203,10 +201,15 @@ const PERCENTILES: &[(f64, &str)] = &[
     (0.999999, "p(6)"),
     (0.9999999, "p(7)"),
     (0.99999999, "p(8)"),
+    (1.0, "max"),
 ];
 
 /// Compute percentile values from a histogram, assuming uniform distribution within each bin.
 fn compute_percentiles(dist: &[u64]) -> Vec<f64> {
+    assert!(
+        PERCENTILES.windows(2).all(|w| w[0].0 <= w[1].0),
+        "PERCENTILES must be sorted in ascending order"
+    );
     let total: u64 = dist.iter().sum();
     if total == 0 {
         return vec![0.0; PERCENTILES.len()];
@@ -269,13 +272,35 @@ fn fmt_distribution(
     kind: MetricKind,
     dist: &[u64],
 ) -> std::fmt::Result {
-    let total: u64 = dist.iter().sum();
-    if total == 0 {
+    let cnt: u64 = dist.iter().sum();
+    if cnt == 0 {
         return Ok(());
     }
+    let sum: u64 = dist
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let (lo, hi) = bin_range(i);
+            (lo + hi) * 0.5 * c as f64
+        })
+        .sum::<f64>() as u64;
     let percentiles = compute_percentiles(dist);
     let ns_per_tick = 1e9 / cntfrq() as f64;
-    write!(f, "{:<30} {:>10}", kind.label(), format_count(total))?;
+    let nnz: u64 = cnt - dist[0];
+    let sum_str = if kind.is_duration() {
+        format_ns(sum as f64 * ns_per_tick)
+    } else {
+        format_count(sum)
+    };
+
+    write!(
+        f,
+        "{:<30} {:>10} {:>10} {:>10}",
+        kind.label(),
+        sum_str,
+        format_count(cnt),
+        format_count(nnz)
+    )?;
     for &value in &percentiles {
         if kind.is_duration() {
             write!(f, " {:>8}", format_ns(value * ns_per_tick))?;
@@ -292,11 +317,6 @@ fn cntfrq() -> u64 {
         core::arch::asm!("mrs {0}, cntfrq_el0", out(reg) value);
     }
     value
-}
-
-/// Record one failed compare_exchange when acquiring hashtable slot lock.
-pub(super) fn record_hashtable_cmpxchg_fail() {
-    with_current_stats(|st| st.hashtable_cmpxchg_fail += 1);
 }
 
 /// Record NOT_STARTED -> PROCESSING claim success (this thread claimed).
@@ -350,7 +370,6 @@ impl ExecutionStatistics {
             steal_retry: 0,
             last_victim_steal_success: 0,
             last_victim_steal_fail: 0,
-            hashtable_cmpxchg_fail: 0,
             status_claim_success: 0,
             status_claim_fail: 0,
             distributions: [[0; Self::DISTRIBUTION_BUCKETS]; MetricKind::COUNT],
@@ -363,7 +382,6 @@ impl ExecutionStatistics {
         self.steal_retry += other.steal_retry;
         self.last_victim_steal_success += other.last_victim_steal_success;
         self.last_victim_steal_fail += other.last_victim_steal_fail;
-        self.hashtable_cmpxchg_fail += other.hashtable_cmpxchg_fail;
         self.status_claim_success += other.status_claim_success;
         self.status_claim_fail += other.status_claim_fail;
         for (dst_dist, src_dist) in self
@@ -380,32 +398,23 @@ impl ExecutionStatistics {
 
 impl std::fmt::Display for ExecutionStatistics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Steal attempts success: {}", self.steal_success)?;
-        writeln!(f, "Steal attempts empty: {}", self.steal_empty)?;
-        writeln!(f, "Steal attempts retry: {}", self.steal_retry)?;
         writeln!(
             f,
-            "Steal from last victim success: {}",
-            self.last_victim_steal_success
+            "Steal attempts: {} ok / {} empty / {} retry",
+            self.steal_success, self.steal_empty, self.steal_retry
         )?;
         writeln!(
             f,
-            "Steal from last victim fail: {}",
-            self.last_victim_steal_fail
+            "Last-victim steals: {} ok / {} fail",
+            self.last_victim_steal_success, self.last_victim_steal_fail
         )?;
         writeln!(
             f,
-            "Hashtable cmpxchg fail (lock acquire): {}",
-            self.hashtable_cmpxchg_fail
-        )?;
-        writeln!(f, "Status claim success: {}", self.status_claim_success)?;
-        writeln!(
-            f,
-            "Status claim fail (NOT_STARTED->PROCESSING): {}",
-            self.status_claim_fail
+            "Status claims: {} ok / {} fail",
+            self.status_claim_success, self.status_claim_fail
         )?;
         // Percentile header
-        write!(f, "{:<30} {:>10}", "", "total")?;
+        write!(f, "{:<30} {:>10} {:>10} {:>10}", "", "sum", "cnt", "nnz")?;
         for &(_, label) in PERCENTILES {
             write!(f, " {:>8}", label)?;
         }
