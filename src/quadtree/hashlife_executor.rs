@@ -263,6 +263,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
 
         assert!(is_finished(&self.mem.get(self.root).status));
         println!("Nodes count: {}", self.mem.len());
+        #[cfg(feature = "statistics")]
         println!("{total_stats}");
 
         Some(root_node.cache.get_value())
@@ -592,7 +593,7 @@ fn handle_dependency<Meta: Default + Sync>(
             Err(status::PROCESSING) => {
                 while n.status.load(Ordering::Relaxed) == status::PROCESSING {
                     spin_count += 1;
-                    hint::spin_loop()
+                    hint::spin_loop();
                 }
             }
             Err(value) => panic!("Unexpected status in handle_dependency: {}", value),

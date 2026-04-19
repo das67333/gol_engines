@@ -128,6 +128,7 @@ impl<'a> StreamLifeExecutor<'a> {
             self.engine.base.mem.len(),
             bicache.len()
         );
+        #[cfg(feature = "statistics")]
         println!("{total_stats}");
 
         Some(bicache.get(root_idx).payload.get_value())
