@@ -1,5 +1,6 @@
 mod algorithm;
 mod blank;
+mod dep_stack;
 mod hashlife;
 mod hashlife_executor;
 mod hashtable;

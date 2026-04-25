@@ -3,7 +3,7 @@ use num_bigint::BigInt;
 
 fn main() {
     let timer = std::time::Instant::now();
-    let mut engine = HashLifeEngine::new(16 << 10, 4);
+    let mut engine = HashLifeEngine::new(20 << 10, 4);
     println!("Time spent on initializing engine: {:?}", timer.elapsed());
 
     let timer = std::time::Instant::now();

@@ -21,8 +21,14 @@
 //!
 //! This space optimization reuses the same memory for both purposes.
 
-use super::hashtable::{CacheField, HashtableSlot, Idx};
-use std::{cell::UnsafeCell, sync::atomic::AtomicU8};
+use super::{
+    dep_stack::DepHead,
+    hashtable::{CacheField, HashtableSlot, Idx},
+};
+use std::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicU8, AtomicU16},
+};
 
 /// A node in the Hashlife quadtree.
 ///
@@ -48,6 +54,9 @@ use std::{cell::UnsafeCell, sync::atomic::AtomicU8};
 /// - `cache`: protected by status state machine, wraps [`UnsafeCell`]
 /// - `status`: atomic for concurrent state transitions
 /// - `flags`: atomic, combines node metadata and hashtable slot lock
+/// - `waiting_cnt`: atomic counter of still-pending dependencies
+/// - `dependents_head`: lock-free close-once stack of nodes waiting on this
+///   node's result
 #[derive(Debug, Default)]
 pub(super) struct QuadTreeNode<Meta> {
     /// Northwest child or lower 32 bits of leaf cells
@@ -64,6 +73,23 @@ pub(super) struct QuadTreeNode<Meta> {
     pub(super) status: AtomicU8,
     /// Flags are used in [`NodeStore::find_or_create_inner`]
     flags: AtomicU8,
+    /// Number of still-pending dependencies while the node is in
+    /// `PENDING`/`PROCESSING` state. Decremented atomically by notifier
+    /// threads via `fetch_sub`; a decrement that brings the value to zero
+    /// re-enqueues this node.
+    ///
+    /// Lives on the node (permanent storage) rather than inside
+    /// `ProcessingData` so that concurrent notifiers can decrement it
+    /// without risking use-after-free when the owner frees the
+    /// `ProcessingData` box at finish time.
+    ///
+    /// `AtomicU16` is sufficient: max concurrent outstanding dependencies
+    /// is 9 (stage-1 children) + 1 (owner's bias) = 10.
+    pub(super) waiting_cnt: AtomicU16,
+    /// Lock-free close-once stack of nodes waiting for this node's result.
+    /// Replaces the previous `SmallVec<_>` dependents list; see
+    /// [`super::dep_stack`] for the encoding and safety argument.
+    pub(super) dependents_head: DepHead,
     /// Meta data for StreamLife (unused in Hashlife)
     pub(super) extra: UnsafeCell<Meta>,
     pub(super) status_extra: AtomicU8,
