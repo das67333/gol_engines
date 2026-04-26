@@ -11,37 +11,57 @@
 //!
 //! ## Status State Machine
 //!
-//! Each node progresses through these states during parallel processing:
+//! Each node carries an `AtomicU8` interpreted as a bit-set (see [`status`]).
+//! The bits divide responsibilities so that independent transitions never
+//! contend on a single critical section:
 //!
 //! ```text
-//!     ┌──────────────────────┐
-//!     │    NOT_STARTED (0)   │ ◄── Initial state
-//!     └──────────┬───────────┘
-//!                │
-//!                │ CAS(NOT_STARTED → PROCESSING)
-//!                │ First thread claims the node
-//!                ▼
-//!     ┌──────────────────────┐                      ┌──────────────────────┐
-//!     │    PROCESSING (1)    │ ◄─┐                  │    FINISHED (3)      │
-//!     └──────────┬───────────┘   │                  └──────────────────────┘
-//!                │               │                            ▲
-//!                ├───────────────┼────────────────────────────┘
-//!                │               │  store(FINISHED) when computation completes
-//!                │               │
-//!                │ store(PENDING)│ CAS(PENDING → PROCESSING)
-//!                │ when waiting  │ when all dependencies ready
-//!                │ for deps      │
-//!                ▼               │
-//!     ┌──────────────────────┐   │
-//!     │     PENDING (2)      │ ──┘
-//!     └──────────────────────┘
+//!     NOT_STARTED ─CAS─► PROCESSING ─store─► PENDING ◄──fetch_xor── ACTIVE
+//!                        (init barrier:        ▲                      │
+//!                         pd not yet           │  CAS preserving      │
+//!                         installed)           │  DEPS_LOCK           │
+//!                                              └──────────────────────┘
+//!                                                      │
+//!                                                      │ CAS (DEPS_LOCK==0)
+//!                                                      ▼
+//!                                                  PROCESSING ─store─► FINISHED
+//!                                                  (finish barrier:
+//!                                                   pd is being drained,
+//!                                                   value is being written)
 //! ```
 //!
 //! Key transitions:
-//! - `NOT_STARTED → PROCESSING`: Thread claims node for processing
-//! - `PROCESSING → PENDING`: Node needs to wait for dependencies
-//! - `PENDING → PROCESSING`: All dependencies ready, resume processing
-//! - `PROCESSING → FINISHED`: Computation complete, result cached
+//! - `NOT_STARTED → PROCESSING`: A thread claims the node and is about to
+//!   install its [`ProcessingData`].
+//! - `PROCESSING → PENDING`: Init barrier ends; pushers may now register
+//!   dependents under `DEPS_LOCK`.
+//! - `PENDING → ACTIVE`: A worker dequeues the task and starts computing
+//!   (preserving any currently-held `DEPS_LOCK`).
+//! - `ACTIVE → PENDING`: Worker is parking the node while waiting for
+//!   dependencies (preserves `DEPS_LOCK`).
+//! - `ACTIVE → PROCESSING`: Finish barrier; spins until `DEPS_LOCK` is
+//!   clear, then no pusher can observe `pd` again.
+//! - `PROCESSING → FINISHED`: Result published, dependents drained.
+//!
+//! ## Dependents-list synchronization
+//!
+//! [`ProcessingData::dependents`] is mutated by two parties:
+//! - The owner during [`start_processing_node`] (exclusive: status is
+//!   `PROCESSING`, pushers spin) and during the finish barrier (exclusive:
+//!   status is `PROCESSING`, no `DEPS_LOCK` is held).
+//! - Pushers in [`handle_dependency`] under the transient `DEPS_LOCK` bit,
+//!   which can coexist with `PENDING` or `ACTIVE` so that the owner is never
+//!   blocked from running its computation.
+//!
+//! ## `waiting_cnt` synchronization
+//!
+//! [`ProcessingData::waiting_cnt`] is an [`AtomicU16`] manipulated lock-free
+//! with a bias trick: the owner adds [`WAITING_BIAS`] before scanning its
+//! children, increments by one for every dependency it registers, and
+//! subtracts the bias after the scan. Notifiers do `fetch_sub(1)`. The bias
+//! prevents a notifier from reaching zero while the owner is mid-scan; the
+//! thread that observes the counter become zero (either the owner upon
+//! `fetch_sub(BIAS)` or the last notifier) re-queues the parent task.
 
 use super::{
     LEAF_SIZE, LEAF_SIZE_LOG2, algorithm,
@@ -55,10 +75,16 @@ use crossbeam::deque::{Steal, Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
 use std::{
     hint, mem,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, AtomicU16, Ordering},
     thread,
     time::Duration,
 };
+
+/// Bias added to `waiting_cnt` while the owner is scanning children. Any
+/// value strictly greater than the maximum number of in-flight registrations
+/// per scan suffices; we choose a clearly out-of-band value so the counter
+/// never collides with a real outstanding-dependency count.
+const WAITING_BIAS: u16 = 1 << 15;
 
 /// List of nodes waiting for this node's result.
 ///
@@ -79,10 +105,14 @@ struct ProcessingData {
     mask9_waiting: u32,
     /// Bitmask: bit `i` set if `arr[i]` (among first 4) is not yet computed.
     mask4_waiting: u32,
-    /// Count of dependencies still being computed. Node can resume when this reaches 0.
-    waiting_cnt: u32,
+    /// Count of dependencies still being computed. The node resumes when this
+    /// reaches 0. Manipulated lock-free with the bias trick (see module docs).
+    waiting_cnt: AtomicU16,
     /// Nodes that registered as dependents of this node.
     /// Notified when this node finishes.
+    ///
+    /// Mutated by the owner exclusively during the init/finish barriers, and
+    /// by pushers in parallel under [`status::DEPS_LOCK`].
     dependents: Dependents,
 }
 
@@ -318,23 +348,31 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
         take_current_execution_stats().unwrap()
     }
 
-    /// Process a single task: compute the node's result or wait for dependencies.
+    /// Process a single task: compute the node's result or park it.
     ///
     /// Flow:
-    /// 1. Acquire PROCESSING status via `ProcessingGuard`
-    /// 2. Call `update_node` to compute result or identify dependencies
-    /// 3. If result ready: cache it, notify dependents, mark FINISHED
-    /// 4. If dependencies needed: guard drops, status returns to PENDING
+    /// 1. Acquire owner-mutex by transitioning `PENDING → ACTIVE` (preserving
+    ///    any currently-held `DEPS_LOCK`).
+    /// 2. Call `update_node` to compute the result or register dependencies.
+    /// 3. If a result is ready: cross the finish barrier (`ACTIVE → PROCESSING`
+    ///    once `DEPS_LOCK` clears), drain the dependents list, publish the
+    ///    value, transition to `FINISHED`, and notify dependents.
+    /// 4. If dependencies are needed: guard drop transitions `ACTIVE → PENDING`
+    ///    while preserving `DEPS_LOCK`.
     fn process_task(&self, task: Task) {
         let n = self.mem.get(task.idx);
         let mut guard = ProcessingGuard::new(&n.status, MetricKind::ProcessTask);
         let data: &mut ProcessingData = n.cache.get_ref();
         if let Some(result) = self.update_node(&task, n.parts(), data) {
-            n.cache.set_value(result);
+            // Cross the finish barrier so pushers stop touching `data` and the
+            // cache slot, then drain dependents, publish the value, and mark
+            // the node FINISHED.
+            guard.enter_finish_barrier(MetricKind::NotifyDep);
             let mut dependents = SmallVec::new();
             mem::swap(&mut data.dependents, &mut dependents);
-            guard.finish(); // Mark as FINISHED
-            unsafe { drop(Box::from_raw(data as *mut ProcessingData)) } // Free ProcessingData
+            n.cache.set_value(result);
+            guard.publish_finished();
+            unsafe { drop(Box::from_raw(data as *mut ProcessingData)) };
             self.notify_dependents(&task, dependents);
         }
     }
@@ -353,9 +391,15 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
     /// ## Dependency Handling
     ///
     /// When a child is not ready:
-    /// - `DependencyIsReady`: Child already computed, use cached result
+    /// - `Ready`: Child already computed, use cached result
     /// - `StartedByThisThread`: We claimed the child, register as dependent, push to local queue
     /// - `StartedByOtherThread`: Another thread processing it, register as dependent
+    ///
+    /// When the function returns `None` because at least one child is still
+    /// in flight, ownership of "wake-up duty" is transferred via the
+    /// `waiting_cnt` bias trick: whichever thread observes the counter become
+    /// zero (this owner via `fetch_sub(WAITING_BIAS)` or the last notifier
+    /// via `fetch_sub(1)`) is responsible for re-queuing the parent task.
     fn update_node(&self, task: &Task, parts: [Idx; 4], data: &mut ProcessingData) -> Option<Idx> {
         let both_stages = self.generations_log2 + 2 >= task.size_log2;
         let [nw, ne, sw, se] = parts;
@@ -386,7 +430,10 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
                     data.mask9_waiting = 0b1_1111_1111;
                 }
 
-                let mut waiting_cnt = 0;
+                // Bias `waiting_cnt` so concurrent notifiers cannot drive it
+                // to zero while we are still scanning.
+                data.waiting_cnt
+                    .fetch_add(WAITING_BIAS, Ordering::Relaxed);
                 for (i, x) in data.arr.iter_mut().enumerate() {
                     if data.mask9_waiting & (1 << i) == 0 {
                         continue;
@@ -398,17 +445,23 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
                             *x = d.cache.get_value();
                         }
                         DependencyHandlingResult::StartedByThisThread => {
+                            data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
                             self.queue.push(Task::new(*x, task.size_log2 - 1));
-                            waiting_cnt += 1;
                         }
                         DependencyHandlingResult::StartedByOtherThread => {
-                            waiting_cnt += 1;
+                            data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
+                let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
 
                 if data.mask9_waiting != 0 {
-                    data.waiting_cnt = waiting_cnt;
+                    if prev == WAITING_BIAS {
+                        // Every dependency we registered already notified
+                        // before our `fetch_sub`; re-queue ourselves so the
+                        // mask gets re-scanned with their now-`Ready` status.
+                        self.queue.push(Task::new(task.idx, task.size_log2));
+                    }
                     return None;
                 }
             }
@@ -418,7 +471,8 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
             data.mask4_waiting = 0b1111;
         }
 
-        let mut waiting_cnt = 0;
+        data.waiting_cnt
+            .fetch_add(WAITING_BIAS, Ordering::Relaxed);
         for (i, x) in data.arr.iter_mut().take(4).enumerate() {
             if data.mask4_waiting & (1 << i) == 0 {
                 continue;
@@ -430,17 +484,20 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
                     *x = d.cache.get_value();
                 }
                 DependencyHandlingResult::StartedByThisThread => {
+                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
                     self.queue.push(Task::new(*x, task.size_log2 - 1));
-                    waiting_cnt += 1;
                 }
                 DependencyHandlingResult::StartedByOtherThread => {
-                    waiting_cnt += 1;
+                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
+        let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
 
         if data.mask4_waiting != 0 {
-            data.waiting_cnt = waiting_cnt;
+            if prev == WAITING_BIAS {
+                self.queue.push(Task::new(task.idx, task.size_log2));
+            }
             return None;
         }
 
@@ -452,20 +509,19 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
 
     /// Notify dependent nodes that this dependency has completed.
     ///
-    /// For each dependent:
-    /// 1. Acquire PROCESSING status
-    /// 2. Decrement its `waiting_cnt`
-    /// 3. If `waiting_cnt` reaches 0, re-queue for processing
+    /// For each dependent we atomically decrement its `waiting_cnt`. The
+    /// thread that drives the counter to zero (this notifier or the owner's
+    /// own `fetch_sub(WAITING_BIAS)` at the end of its scan) is responsible
+    /// for re-queuing the parent. Notifiers do not take any lock on the
+    /// dependent node: `waiting_cnt` is atomic, and `ProcessingData` stays
+    /// alive until `FINISHED` (which only the owner can publish, after the
+    /// counter has dropped to zero).
     fn notify_dependents(&self, task: &Task, dependents: Dependents) {
         for &dependent in dependents.iter() {
             let n = self.mem.get(dependent);
-            let waiting_cnt = {
-                let _guard = ProcessingGuard::new(&n.status, MetricKind::NotifyDep);
-                let dep_data: &mut ProcessingData = n.cache.get_ref();
-                dep_data.waiting_cnt -= 1;
-                dep_data.waiting_cnt
-            };
-            if waiting_cnt == 0 {
+            let dep_data: &ProcessingData = n.cache.get_ref();
+            let prev = dep_data.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
+            if prev == 1 {
                 self.queue.push(Task::new(dependent, task.size_log2 + 1));
             }
         }
@@ -474,17 +530,20 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
 
 /// Check if a status field indicates FINISHED.
 pub(super) fn is_finished(status: &AtomicU8) -> bool {
-    status.load(Ordering::Acquire) == status::FINISHED
+    status.load(Ordering::Acquire) & status::FINISHED != 0
 }
 
-/// Initialize a node for processing by transitioning NOT_STARTED → PROCESSING → PENDING.
+/// Initialize a node for processing by transitioning `NOT_STARTED → PROCESSING → PENDING`.
 ///
 /// Returns `true` if this thread successfully claimed the node, `false` if another thread did.
 ///
 /// Steps:
-/// 1. CAS(NOT_STARTED → PROCESSING) to claim the node
-/// 2. Allocate and store ProcessingData
-/// 3. Store PENDING status (node ready to be processed)
+/// 1. CAS `NOT_STARTED → PROCESSING` claims the node and erects an init
+///    barrier (pushers spin while `PROCESSING` is observed).
+/// 2. Allocate and install [`ProcessingData`].
+/// 3. `fetch_xor` flips `PROCESSING → PENDING`, releasing the barrier with
+///    Release semantics so subsequent pushers observe the freshly-installed
+///    `ProcessingData`.
 fn start_processing_node<Meta: Default + Sync>(
     node: &QuadTreeNode<Meta>,
     dependents: Dependents,
@@ -508,61 +567,90 @@ fn start_processing_node<Meta: Default + Sync>(
         ..Default::default()
     };
     node.cache.set_ptr(Box::into_raw(Box::new(pd)));
-    node.status.store(status::PENDING, Ordering::Release);
+    // Atomically swap the `PROCESSING` bit for `PENDING` while preserving any
+    // other bits (none should be set during init, but `fetch_xor` makes the
+    // intent explicit).
+    node.status
+        .fetch_xor(status::PROCESSING | status::PENDING, Ordering::Release);
     record_status_claim_success();
     true
 }
 
-/// Atomically transition status from `from` to `to`, spinning until successful.
-fn atomic_transition_loop(a: &AtomicU8, from: u8, to: u8, kind: MetricKind) {
-    let mut spin_count = 0u64;
-    loop {
-        if a.compare_exchange_weak(from, to, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            record_metric(spin_count, kind);
-            return;
-        }
-        while a.load(Ordering::Relaxed) != from {
-            spin_count += 1;
-            hint::spin_loop();
-        }
-    }
-}
-
-/// RAII guard for PROCESSING status.
+/// RAII guard for the owner-mutex bit (`ACTIVE`).
 ///
-/// Acquires PROCESSING status on creation, releases it on drop.
-/// - If `finish()` called: transitions to FINISHED
-/// - If dropped without `finish()`: transitions back to PENDING
+/// `new` transitions `PENDING → ACTIVE` while preserving any currently-held
+/// `DEPS_LOCK` overlay bit. If neither `enter_finish_barrier` nor
+/// `publish_finished` is called, `Drop` reverts `ACTIVE → PENDING` (again
+/// preserving `DEPS_LOCK`).
 pub(super) struct ProcessingGuard<'a> {
     status: &'a AtomicU8,
     released: bool,
 }
 
 impl<'a> ProcessingGuard<'a> {
-    /// Acquire PROCESSING status, spinning until PENDING.
+    /// Acquire the owner-mutex by transitioning `PENDING → ACTIVE`. Spins
+    /// while `PENDING` is not observable (e.g. `PROCESSING` init barrier).
     pub(super) fn new(status: &'a AtomicU8, kind: MetricKind) -> Self {
-        atomic_transition_loop(status, status::PENDING, status::PROCESSING, kind);
-        Self {
-            status,
-            released: false,
+        let mut spin_count = 0u64;
+        loop {
+            let cur = status.load(Ordering::Acquire);
+            if cur & status::PENDING != 0 {
+                let want = (cur & !status::PENDING) | status::ACTIVE;
+                if status
+                    .compare_exchange_weak(cur, want, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    record_metric(spin_count, kind);
+                    return Self {
+                        status,
+                        released: false,
+                    };
+                }
+            }
+            spin_count += 1;
+            hint::spin_loop();
         }
     }
-}
 
-impl<'a> ProcessingGuard<'a> {
-    /// Mark node as FINISHED and prevent drop from reverting to PENDING.
-    pub(super) fn finish(&mut self) {
-        self.status.store(status::FINISHED, Ordering::Release);
+    /// Cross the finish barrier: `ACTIVE → PROCESSING`, spinning until
+    /// `DEPS_LOCK` is clear. After this returns, no pusher can observe the
+    /// node as live, so the caller may safely write the result into the
+    /// cache slot and drain the dependents list.
+    pub(super) fn enter_finish_barrier(&mut self, kind: MetricKind) {
+        let mut spin_count = 0u64;
+        while self
+            .status
+            .compare_exchange_weak(
+                status::ACTIVE,
+                status::PROCESSING,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            spin_count += 1;
+            hint::spin_loop();
+        }
+        record_metric(spin_count, kind);
+        // From now on `Drop` must not revert: we have left `ACTIVE` for good.
         self.released = true;
+    }
+
+    /// Publish the terminal state: `PROCESSING → FINISHED`. Must be called
+    /// after [`Self::enter_finish_barrier`] and after the result has been
+    /// written into the cache slot.
+    pub(super) fn publish_finished(self) {
+        self.status.store(status::FINISHED, Ordering::Release);
+        mem::forget(self);
     }
 }
 
 impl<'a> Drop for ProcessingGuard<'a> {
     fn drop(&mut self) {
         if !self.released {
-            self.status.store(status::PENDING, Ordering::Release);
+            // `ACTIVE → PENDING` while preserving `DEPS_LOCK`.
+            self.status
+                .fetch_xor(status::ACTIVE | status::PENDING, Ordering::Release);
         }
     }
 }
@@ -578,44 +666,58 @@ enum DependencyHandlingResult {
 }
 
 /// Handle a dependency: check if ready, start processing, or register as dependent.
+///
+/// Registration uses the [`status::DEPS_LOCK`] overlay bit, which can coexist
+/// with both `PENDING` and `ACTIVE`. This means a pusher never has to wait
+/// for the owner's compute burst — only for the brief init / finish
+/// barriers (encoded as `PROCESSING`) or for another concurrent pusher.
 fn handle_dependency<Meta: Default + Sync>(
     n: &QuadTreeNode<Meta>,
     task: &Task,
 ) -> DependencyHandlingResult {
-    let status = n.status.load(Ordering::Acquire);
-    if status == status::FINISHED {
-        return DependencyHandlingResult::Ready;
-    }
-
-    if status == status::NOT_STARTED && start_processing_node(n, smallvec![task.idx]) {
-        return DependencyHandlingResult::StartedByThisThread;
-    }
-
     let mut spin_count = 0u64;
     loop {
-        match n.status.compare_exchange_weak(
-            status::PENDING,
-            status::PROCESSING,
-            Ordering::Acquire,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
+        let cur = n.status.load(Ordering::Acquire);
+        if cur & status::FINISHED != 0 {
+            record_metric(spin_count, MetricKind::HandleDep);
+            return DependencyHandlingResult::Ready;
+        }
+        if cur == status::NOT_STARTED {
+            if start_processing_node(n, smallvec![task.idx]) {
                 record_metric(spin_count, MetricKind::HandleDep);
-                n.cache
-                    .get_ref::<ProcessingData>()
-                    .dependents
-                    .push(task.idx);
-                n.status.store(status::PENDING, Ordering::Release);
-                return DependencyHandlingResult::StartedByOtherThread;
+                return DependencyHandlingResult::StartedByThisThread;
             }
-            Err(status::FINISHED) => return DependencyHandlingResult::Ready,
-            Err(status::PROCESSING) => {
-                while n.status.load(Ordering::Relaxed) == status::PROCESSING {
-                    spin_count += 1;
-                    hint::spin_loop();
-                }
-            }
-            Err(value) => panic!("Unexpected status in handle_dependency: {}", value),
+            // Lost the race; observe the new state on the next iteration.
+            continue;
+        }
+        if cur & status::PROCESSING != 0 {
+            // Init or finish barrier; brief by construction.
+            spin_count += 1;
+            hint::spin_loop();
+            continue;
+        }
+        if cur & status::DEPS_LOCK != 0 {
+            // Another pusher is mutating the dependents list.
+            spin_count += 1;
+            hint::spin_loop();
+            continue;
+        }
+        // `cur` has `PENDING` or `ACTIVE` set and no `DEPS_LOCK`. Try to
+        // grab the lock without disturbing the work-status bits.
+        let want = cur | status::DEPS_LOCK;
+        if n
+            .status
+            .compare_exchange_weak(cur, want, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            n.cache
+                .get_ref::<ProcessingData>()
+                .dependents
+                .push(task.idx);
+            n.status
+                .fetch_and(!status::DEPS_LOCK, Ordering::Release);
+            record_metric(spin_count, MetricKind::HandleDep);
+            return DependencyHandlingResult::StartedByOtherThread;
         }
     }
 }

@@ -37,8 +37,16 @@ union PtrOrValue<V: Copy> {
 /// Used by both [`QuadTreeNode`] (caches `Idx` results) and
 /// [`CacheEntry`] (caches `(Idx, Idx)` binode results).
 ///
-/// Safety is guaranteed by the status state machine:
-/// only the thread holding PROCESSING status can mutate this.
+/// Concurrent access is coordinated by the status state machine of the
+/// surrounding node/entry (see the `quadtree::status` module docs):
+/// - The pointer is installed by the owner during the `PROCESSING` init
+///   barrier (no other thread can observe the slot at that point).
+/// - While `PENDING` or `ACTIVE` is set, the pointed-to `ProcessingData`
+///   is mutated by the owner (during `ACTIVE`, on fields that pushers
+///   never touch) and by pushers (only the `dependents` list, under
+///   `DEPS_LOCK`).
+/// - The final value is written by the owner during the `PROCESSING`
+///   finish barrier and is then immutable.
 pub(super) struct CacheField<V: Copy>(UnsafeCell<PtrOrValue<V>>);
 
 // SAFETY: Protected by the status state machine.

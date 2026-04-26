@@ -45,8 +45,9 @@ use std::{cell::UnsafeCell, sync::atomic::AtomicU8};
 ///
 /// DO NOT CREATE A MUTABLE REFERENCE AFTER CREATION!
 /// - `nw`, `ne`, `sw`, `se`: immutable after creation
-/// - `cache`: protected by status state machine, wraps [`UnsafeCell`]
-/// - `status`: atomic for concurrent state transitions
+/// - `cache`: protected by the status bit-set, wraps [`UnsafeCell`]
+/// - `status`: atomic bit-set encoding the async state machine
+///   (see `super::status`)
 /// - `flags`: atomic, combines node metadata and hashtable slot lock
 #[derive(Debug, Default)]
 pub(super) struct QuadTreeNode<Meta> {

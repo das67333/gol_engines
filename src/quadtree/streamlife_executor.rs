@@ -10,6 +10,10 @@
 //! - Processing data (`BiProcessingData`) is stored in the cache entry's payload union
 //! - Solitonic and base cases are computed synchronously via `update_node_sync`
 //! - Two parallel arrays (`arr0`, `arr1`) track the two universes
+//!
+//! Dependents-list and `waiting_cnt` synchronization mirror the HashLife
+//! executor — see [`super::hashlife_executor`] module docs for the full state
+//! machine.
 
 use super::{
     LEAF_SIZE_LOG2, algorithm,
@@ -23,9 +27,13 @@ use crossbeam::deque::{Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
 use std::{
     hint, mem,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, AtomicU16, Ordering},
     thread,
 };
+
+/// Bias added to `waiting_cnt` while the owner is scanning children. See
+/// [`super::hashlife_executor`] for the full rationale.
+const WAITING_BIAS: u16 = 1 << 15;
 
 /// A unit of work representing a binode pair to be processed.
 #[derive(Clone, Copy)]
@@ -50,10 +58,12 @@ struct BiProcessingData {
     mask9_waiting: u32,
     /// Bitmask: bit `i` set if child pair `i` (among first 4) is not yet computed.
     mask4_waiting: u32,
-    /// Count of dependencies still being computed. Entry can resume when this reaches 0.
-    waiting_cnt: u32,
-    /// Entries that registered as dependents of this entry.
-    /// Notified when this entry finishes.
+    /// Count of dependencies still being computed. The entry resumes when
+    /// this reaches 0. Manipulated lock-free with the bias trick.
+    waiting_cnt: AtomicU16,
+    /// Entries that registered as dependents of this entry. Mutated by the
+    /// owner exclusively during the init / finish barriers, and by pushers
+    /// in parallel under [`status::DEPS_LOCK`].
     dependents: SmallVec<[BiTask; 2]>,
 }
 
@@ -192,10 +202,13 @@ impl<'a> BiExecutorThread<'a> {
     /// Process a single binode task.
     ///
     /// Flow:
-    /// 1. Acquire PROCESSING status via `ProcessingGuard`
-    /// 2. Call `update_binode` to compute result or identify dependencies
-    /// 3. If result ready: store it, notify dependents, mark FINISHED
-    /// 4. If dependencies needed: guard drops, status returns to PENDING
+    /// 1. Acquire owner-mutex by transitioning `PENDING → ACTIVE`.
+    /// 2. Call `update_binode` to compute the result or register dependencies.
+    /// 3. If a result is ready: cross the finish barrier (`ACTIVE → PROCESSING`
+    ///    once `DEPS_LOCK` clears), drain dependents, publish the value,
+    ///    transition to `FINISHED`, and notify dependents.
+    /// 4. Otherwise: guard drop transitions `ACTIVE → PENDING` while
+    ///    preserving any in-flight `DEPS_LOCK`.
     fn process_task(&self, task: BiTask) {
         let entry = self.bicache_ref.get(task.entry_idx);
         let status = entry.status();
@@ -204,14 +217,14 @@ impl<'a> BiExecutorThread<'a> {
         let idx = entry.key();
 
         if let Some(result) = self.update_binode(task.entry_idx, idx, task.size_log2, data) {
-            entry.payload.set_value(result);
+            guard.enter_finish_barrier(MetricKind::NotifyDep);
             let mut dependents = SmallVec::new();
             mem::swap(&mut data.dependents, &mut dependents);
-            guard.finish(); // Mark as FINISHED
-            unsafe { drop(Box::from_raw(data as *mut BiProcessingData)) }; // Free BiProcessingData
+            entry.payload.set_value(result);
+            guard.publish_finished();
+            unsafe { drop(Box::from_raw(data as *mut BiProcessingData)) };
             self.notify_dependents(dependents);
         }
-        // If None: guard drops -> reverts to PENDING, task will be re-queued by a dependency
     }
 
     /// Compute binode result or identify dependencies.
@@ -303,7 +316,8 @@ impl<'a> BiExecutorThread<'a> {
 
         // Stage 1: Wait for 9 overlapping children (if both_stages)
         if data.mask4_waiting == 0 && data.mask9_waiting != 0 {
-            let mut waiting_cnt = 0;
+            data.waiting_cnt
+                .fetch_add(WAITING_BIAS, Ordering::Relaxed);
             for i in 0..9 {
                 if data.mask9_waiting & (1 << i) == 0 {
                     continue;
@@ -320,20 +334,31 @@ impl<'a> BiExecutorThread<'a> {
                         data.arr1[i] = val.1;
                     }
                     BiDependencyResult::StartedByThisThread => {
+                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
                         self.queue.push(BiTask {
                             entry_idx: child_idx,
                             size_log2: size_log2 - 1,
                         });
-                        waiting_cnt += 1;
                     }
                     BiDependencyResult::StartedByOtherThread => {
-                        waiting_cnt += 1;
+                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
+            let prev = data
+                .waiting_cnt
+                .fetch_sub(WAITING_BIAS, Ordering::AcqRel);
 
             if data.mask9_waiting != 0 {
-                data.waiting_cnt = waiting_cnt;
+                if prev == WAITING_BIAS {
+                    // All registered deps already notified during the scan;
+                    // re-queue ourselves to re-scan with their now-`Ready`
+                    // status.
+                    self.queue.push(BiTask {
+                        entry_idx: parent_entry_idx,
+                        size_log2,
+                    });
+                }
                 return None;
             }
         }
@@ -349,7 +374,8 @@ impl<'a> BiExecutorThread<'a> {
 
         // Stage 2: Wait for 4 final children
         {
-            let mut waiting_cnt = 0;
+            data.waiting_cnt
+                .fetch_add(WAITING_BIAS, Ordering::Relaxed);
             for i in 0..4 {
                 if data.mask4_waiting & (1 << i) == 0 {
                     continue;
@@ -366,20 +392,28 @@ impl<'a> BiExecutorThread<'a> {
                         data.arr1[i] = val.1;
                     }
                     BiDependencyResult::StartedByThisThread => {
+                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
                         self.queue.push(BiTask {
                             entry_idx: child_idx,
                             size_log2: size_log2 - 1,
                         });
-                        waiting_cnt += 1;
                     }
                     BiDependencyResult::StartedByOtherThread => {
-                        waiting_cnt += 1;
+                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
+            let prev = data
+                .waiting_cnt
+                .fetch_sub(WAITING_BIAS, Ordering::AcqRel);
 
             if data.mask4_waiting != 0 {
-                data.waiting_cnt = waiting_cnt;
+                if prev == WAITING_BIAS {
+                    self.queue.push(BiTask {
+                        entry_idx: parent_entry_idx,
+                        size_log2,
+                    });
+                }
                 return None;
             }
         }
@@ -403,21 +437,17 @@ impl<'a> BiExecutorThread<'a> {
 
     /// Notify dependent entries that this dependency has completed.
     ///
-    /// For each dependent:
-    /// 1. Acquire PROCESSING status on the dependent's entry
-    /// 2. Decrement its `waiting_cnt`
-    /// 3. If `waiting_cnt` reaches 0, re-queue for processing
+    /// Atomically decrements each dependent's `waiting_cnt`. The thread that
+    /// drives the counter to zero (this notifier or the owner's own
+    /// `fetch_sub(WAITING_BIAS)`) re-queues the parent task. No lock is taken
+    /// on the dependent entry: `BiProcessingData` is alive until `FINISHED`,
+    /// which only its owner can publish, after `waiting_cnt == 0`.
     fn notify_dependents(&self, dependents: SmallVec<[BiTask; 2]>) {
         for dep in dependents {
             let entry = self.bicache_ref.get(dep.entry_idx);
-            let status = entry.status();
-            let waiting_cnt = {
-                let _guard = ProcessingGuard::new(status, MetricKind::NotifyDep);
-                let dep_data: &mut BiProcessingData = entry.payload.get_ref();
-                dep_data.waiting_cnt -= 1;
-                dep_data.waiting_cnt
-            };
-            if waiting_cnt == 0 {
+            let dep_data: &BiProcessingData = entry.payload.get_ref();
+            let prev = dep_data.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
+            if prev == 1 {
                 self.queue.push(BiTask {
                     entry_idx: dep.entry_idx,
                     size_log2: dep.size_log2,
@@ -427,14 +457,17 @@ impl<'a> BiExecutorThread<'a> {
     }
 }
 
-/// Initialize a cache entry for processing by transitioning NOT_STARTED -> PROCESSING -> PENDING.
+/// Initialize a cache entry for processing by transitioning
+/// `NOT_STARTED → PROCESSING → PENDING`.
 ///
 /// Returns `true` if this thread successfully claimed the entry, `false` if another thread did.
 ///
 /// Steps:
-/// 1. CAS(NOT_STARTED -> PROCESSING) to claim the entry
-/// 2. Allocate and store BiProcessingData
-/// 3. Store PENDING status (entry ready to be processed)
+/// 1. CAS `NOT_STARTED → PROCESSING` claims the entry and erects an init
+///    barrier (pushers spin while `PROCESSING` is observed).
+/// 2. Allocate and install [`BiProcessingData`].
+/// 3. `fetch_xor` flips `PROCESSING → PENDING` with Release semantics so
+///    subsequent pushers observe the freshly-installed payload.
 fn start_processing_entry(
     bicache: &BinodeCache,
     entry_idx: Idx,
@@ -461,7 +494,7 @@ fn start_processing_entry(
         ..Default::default()
     };
     entry.payload.set_ptr(Box::into_raw(Box::new(pd)));
-    status.store(status::PENDING, Ordering::Release);
+    status.fetch_xor(status::PROCESSING | status::PENDING, Ordering::Release);
     true
 }
 
@@ -475,9 +508,16 @@ enum BiDependencyResult {
     StartedByOtherThread,
 }
 
-/// Handle a binode dependency: check if ready, claim for processing, or register as dependent.
+/// Handle a binode dependency: check if ready, claim for processing, or
+/// register as dependent.
 ///
-/// The `parent_entry_idx` and `parent_size_log2` identify the parent task that depends on this child.
+/// Registration uses the [`status::DEPS_LOCK`] overlay bit, which can coexist
+/// with both `PENDING` and `ACTIVE`. The pusher only waits during the brief
+/// init / finish barriers (encoded as `PROCESSING`) or behind another
+/// concurrent pusher.
+///
+/// `parent_entry_idx` and `parent_size_log2` identify the parent task that
+/// depends on this child.
 fn handle_bi_dependency(
     bicache: &BinodeCache,
     child_idx: Idx,
@@ -486,53 +526,52 @@ fn handle_bi_dependency(
 ) -> BiDependencyResult {
     let child_entry = bicache.get(child_idx);
     let status = child_entry.status();
-    let status_value = status.load(Ordering::Acquire);
 
-    if status_value == status::FINISHED {
-        return BiDependencyResult::Ready;
-    }
-
-    if status_value == status::NOT_STARTED
-        && start_processing_entry(
-            bicache,
-            child_idx,
-            smallvec![BiTask {
-                entry_idx: parent_entry_idx,
-                size_log2: parent_size_log2,
-            }],
-        )
-    {
-        return BiDependencyResult::StartedByThisThread;
-    }
-
-    // Entry is being processed by another thread (or just claimed above by a racing thread).
-    // Spin until we can register as dependent.
     let mut spin_count = 0u64;
     loop {
-        match status.compare_exchange_weak(
-            status::PENDING,
-            status::PROCESSING,
-            Ordering::Acquire,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                record_metric(spin_count, MetricKind::HandleBiDep);
-                let child_data: &mut BiProcessingData = child_entry.payload.get_ref();
-                child_data.dependents.push(BiTask {
+        let cur = status.load(Ordering::Acquire);
+        if cur & status::FINISHED != 0 {
+            record_metric(spin_count, MetricKind::HandleBiDep);
+            return BiDependencyResult::Ready;
+        }
+        if cur == status::NOT_STARTED {
+            if start_processing_entry(
+                bicache,
+                child_idx,
+                smallvec![BiTask {
                     entry_idx: parent_entry_idx,
                     size_log2: parent_size_log2,
-                });
-                status.store(status::PENDING, Ordering::Release);
-                return BiDependencyResult::StartedByOtherThread;
+                }],
+            ) {
+                record_metric(spin_count, MetricKind::HandleBiDep);
+                return BiDependencyResult::StartedByThisThread;
             }
-            Err(status::FINISHED) => return BiDependencyResult::Ready,
-            Err(status::PROCESSING) => {
-                while status.load(Ordering::Relaxed) == status::PROCESSING {
-                    spin_count += 1;
-                    hint::spin_loop()
-                }
-            }
-            Err(value) => panic!("Unexpected status in handle_bi_dependency: {}", value),
+            // Lost the race; observe the new state on the next iteration.
+            continue;
+        }
+        if cur & status::PROCESSING != 0 {
+            spin_count += 1;
+            hint::spin_loop();
+            continue;
+        }
+        if cur & status::DEPS_LOCK != 0 {
+            spin_count += 1;
+            hint::spin_loop();
+            continue;
+        }
+        let want = cur | status::DEPS_LOCK;
+        if status
+            .compare_exchange_weak(cur, want, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let child_data: &mut BiProcessingData = child_entry.payload.get_ref();
+            child_data.dependents.push(BiTask {
+                entry_idx: parent_entry_idx,
+                size_log2: parent_size_log2,
+            });
+            status.fetch_and(!status::DEPS_LOCK, Ordering::Release);
+            record_metric(spin_count, MetricKind::HandleBiDep);
+            return BiDependencyResult::StartedByOtherThread;
         }
     }
 }
