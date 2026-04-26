@@ -45,6 +45,13 @@ impl ShardedLength {
     pub(super) fn len_upper_bound(&self) -> usize {
         self.global.load(Ordering::Relaxed) + self.max_underestimation
     }
+
+    pub(super) fn clear(&mut self) {
+        self.global.store(0, Ordering::Relaxed);
+        for shard in self.shards.iter() {
+            shard.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 pub(super) struct LengthShard<'a> {

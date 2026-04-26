@@ -190,6 +190,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
 
     fn clear(&mut self) {
         self.hashtable.fill_with(UnsafeCell::default);
+        self.length.clear();
     }
 
     fn bytes_total(&self) -> usize {

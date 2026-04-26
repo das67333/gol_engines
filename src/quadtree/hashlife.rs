@@ -139,7 +139,6 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
         self.size_log2 = size_log2;
         self.mem.clear();
         self.blank_nodes.clear();
-        // ExecutionStatistics::reset(); TODO
         let mut cache = HashMap::new();
         self.root =
             Self::init_pattern_recursive(pattern.get_root(), pattern, &self.mem, &mut cache);
@@ -242,7 +241,6 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
         let pattern = self.current_state();
         self.mem.clear();
         self.blank_nodes.clear();
-        // ExecutionStatistics::reset(); TODO
         let mut cache = HashMap::new();
         self.root =
             Self::init_pattern_recursive(pattern.get_root(), &pattern, &self.mem, &mut cache);
