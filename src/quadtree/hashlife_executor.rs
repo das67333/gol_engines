@@ -284,6 +284,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
         });
 
         if self.mem.exceeds_load_factor() {
+            self.free_orphaned_processing_data();
             return None;
         }
 
@@ -293,6 +294,22 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
         println!("{total_stats}");
 
         Some(root_node.cache.get_value())
+    }
+
+    /// Drop `ProcessingData` boxes orphaned by cancellation. Must be called
+    /// from a single-threaded context after `thread::scope` has joined; only
+    /// PENDING slots own a live box at that point.
+    fn free_orphaned_processing_data(&self) {
+        for idx in 0..self.mem.capacity() {
+            let n = self.mem.get(idx as Idx);
+            let status = n.status.load(Ordering::Relaxed);
+            if status == status::PENDING {
+                let pd: &mut ProcessingData = n.cache.get_ref();
+                // SAFETY: produced by `Box::into_raw` in
+                // `start_processing_node`; all workers have joined.
+                unsafe { drop(Box::from_raw(pd as *mut ProcessingData)) };
+            }
+        }
     }
 }
 

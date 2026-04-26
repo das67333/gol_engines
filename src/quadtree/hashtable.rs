@@ -200,6 +200,10 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         self.length.len_exact()
     }
 
+    fn capacity(&self) -> usize {
+        self.hashtable.len()
+    }
+
     fn exceeds_load_factor(&self) -> bool {
         self.length.len_upper_bound() > self.length_limit
     }
@@ -366,6 +370,10 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
 
     pub(super) fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    pub(super) fn capacity(&self) -> usize {
+        self.inner.capacity()
     }
 
     pub(super) fn exceeds_load_factor(&self) -> bool {
@@ -550,6 +558,10 @@ impl BinodeCache {
 
     pub(super) fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    pub(super) fn capacity(&self) -> usize {
+        self.inner.capacity()
     }
 
     pub(super) fn exceeds_load_factor(&self) -> bool {

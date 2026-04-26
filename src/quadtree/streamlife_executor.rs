@@ -136,6 +136,9 @@ impl<'a> StreamLifeExecutor<'a> {
         });
 
         if self.engine.base.mem.exceeds_load_factor() || bicache.exceeds_load_factor() {
+            // The base `NodeStore` carries no orphaned boxes: StreamLife
+            // drives it via `update_node_sync`, never via async PROCESSING.
+            self.free_orphaned_bi_processing_data();
             return None;
         }
 
@@ -149,6 +152,22 @@ impl<'a> StreamLifeExecutor<'a> {
         println!("{total_stats}");
 
         Some(bicache.get(root_idx).payload.get_value())
+    }
+
+    /// Binode-cache analogue of
+    /// [`HashLifeExecutor::free_orphaned_processing_data`].
+    fn free_orphaned_bi_processing_data(&self) {
+        let bicache = &self.engine.bicache;
+        for idx in 0..bicache.capacity() {
+            let entry = bicache.get(idx as Idx);
+            let status = entry.status().load(Ordering::Relaxed);
+            if status == status::PENDING {
+                let pd: &mut BiProcessingData = entry.payload.get_ref();
+                // SAFETY: produced by `Box::into_raw` in
+                // `start_processing_entry`; all workers have joined.
+                unsafe { drop(Box::from_raw(pd as *mut BiProcessingData)) };
+            }
+        }
     }
 }
 
@@ -169,7 +188,10 @@ impl<'a> BiExecutorThread<'a> {
             &self.queue,
             self.stealers,
             || is_finished(self.root_status),
-            || self.engine.base.mem.exceeds_load_factor() || self.bicache_ref.exceeds_load_factor(),
+            || {
+                self.engine.base.mem.exceeds_load_factor()
+                    || self.bicache_ref.exceeds_load_factor()
+            },
         );
         set_current_execution_stats();
 
