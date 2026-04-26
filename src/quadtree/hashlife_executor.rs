@@ -245,6 +245,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
     }
 
     pub(super) fn run(&self, num_threads: usize) -> Option<Idx> {
+        let timer = std::time::Instant::now();
         // Create worker queues and stealers
         let mut queues = Vec::with_capacity(num_threads);
         let mut stealers = Vec::with_capacity(num_threads);
@@ -287,6 +288,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
         }
 
         assert!(is_finished(&self.mem.get(self.root).status));
+        println!("Time spent on hashlife executor: {:?}", timer.elapsed());
         println!("Nodes count: {}", self.mem.len());
         println!("{total_stats}");
 

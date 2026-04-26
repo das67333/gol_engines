@@ -88,6 +88,7 @@ impl<'a> StreamLifeExecutor<'a> {
     }
 
     pub(super) fn run(&self, num_threads: usize) -> Option<(Idx, Idx)> {
+        let timer = std::time::Instant::now();
         let bicache = &self.engine.bicache;
 
         // Look up root entry
@@ -139,6 +140,7 @@ impl<'a> StreamLifeExecutor<'a> {
         }
 
         assert!(is_finished(root_status));
+        println!("Time spent on streamlife executor: {:?}", timer.elapsed());
         println!(
             "Nodes count: {}, BiCache count: {}",
             self.engine.base.mem.len(),
