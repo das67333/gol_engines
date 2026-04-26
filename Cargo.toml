@@ -47,6 +47,12 @@ num-format = { version = "0.4", features = [
     "with-num-bigint",
 ], optional = true }
 
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = true
+
 [dev-dependencies]
 criterion = "0.7"
 libc = "0.2"
