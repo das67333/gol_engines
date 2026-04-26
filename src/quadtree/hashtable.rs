@@ -1,9 +1,9 @@
-use super::{dep_stack::DepHead, node::QuadTreeNode, sharded_statistics::*};
+use super::{node::QuadTreeNode, sharded_statistics::*};
 use std::{
     cell::UnsafeCell,
     hash::{Hash, Hasher},
     hint, mem, ptr,
-    sync::atomic::{AtomicU8, AtomicU16, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
 };
 
 /// Index into a [`ConcurrentHashTable`].
@@ -450,13 +450,6 @@ pub(super) struct CacheEntry {
     status: AtomicU8,
     /// Slot flags for ConcurrentHashTable (IS_USED, IS_LOCKED, etc.)
     flags: AtomicU8,
-    /// See [`QuadTreeNode::waiting_cnt`] for semantics. Lives on the entry
-    /// (permanent storage) so concurrent notifiers can `fetch_sub` without
-    /// risking use-after-free when the owning task frees
-    /// `BiProcessingData`.
-    pub(super) waiting_cnt: AtomicU16,
-    /// Lock-free close-once stack of entries waiting for this entry's result.
-    pub(super) dependents_head: DepHead,
 }
 
 impl Default for CacheEntry {
@@ -466,8 +459,6 @@ impl Default for CacheEntry {
             payload: CacheField::default(),
             status: AtomicU8::new(0),
             flags: AtomicU8::new(0),
-            waiting_cnt: AtomicU16::new(0),
-            dependents_head: DepHead::default(),
         }
     }
 }
@@ -523,8 +514,6 @@ impl BinodeCache {
                 (*slot).key = key;
                 (*slot).payload = CacheField::default();
                 (*slot).status = AtomicU8::new(0);
-                (*slot).waiting_cnt = AtomicU16::new(0);
-                (*slot).dependents_head = DepHead::default();
             },
         )
     }
