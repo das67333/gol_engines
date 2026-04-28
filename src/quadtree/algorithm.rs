@@ -3,9 +3,10 @@ use super::{
     blank::BlankNodes,
     hashtable::{Idx, NodeAccess},
     sharded_statistics::{MetricKind, record_metric},
+    spin::Spinner,
     status,
 };
-use std::{hint, sync::atomic::Ordering};
+use std::sync::atomic::Ordering;
 
 /// Apply Conway's Game of Life rules to a row of cells.
 ///
@@ -305,12 +306,11 @@ fn node2lanes(
             )
             .is_ok())
     {
-        let mut spin_count = 0u64;
+        let mut spinner = Spinner::new();
         while n.status_extra.load(Ordering::Acquire) != status::FINISHED {
-            spin_count += 1;
-            hint::spin_loop();
+            spinner.spin();
         }
-        record_metric(spin_count, MetricKind::Node2Lanes);
+        record_metric(spinner.count(), MetricKind::Node2Lanes);
         return unsafe { *n.extra.get() };
     }
 
@@ -587,15 +587,14 @@ pub(super) fn update_node_sync(
         n.status.store(status::FINISHED, Ordering::Release);
         cache
     } else {
-        let mut spin_count = 0u64;
+        let mut spinner = Spinner::new();
         while n.status.load(Ordering::Acquire) != status::FINISHED {
             // if ExecutionStatistics::is_poisoned() {
             //     return Idx::default();
             // }
-            spin_count += 1;
-            hint::spin_loop();
+            spinner.spin();
         }
-        record_metric(spin_count, MetricKind::UpdateNodeSync);
+        record_metric(spinner.count(), MetricKind::UpdateNodeSync);
         n.cache.get_value()
     }
 }

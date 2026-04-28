@@ -5,6 +5,7 @@ mod hashlife_executor;
 mod hashtable;
 mod node;
 mod sharded_statistics;
+mod spin;
 mod streamlife;
 mod streamlife_executor;
 

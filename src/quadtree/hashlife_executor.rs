@@ -69,12 +69,13 @@ use super::{
     hashtable::{Idx, NodeStore, NodeStoreRef},
     node::QuadTreeNode,
     sharded_statistics::*,
+    spin::Spinner,
     status,
 };
 use crossbeam::deque::{Steal, Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
 use std::{
-    hint, mem,
+    mem,
     sync::atomic::{AtomicU8, AtomicU16, Ordering},
     thread,
     time::Duration,
@@ -591,7 +592,7 @@ impl<'a> ProcessingGuard<'a> {
     /// Acquire the owner-mutex by transitioning `PENDING → ACTIVE`. Spins
     /// while `PENDING` is not observable (e.g. `PROCESSING` init barrier).
     pub(super) fn new(status: &'a AtomicU8, kind: MetricKind) -> Self {
-        let mut spin_count = 0u64;
+        let mut spinner = Spinner::new();
         loop {
             let cur = status.load(Ordering::Acquire);
             if cur & status::PENDING != 0 {
@@ -600,15 +601,14 @@ impl<'a> ProcessingGuard<'a> {
                     .compare_exchange_weak(cur, want, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
-                    record_metric(spin_count, kind);
+                    record_metric(spinner.count(), kind);
                     return Self {
                         status,
                         released: false,
                     };
                 }
             }
-            spin_count += 1;
-            hint::spin_loop();
+            spinner.spin();
         }
     }
 
@@ -617,7 +617,7 @@ impl<'a> ProcessingGuard<'a> {
     /// node as live, so the caller may safely write the result into the
     /// cache slot and drain the dependents list.
     pub(super) fn enter_finish_barrier(&mut self, kind: MetricKind) {
-        let mut spin_count = 0u64;
+        let mut spinner = Spinner::new();
         while self
             .status
             .compare_exchange_weak(
@@ -628,10 +628,9 @@ impl<'a> ProcessingGuard<'a> {
             )
             .is_err()
         {
-            spin_count += 1;
-            hint::spin_loop();
+            spinner.spin();
         }
-        record_metric(spin_count, kind);
+        record_metric(spinner.count(), kind);
         // From now on `Drop` must not revert: we have left `ACTIVE` for good.
         self.released = true;
     }
@@ -675,16 +674,16 @@ fn handle_dependency<Meta: Default + Sync>(
     n: &QuadTreeNode<Meta>,
     task: &Task,
 ) -> DependencyHandlingResult {
-    let mut spin_count = 0u64;
+    let mut spinner = Spinner::new();
     loop {
         let cur = n.status.load(Ordering::Acquire);
         if cur & status::FINISHED != 0 {
-            record_metric(spin_count, MetricKind::HandleDep);
+            record_metric(spinner.count(), MetricKind::HandleDep);
             return DependencyHandlingResult::Ready;
         }
         if cur == status::NOT_STARTED {
             if start_processing_node(n, smallvec![task.idx]) {
-                record_metric(spin_count, MetricKind::HandleDep);
+                record_metric(spinner.count(), MetricKind::HandleDep);
                 return DependencyHandlingResult::StartedByThisThread;
             }
             // Lost the race; observe the new state on the next iteration.
@@ -692,14 +691,12 @@ fn handle_dependency<Meta: Default + Sync>(
         }
         if cur & status::PROCESSING != 0 {
             // Init or finish barrier; brief by construction.
-            spin_count += 1;
-            hint::spin_loop();
+            spinner.spin();
             continue;
         }
         if cur & status::DEPS_LOCK != 0 {
             // Another pusher is mutating the dependents list.
-            spin_count += 1;
-            hint::spin_loop();
+            spinner.spin();
             continue;
         }
         // `cur` has `PENDING` or `ACTIVE` set and no `DEPS_LOCK`. Try to
@@ -716,7 +713,7 @@ fn handle_dependency<Meta: Default + Sync>(
                 .push(task.idx);
             n.status
                 .fetch_and(!status::DEPS_LOCK, Ordering::Release);
-            record_metric(spin_count, MetricKind::HandleDep);
+            record_metric(spinner.count(), MetricKind::HandleDep);
             return DependencyHandlingResult::StartedByOtherThread;
         }
     }

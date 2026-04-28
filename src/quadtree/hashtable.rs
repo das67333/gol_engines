@@ -1,8 +1,8 @@
-use super::{node::QuadTreeNode, sharded_statistics::*};
+use super::{node::QuadTreeNode, sharded_statistics::*, spin::Spinner};
 use std::{
     cell::UnsafeCell,
     hash::{Hash, Hasher},
-    hint, mem, ptr,
+    mem, ptr,
     sync::atomic::{AtomicU8, Ordering},
 };
 
@@ -148,12 +148,11 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
             }
 
             // STEP 2: Acquire slot lock
-            let mut spin_count = 0;
+            let mut spinner = Spinner::new();
             loop {
                 while current_flags & FLAG_LOCKED != 0 {
-                    spin_count += 1;
                     current_flags = flags.load(Ordering::Relaxed);
-                    hint::spin_loop();
+                    spinner.spin();
                 }
                 match flags.compare_exchange_weak(
                     current_flags,
@@ -162,7 +161,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        record_metric(spin_count, kind);
+                        record_metric(spinner.count(), kind);
                         break;
                     }
                     Err(value) => current_flags = value,

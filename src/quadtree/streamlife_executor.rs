@@ -20,13 +20,14 @@ use super::{
     hashlife_executor::{ProcessingGuard, TaskFetcher, is_finished},
     hashtable::{BinodeCache, BinodeCacheRef, Idx},
     sharded_statistics::*,
+    spin::Spinner,
     status,
     streamlife::StreamLifeEngine,
 };
 use crossbeam::deque::{Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
 use std::{
-    hint, mem,
+    mem,
     sync::atomic::{AtomicU8, AtomicU16, Ordering},
     thread,
 };
@@ -527,11 +528,11 @@ fn handle_bi_dependency(
     let child_entry = bicache.get(child_idx);
     let status = child_entry.status();
 
-    let mut spin_count = 0u64;
+    let mut spinner = Spinner::new();
     loop {
         let cur = status.load(Ordering::Acquire);
         if cur & status::FINISHED != 0 {
-            record_metric(spin_count, MetricKind::HandleBiDep);
+            record_metric(spinner.count(), MetricKind::HandleBiDep);
             return BiDependencyResult::Ready;
         }
         if cur == status::NOT_STARTED {
@@ -543,20 +544,18 @@ fn handle_bi_dependency(
                     size_log2: parent_size_log2,
                 }],
             ) {
-                record_metric(spin_count, MetricKind::HandleBiDep);
+                record_metric(spinner.count(), MetricKind::HandleBiDep);
                 return BiDependencyResult::StartedByThisThread;
             }
             // Lost the race; observe the new state on the next iteration.
             continue;
         }
         if cur & status::PROCESSING != 0 {
-            spin_count += 1;
-            hint::spin_loop();
+            spinner.spin();
             continue;
         }
         if cur & status::DEPS_LOCK != 0 {
-            spin_count += 1;
-            hint::spin_loop();
+            spinner.spin();
             continue;
         }
         let want = cur | status::DEPS_LOCK;
@@ -570,7 +569,7 @@ fn handle_bi_dependency(
                 size_log2: parent_size_log2,
             });
             status.fetch_and(!status::DEPS_LOCK, Ordering::Release);
-            record_metric(spin_count, MetricKind::HandleBiDep);
+            record_metric(spinner.count(), MetricKind::HandleBiDep);
             return BiDependencyResult::StartedByOtherThread;
         }
     }
