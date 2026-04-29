@@ -66,7 +66,7 @@
 use super::{
     LEAF_SIZE, LEAF_SIZE_LOG2, algorithm,
     hashlife::HashLifeEngine,
-    hashtable::{Idx, NodeStore, NodeStoreRef},
+    hashtable::{Idx, NodeAccess, NodeStore, NodeStoreRef},
     node::QuadTreeNode,
     sharded_statistics::*,
     spin::Spinner,
@@ -87,44 +87,60 @@ use std::{
 /// never collides with a real outstanding-dependency count.
 const WAITING_BIAS: u16 = 1 << 15;
 
-/// List of nodes waiting for this node's result.
-///
-/// Optimized with `SmallVec<[_; 2]>` to avoid heap allocation in the common case,
-/// since almost every node (>>99.99%) has 1 dependent. A capacity of 2 is used
-/// because it does not increase the struct size compared to a capacity of 1.
-type Dependents = SmallVec<[Idx; 2]>;
-
 /// Temporary data allocated during node processing.
 ///
 /// Heap-allocated when processing starts, freed when node reaches FINISHED state.
 /// Stored via pointer in the node's `cache` field.
-#[derive(Default)]
-struct ProcessingData {
+///
+/// Generic over `Dep`, the dependent type. Pure HashLife runs use
+/// `ProcessingData<Idx>` (today's layout). StreamLife runs that drive
+/// HashLife nodes asynchronously use `ProcessingData<Dependent>` so a binode
+/// task can register itself as a waiter. The `cache` field on
+/// [`super::node::QuadTreeNode`] is type-erased, so per-run instantiation is
+/// safe as long as a single run is consistent (cleared via `run_gc` /
+/// `load_pattern` between runs).
+///
+/// `dependents` uses `SmallVec<[_; 2]>` to avoid heap allocation in the
+/// common case (>>99.99% of nodes have 1 dependent). A capacity of 2 is used
+/// because it does not increase the struct size vs. a capacity of 1.
+pub(super) struct ProcessingData<Dep> {
     /// Intermediate child node results (up to 9 for overlapping, 4 for final stage).
-    arr: [Idx; 9],
+    pub(super) arr: [Idx; 9],
     /// Bitmask: bit `i` set if `arr[i]` (among first 9) is not yet computed.
-    mask9_waiting: u32,
+    pub(super) mask9_waiting: u32,
     /// Bitmask: bit `i` set if `arr[i]` (among first 4) is not yet computed.
-    mask4_waiting: u32,
+    pub(super) mask4_waiting: u32,
     /// Count of dependencies still being computed. The node resumes when this
     /// reaches 0. Manipulated lock-free with the bias trick (see module docs).
-    waiting_cnt: AtomicU16,
-    /// Nodes that registered as dependents of this node.
+    pub(super) waiting_cnt: AtomicU16,
+    /// Nodes / binodes that registered as dependents of this node.
     /// Notified when this node finishes.
     ///
     /// Mutated by the owner exclusively during the init/finish barriers, and
     /// by pushers in parallel under [`status::DEPS_LOCK`].
-    dependents: Dependents,
+    pub(super) dependents: SmallVec<[Dep; 2]>,
+}
+
+impl<Dep> Default for ProcessingData<Dep> {
+    fn default() -> Self {
+        Self {
+            arr: [Idx::default(); 9],
+            mask9_waiting: 0,
+            mask4_waiting: 0,
+            waiting_cnt: AtomicU16::new(0),
+            dependents: SmallVec::new(),
+        }
+    }
 }
 
 /// A unit of work representing a node to be processed.
-struct Task {
-    idx: Idx,
-    size_log2: u32,
+pub(super) struct Task {
+    pub(super) idx: Idx,
+    pub(super) size_log2: u32,
 }
 
 impl Task {
-    fn new(idx: Idx, size_log2: u32) -> Self {
+    pub(super) fn new(idx: Idx, size_log2: u32) -> Self {
         Self { idx, size_log2 }
     }
 }
@@ -266,7 +282,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
         }
 
         let root_node = self.mem.get(self.root);
-        start_processing_node(root_node, smallvec![]);
+        start_processing_node::<Meta, Idx>(root_node, smallvec![]);
         queues[0].push(Task::new(self.root, self.size_log2));
 
         let mut total_stats = ExecutionStatistics::new();
@@ -311,10 +327,10 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
             let n = self.mem.get(idx as Idx);
             let status = n.status.load(Ordering::Relaxed);
             if status == status::PENDING {
-                let pd: &mut ProcessingData = n.cache.get_ref();
+                let pd: &mut ProcessingData<Idx> = n.cache.get_ref();
                 // SAFETY: produced by `Box::into_raw` in
                 // `start_processing_node`; all workers have joined.
-                unsafe { drop(Box::from_raw(pd as *mut ProcessingData)) };
+                unsafe { drop(Box::from_raw(pd as *mut ProcessingData<Idx>)) };
             }
         }
     }
@@ -363,7 +379,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
     fn process_task(&self, task: Task) {
         let n = self.mem.get(task.idx);
         let mut guard = ProcessingGuard::new(&n.status, MetricKind::ProcessTask);
-        let data: &mut ProcessingData = n.cache.get_ref();
+        let data: &mut ProcessingData<Idx> = n.cache.get_ref();
         if let Some(result) = self.update_node(&task, n.parts(), data) {
             // Cross the finish barrier so pushers stop touching `data` and the
             // cache slot, then drain dependents, publish the value, and mark
@@ -373,7 +389,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
             mem::swap(&mut data.dependents, &mut dependents);
             n.cache.set_value(result);
             guard.publish_finished();
-            unsafe { drop(Box::from_raw(data as *mut ProcessingData)) };
+            unsafe { drop(Box::from_raw(data as *mut ProcessingData<Idx>)) };
             self.notify_dependents(&task, dependents);
         }
     }
@@ -401,111 +417,8 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
     /// `waiting_cnt` bias trick: whichever thread observes the counter become
     /// zero (this owner via `fetch_sub(WAITING_BIAS)` or the last notifier
     /// via `fetch_sub(1)`) is responsible for re-queuing the parent task.
-    fn update_node(&self, task: &Task, parts: [Idx; 4], data: &mut ProcessingData) -> Option<Idx> {
-        let both_stages = self.generations_log2 + 2 >= task.size_log2;
-        let [nw, ne, sw, se] = parts;
-        if task.size_log2 == LEAF_SIZE_LOG2 + 1 {
-            // base case: node consists of leaves
-            let steps = if both_stages {
-                LEAF_SIZE / 2
-            } else {
-                1 << self.generations_log2
-            };
-            return Some(algorithm::update_leaves(&self.mem, nw, ne, sw, se, steps));
-        }
-
-        if data.mask4_waiting == 0 {
-            // arr4 is not ready
-            if !both_stages {
-                data.arr = algorithm::nine_children_disjoint(
-                    &self.mem,
-                    nw,
-                    ne,
-                    sw,
-                    se,
-                    task.size_log2 - 1,
-                );
-            } else {
-                if data.mask9_waiting == 0 {
-                    data.arr = algorithm::nine_children_overlapping(&self.mem, nw, ne, sw, se);
-                    data.mask9_waiting = 0b1_1111_1111;
-                }
-
-                // Bias `waiting_cnt` so concurrent notifiers cannot drive it
-                // to zero while we are still scanning.
-                data.waiting_cnt
-                    .fetch_add(WAITING_BIAS, Ordering::Relaxed);
-                for (i, x) in data.arr.iter_mut().enumerate() {
-                    if data.mask9_waiting & (1 << i) == 0 {
-                        continue;
-                    }
-                    let d = self.mem.get(*x);
-                    match handle_dependency(d, task) {
-                        DependencyHandlingResult::Ready => {
-                            data.mask9_waiting &= !(1 << i);
-                            *x = d.cache.get_value();
-                        }
-                        DependencyHandlingResult::StartedByThisThread => {
-                            data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                            self.queue.push(Task::new(*x, task.size_log2 - 1));
-                        }
-                        DependencyHandlingResult::StartedByOtherThread => {
-                            data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
-
-                if data.mask9_waiting != 0 {
-                    if prev == WAITING_BIAS {
-                        // Every dependency we registered already notified
-                        // before our `fetch_sub`; re-queue ourselves so the
-                        // mask gets re-scanned with their now-`Ready` status.
-                        self.queue.push(Task::new(task.idx, task.size_log2));
-                    }
-                    return None;
-                }
-            }
-
-            let arr4 = algorithm::four_children_overlapping(&self.mem, &data.arr);
-            data.arr[..4].copy_from_slice(&arr4);
-            data.mask4_waiting = 0b1111;
-        }
-
-        data.waiting_cnt
-            .fetch_add(WAITING_BIAS, Ordering::Relaxed);
-        for (i, x) in data.arr.iter_mut().take(4).enumerate() {
-            if data.mask4_waiting & (1 << i) == 0 {
-                continue;
-            }
-            let d = self.mem.get(*x);
-            match handle_dependency(d, task) {
-                DependencyHandlingResult::Ready => {
-                    data.mask4_waiting &= !(1 << i);
-                    *x = d.cache.get_value();
-                }
-                DependencyHandlingResult::StartedByThisThread => {
-                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                    self.queue.push(Task::new(*x, task.size_log2 - 1));
-                }
-                DependencyHandlingResult::StartedByOtherThread => {
-                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
-
-        if data.mask4_waiting != 0 {
-            if prev == WAITING_BIAS {
-                self.queue.push(Task::new(task.idx, task.size_log2));
-            }
-            return None;
-        }
-
-        Some(
-            self.mem
-                .find_or_create_node(data.arr[0], data.arr[1], data.arr[2], data.arr[3]),
-        )
+    fn update_node(&self, task: &Task, parts: [Idx; 4], data: &mut ProcessingData<Idx>) -> Option<Idx> {
+        update_node_async(&self.mem, &self.queue, self.generations_log2, task, parts, data, task.idx)
     }
 
     /// Notify dependent nodes that this dependency has completed.
@@ -517,10 +430,10 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
     /// dependent node: `waiting_cnt` is atomic, and `ProcessingData` stays
     /// alive until `FINISHED` (which only the owner can publish, after the
     /// counter has dropped to zero).
-    fn notify_dependents(&self, task: &Task, dependents: Dependents) {
+    fn notify_dependents(&self, task: &Task, dependents: SmallVec<[Idx; 2]>) {
         for &dependent in dependents.iter() {
             let n = self.mem.get(dependent);
-            let dep_data: &ProcessingData = n.cache.get_ref();
+            let dep_data: &ProcessingData<Idx> = n.cache.get_ref();
             let prev = dep_data.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
             if prev == 1 {
                 self.queue.push(Task::new(dependent, task.size_log2 + 1));
@@ -545,9 +458,9 @@ pub(super) fn is_finished(status: &AtomicU8) -> bool {
 /// 3. `fetch_xor` flips `PROCESSING → PENDING`, releasing the barrier with
 ///    Release semantics so subsequent pushers observe the freshly-installed
 ///    `ProcessingData`.
-fn start_processing_node<Meta: Default + Sync>(
+pub(super) fn start_processing_node<Meta: Default + Sync, Dep>(
     node: &QuadTreeNode<Meta>,
-    dependents: Dependents,
+    dependents: SmallVec<[Dep; 2]>,
 ) -> bool {
     if node
         .status
@@ -563,7 +476,7 @@ fn start_processing_node<Meta: Default + Sync>(
         return false;
     }
 
-    let pd = ProcessingData {
+    let pd = ProcessingData::<Dep> {
         dependents,
         ..Default::default()
     };
@@ -575,6 +488,137 @@ fn start_processing_node<Meta: Default + Sync>(
         .fetch_xor(status::PROCESSING | status::PENDING, Ordering::Release);
     record_status_claim_success();
     true
+}
+
+/// Async work body for a HashLife node: drive the node's `ProcessingData`
+/// state machine through Stage 1 (9 overlapping children, if `both_stages`)
+/// and Stage 2 (4 final children), registering dependencies and pushing
+/// child tasks via `queue` as needed.
+///
+/// Returns `Some(result)` if all child results are ready and the node can be
+/// finalized; returns `None` when at least one child is still in flight, in
+/// which case wake-up duty is transferred via the `waiting_cnt` bias trick
+/// (see module docs).
+///
+/// Generic over `Dep`. Pure HashLife runs pass `Dep = Idx` and `dep =
+/// task.idx`. StreamLife runs that descend through HashLife nodes pass
+/// `Dep = Dependent` and a tagged-enum value identifying the parent task.
+/// HashLife runtime path is unchanged: monomorphization with `Dep = Idx`
+/// emits today's exact code.
+pub(super) fn update_node_async<Meta, Dep>(
+    mem: &impl NodeAccess<Meta>,
+    queue: &Worker<Task>,
+    generations_log2: u32,
+    task: &Task,
+    parts: [Idx; 4],
+    data: &mut ProcessingData<Dep>,
+    dep: Dep,
+) -> Option<Idx>
+where
+    Meta: Default + Sync,
+    Dep: Copy,
+{
+    let both_stages = generations_log2 + 2 >= task.size_log2;
+    let [nw, ne, sw, se] = parts;
+    if task.size_log2 == LEAF_SIZE_LOG2 + 1 {
+        // base case: node consists of leaves
+        let steps = if both_stages {
+            LEAF_SIZE / 2
+        } else {
+            1 << generations_log2
+        };
+        return Some(algorithm::update_leaves(mem, nw, ne, sw, se, steps));
+    }
+
+    if data.mask4_waiting == 0 {
+        // arr4 is not ready
+        if !both_stages {
+            data.arr = algorithm::nine_children_disjoint(
+                mem,
+                nw,
+                ne,
+                sw,
+                se,
+                task.size_log2 - 1,
+            );
+        } else {
+            if data.mask9_waiting == 0 {
+                data.arr = algorithm::nine_children_overlapping(mem, nw, ne, sw, se);
+                data.mask9_waiting = 0b1_1111_1111;
+            }
+
+            // Bias `waiting_cnt` so concurrent notifiers cannot drive it
+            // to zero while we are still scanning.
+            data.waiting_cnt
+                .fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            for (i, x) in data.arr.iter_mut().enumerate() {
+                if data.mask9_waiting & (1 << i) == 0 {
+                    continue;
+                }
+                let d = mem.get(*x);
+                match handle_dependency(d, dep) {
+                    DependencyHandlingResult::Ready => {
+                        data.mask9_waiting &= !(1 << i);
+                        *x = d.cache.get_value();
+                    }
+                    DependencyHandlingResult::StartedByThisThread => {
+                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        queue.push(Task::new(*x, task.size_log2 - 1));
+                    }
+                    DependencyHandlingResult::StartedByOtherThread => {
+                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+
+            if data.mask9_waiting != 0 {
+                if prev == WAITING_BIAS {
+                    // Every dependency we registered already notified
+                    // before our `fetch_sub`; re-queue ourselves so the
+                    // mask gets re-scanned with their now-`Ready` status.
+                    queue.push(Task::new(task.idx, task.size_log2));
+                }
+                return None;
+            }
+        }
+
+        let arr4 = algorithm::four_children_overlapping(mem, &data.arr);
+        data.arr[..4].copy_from_slice(&arr4);
+        data.mask4_waiting = 0b1111;
+    }
+
+    data.waiting_cnt
+        .fetch_add(WAITING_BIAS, Ordering::Relaxed);
+    for (i, x) in data.arr.iter_mut().take(4).enumerate() {
+        if data.mask4_waiting & (1 << i) == 0 {
+            continue;
+        }
+        let d = mem.get(*x);
+        match handle_dependency(d, dep) {
+            DependencyHandlingResult::Ready => {
+                data.mask4_waiting &= !(1 << i);
+                *x = d.cache.get_value();
+            }
+            DependencyHandlingResult::StartedByThisThread => {
+                data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                queue.push(Task::new(*x, task.size_log2 - 1));
+            }
+            DependencyHandlingResult::StartedByOtherThread => {
+                data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+
+    if data.mask4_waiting != 0 {
+        if prev == WAITING_BIAS {
+            queue.push(Task::new(task.idx, task.size_log2));
+        }
+        return None;
+    }
+
+    Some(mem.find_or_create_node(data.arr[0], data.arr[1], data.arr[2], data.arr[3]))
 }
 
 /// RAII guard for the owner-mutex bit (`ACTIVE`).
@@ -655,7 +699,7 @@ impl<'a> Drop for ProcessingGuard<'a> {
 }
 
 /// Result of attempting to handle a dependency.
-enum DependencyHandlingResult {
+pub(super) enum DependencyHandlingResult {
     /// Dependency already computed, result available in cache
     Ready,
     /// This thread successfully claimed the dependency for processing
@@ -670,9 +714,15 @@ enum DependencyHandlingResult {
 /// with both `PENDING` and `ACTIVE`. This means a pusher never has to wait
 /// for the owner's compute burst — only for the brief init / finish
 /// barriers (encoded as `PROCESSING`) or for another concurrent pusher.
-fn handle_dependency<Meta: Default + Sync>(
+///
+/// Generic over `Dep`. Pure HashLife runs use `Dep = Idx` (registering the
+/// parent task's index). StreamLife runs that descend through HashLife nodes
+/// use `Dep = Dependent` (a tagged enum that distinguishes a HashLife waiter
+/// from a binode waiter). The `ProcessingData<Dep>` allocated for `n` must
+/// be of the same flavor across a single run.
+pub(super) fn handle_dependency<Meta: Default + Sync, Dep: Copy>(
     n: &QuadTreeNode<Meta>,
-    task: &Task,
+    dep: Dep,
 ) -> DependencyHandlingResult {
     let mut spinner = Spinner::new();
     loop {
@@ -682,7 +732,7 @@ fn handle_dependency<Meta: Default + Sync>(
             return DependencyHandlingResult::Ready;
         }
         if cur == status::NOT_STARTED {
-            if start_processing_node(n, smallvec![task.idx]) {
+            if start_processing_node(n, smallvec![dep]) {
                 record_metric(spinner.count(), MetricKind::HandleDep);
                 return DependencyHandlingResult::StartedByThisThread;
             }
@@ -708,9 +758,9 @@ fn handle_dependency<Meta: Default + Sync>(
             .is_ok()
         {
             n.cache
-                .get_ref::<ProcessingData>()
+                .get_ref::<ProcessingData<Dep>>()
                 .dependents
-                .push(task.idx);
+                .push(dep);
             n.status
                 .fetch_and(!status::DEPS_LOCK, Ordering::Release);
             record_metric(spinner.count(), MetricKind::HandleDep);

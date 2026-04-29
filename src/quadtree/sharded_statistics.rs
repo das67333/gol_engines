@@ -86,9 +86,8 @@ pub(super) enum MetricKind {
     HandleBiDep = 5,
     // Algorithm spin-wait on FINISHED (spin count)
     Node2Lanes = 6,
-    UpdateNodeSync = 7,
     // Task duration (raw timer ticks)
-    TaskDuration = 8,
+    TaskDuration = 7,
 }
 
 // ============================================================================
@@ -152,7 +151,7 @@ mod enabled {
 
     impl ExecutionStatistics {
         const DISTRIBUTION_BUCKETS: usize = 40;
-        const METRIC_COUNT: usize = 9;
+        const METRIC_COUNT: usize = 8;
 
         pub fn new() -> Self {
             Self {
@@ -199,7 +198,6 @@ mod enabled {
             Self::HandleDep,
             Self::HandleBiDep,
             Self::Node2Lanes,
-            Self::UpdateNodeSync,
             Self::TaskDuration,
         ];
 
@@ -212,7 +210,6 @@ mod enabled {
                 Self::HandleDep => "Spin [handle_dep]",
                 Self::HandleBiDep => "Spin [handle_bi_dep]",
                 Self::Node2Lanes => "Spin [node2lanes]",
-                Self::UpdateNodeSync => "Spin [update_node_sync]",
                 Self::TaskDuration => "Task duration",
             }
         }

@@ -1,5 +1,5 @@
 use super::{
-    LEAF_SIZE, LEAF_SIZE_LOG2,
+    LEAF_SIZE_LOG2,
     blank::BlankNodes,
     hashtable::{Idx, NodeAccess},
     sharded_statistics::{MetricKind, record_metric},
@@ -279,7 +279,12 @@ fn determine_direction<Meta: Default + Sync>(
 }
 
 /// Compute lane descriptors for a node. Thread-safe (uses CAS on `status_extra`).
-fn node2lanes(
+///
+/// Currently kept synchronous (kept-as-Spinner-based) per the v1 plan in
+/// `streamlife_async_design.md §8.1`. Called from both `is_solitonic` (the
+/// solitonic check inside the binode phase machine) and from the
+/// finalization steps of Phases Solitonic / Base.
+pub(super) fn node2lanes(
     mem: &impl NodeAccess<u64>,
     blank_nodes: &BlankNodes,
     idx: Idx,
@@ -484,119 +489,6 @@ pub(super) fn is_solitonic(
         return false;
     }
     (((lanes1 >> 4) & lanes2) | ((lanes2 >> 4) & lanes1)) & 15 != 0
-}
-
-/// Compute solitonic case: two non-interacting universes updated independently.
-/// Used by the parallel executor for the fast-path.
-pub(super) fn compute_solitonic(
-    mem: &impl NodeAccess<u64>,
-    blank_nodes: &BlankNodes,
-    gens_log2: u32,
-    idx: (Idx, Idx),
-    size_log2: u32,
-) -> (Idx, Idx) {
-    let i1 = update_node_sync(mem, gens_log2, idx.0, size_log2);
-    let i2 = update_node_sync(mem, gens_log2, idx.1, size_log2);
-
-    let b = blank_nodes.get(size_log2);
-    if idx.0 == b || idx.1 == b {
-        let (i3, ind3) = if idx.0 == b { (i2, idx.1) } else { (i1, idx.0) };
-        let lanes = node2lanes(mem, blank_nodes, ind3, size_log2);
-        let b = blank_nodes.get(size_log2 - 1);
-        if lanes & 0xf0 != 0 { (b, i3) } else { (i3, b) }
-    } else {
-        (i1, i2)
-    }
-}
-
-/// Compute base case: merge universes and run standard HashLife.
-/// Used by the parallel executor for the smallest recursive level.
-pub(super) fn compute_base_case(
-    mem: &impl NodeAccess<u64>,
-    blank_nodes: &BlankNodes,
-    gens_log2: u32,
-    idx: (Idx, Idx),
-    size_log2: u32,
-) -> (Idx, Idx) {
-    let hnode2 = merge_universes(mem, blank_nodes, idx, size_log2);
-    let i3 = update_node_sync(mem, gens_log2, hnode2, size_log2);
-    let b = blank_nodes.get(size_log2 - 1);
-
-    if i3 != b {
-        let lanes = node2lanes(mem, blank_nodes, hnode2, size_log2);
-        if lanes & 0xf0 != 0 { (b, i3) } else { (i3, b) }
-    } else {
-        (b, b)
-    }
-}
-
-fn update_inner_sync(mem: &impl NodeAccess<u64>, gens_log2: u32, node: Idx, size_log2: u32) -> Idx {
-    let n = mem.get(node);
-    let both_stages = gens_log2 + 2 >= size_log2;
-    if size_log2 == LEAF_SIZE_LOG2 + 1 {
-        let steps = if both_stages {
-            LEAF_SIZE / 2
-        } else {
-            1 << gens_log2
-        };
-        update_leaves(mem, n.nw, n.ne, n.sw, n.se, steps)
-    } else {
-        let mut arr9;
-        if both_stages {
-            arr9 = nine_children_overlapping(mem, n.nw, n.ne, n.sw, n.se);
-            for x in arr9.iter_mut() {
-                *x = update_node_sync(mem, gens_log2, *x, size_log2 - 1);
-            }
-        } else {
-            arr9 = nine_children_disjoint(mem, n.nw, n.ne, n.sw, n.se, size_log2 - 1);
-        }
-
-        let mut arr4 = four_children_overlapping(mem, &arr9);
-        for x in arr4.iter_mut() {
-            *x = update_node_sync(mem, gens_log2, *x, size_log2 - 1);
-        }
-
-        mem.find_or_create_node(arr4[0], arr4[1], arr4[2], arr4[3])
-    }
-}
-
-pub(super) fn update_node_sync(
-    mem: &impl NodeAccess<u64>,
-    gens_log2: u32,
-    node: Idx,
-    size_log2: u32,
-) -> Idx {
-    let n = mem.get(node);
-    let status = n.status.load(Ordering::Acquire);
-    if status == status::FINISHED {
-        return n.cache.get_value();
-    }
-
-    if status == status::NOT_STARTED
-        && n.status
-            .compare_exchange(
-                status::NOT_STARTED,
-                status::PROCESSING,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-    {
-        let cache = update_inner_sync(mem, gens_log2, node, size_log2);
-        n.cache.set_value(cache);
-        n.status.store(status::FINISHED, Ordering::Release);
-        cache
-    } else {
-        let mut spinner = Spinner::new();
-        while n.status.load(Ordering::Acquire) != status::FINISHED {
-            // if ExecutionStatistics::is_poisoned() {
-            //     return Idx::default();
-            // }
-            spinner.spin();
-        }
-        record_metric(spinner.count(), MetricKind::UpdateNodeSync);
-        n.cache.get_value()
-    }
 }
 
 /// Merge two non-overlapping universes into a single node. Thread-safe.

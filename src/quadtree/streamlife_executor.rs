@@ -1,35 +1,57 @@
 //! # Parallel StreamLife Executor
 //!
-//! Work-stealing parallel executor for the StreamLife algorithm's `update_binode` operation.
-//! Follows the same architecture as `hashlife_executor`, but operates on pairs of nodes
-//! `(Idx, Idx)` with state tracked in `BinodeCache`'s `CacheEntry`.
+//! Work-stealing parallel executor for the StreamLife algorithm's
+//! `update_binode` operation, with cross-engine async cooperation: HashLife
+//! sub-results required by `update_binode`'s solitonic / base fast-paths are
+//! computed asynchronously rather than via the synchronous `update_node_sync`
+//! path. See `streamlife_async_design.md` for the full design.
 //!
-//! ## Differences from HashLife Executor
+//! ## Two queues per worker
 //!
-//! - Tasks are identified by `u32` indices into the `BinodeCache` (binode pairs)
-//! - Processing data (`BiProcessingData`) is stored in the cache entry's payload union
-//! - Solitonic and base cases are computed synchronously via `update_node_sync`
-//! - Two parallel arrays (`arr0`, `arr1`) track the two universes
+//! Each worker holds two crossbeam deques:
+//! - `bi_queue: Worker<BiTask>` — binode tasks (the existing work item).
+//! - `hash_queue: Worker<Task>` — HashLife tasks descended from binode
+//!   Phases Solitonic / Base.
+//!
+//! Pop policy: local LIFO bi first (keep recursion stack-warm), then local
+//! LIFO hash, then steal — bi first, then hash, from a random victim.
+//! HashLife's pure-engine path is unchanged: it still uses a single
+//! `Worker<Task>`.
+//!
+//! ## Cross-engine dependents
+//!
+//! A binode task in Phase Solitonic or Base waits on the result of one or
+//! two HashLife nodes. It registers itself on the HashLife node's
+//! dependents list as `Dependent::Binode { entry_idx, size_log2 }`. HashLife
+//! sub-children registered during async descent of a HashLife node use
+//! `Dependent::Node { idx, size_log2 }`. The HashLife `notify_dependents`
+//! dispatches by variant, pushing to `bi_queue` or `hash_queue`
+//! appropriately.
 //!
 //! Dependents-list and `waiting_cnt` synchronization mirror the HashLife
 //! executor — see [`super::hashlife_executor`] module docs for the full state
-//! machine.
+//! machine. The bit-flag state machine on `n.status` is shared across both
+//! engines.
 
 use super::{
     LEAF_SIZE_LOG2, algorithm,
-    hashlife_executor::{ProcessingGuard, TaskFetcher, is_finished},
-    hashtable::{BinodeCache, BinodeCacheRef, Idx},
+    hashlife_executor::{
+        DependencyHandlingResult, ProcessingData, ProcessingGuard, Task, handle_dependency,
+        is_finished, update_node_async,
+    },
+    hashtable::{BinodeCache, BinodeCacheRef, Idx, NodeStoreRef},
     sharded_statistics::*,
     spin::Spinner,
     status,
     streamlife::StreamLifeEngine,
 };
-use crossbeam::deque::{Stealer, Worker};
+use crossbeam::deque::{Steal, Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
 use std::{
     mem,
     sync::atomic::{AtomicU8, AtomicU16, Ordering},
     thread,
+    time::Duration,
 };
 
 /// Bias added to `waiting_cnt` while the owner is scanning children. See
@@ -38,27 +60,75 @@ const WAITING_BIAS: u16 = 1 << 15;
 
 /// A unit of work representing a binode pair to be processed.
 #[derive(Clone, Copy)]
-struct BiTask {
+pub(super) struct BiTask {
     /// Index into the BinodeCache for this binode pair.
-    entry_idx: Idx,
+    pub(super) entry_idx: Idx,
     /// Size (log2) of the nodes in this pair.
-    size_log2: u32,
+    pub(super) size_log2: u32,
+}
+
+/// Tagged dependent for a HashLife `QuadTreeNode` processed during a
+/// StreamLife run. A HashLife node's dependents list (under `Dep =
+/// Dependent`) can hold either kind of waiter:
+/// - `Node`: another HashLife node (descended from a binode task) is waiting.
+/// - `Binode`: a binode task is waiting (Phases Solitonic / Base).
+///
+/// The `size_log2` is stored on the variant because the dependent's level is
+/// not always derivable from the dependency's: a binode in Phase S/B depends
+/// on a HashLife node at the *same* level, while a HashLife child is at one
+/// level below its parent.
+#[derive(Clone, Copy)]
+pub(super) enum Dependent {
+    Node { idx: Idx, size_log2: u32 },
+    Binode { entry_idx: Idx, size_log2: u32 },
+}
+
+/// Phase tag for a `BiTask`'s state machine. Set on the first invocation
+/// (Phase Entry) and read on every subsequent invocation to dispatch.
+///
+/// See `streamlife_async_design.md §3` for the full state machine.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum BiPhase {
+    /// First invocation; phase not yet decided.
+    #[default]
+    Entry,
+    /// Two universes are provably non-interacting. Need async
+    /// `update_node`-equivalent results for both `idx.0` and `idx.1`.
+    Solitonic,
+    /// Smallest recursive level. Universes merged synchronously; need async
+    /// `update_node`-equivalent result for the merged node.
+    Base,
+    /// Standard recursive case: 9-then-4 binode children. State tracked via
+    /// existing `mask9_waiting` / `mask4_waiting` masks (no cross-engine
+    /// dependents involved).
+    Recursive,
 }
 
 /// Temporary data allocated during binode processing.
 ///
 /// Heap-allocated when processing starts, freed when entry reaches FINISHED state.
 /// Stored via pointer in the cache entry's payload field.
-#[derive(Default)]
 struct BiProcessingData {
+    /// Phase the task is currently in (see [`BiPhase`]).
+    phase: BiPhase,
     /// Intermediate child node results for universe 0 (BESZEL).
+    /// In Phase Base, `arr0[0]` holds the merged-universes node.
     arr0: [Idx; 9],
     /// Intermediate child node results for universe 1 (ULQOMA).
     arr1: [Idx; 9],
     /// Bitmask: bit `i` set if child pair `i` (among first 9) is not yet computed.
+    /// Used in Phase Recursive only.
     mask9_waiting: u32,
     /// Bitmask: bit `i` set if child pair `i` (among first 4) is not yet computed.
+    /// Used in Phase Recursive only.
     mask4_waiting: u32,
+    /// Hash-result scratch for Phases Solitonic / Base.
+    ///   Phase Solitonic: hash_results[0] = i1 (for idx.0), hash_results[1] = i2 (for idx.1).
+    ///   Phase Base: hash_results[0] = i3 (for the merged node stored in arr0[0]).
+    hash_results: [Idx; 2],
+    /// Bitmask of pending HashLife results for Phases Solitonic / Base.
+    /// Solitonic uses bits 0,1; Base uses bit 0 only.
+    hash_mask: u8,
     /// Count of dependencies still being computed. The entry resumes when
     /// this reaches 0. Manipulated lock-free with the bias trick.
     waiting_cnt: AtomicU16,
@@ -66,6 +136,22 @@ struct BiProcessingData {
     /// owner exclusively during the init / finish barriers, and by pushers
     /// in parallel under [`status::DEPS_LOCK`].
     dependents: SmallVec<[BiTask; 2]>,
+}
+
+impl Default for BiProcessingData {
+    fn default() -> Self {
+        Self {
+            phase: BiPhase::default(),
+            arr0: [Idx::default(); 9],
+            arr1: [Idx::default(); 9],
+            mask9_waiting: 0,
+            mask4_waiting: 0,
+            hash_results: [Idx::default(); 2],
+            hash_mask: 0,
+            waiting_cnt: AtomicU16::new(0),
+            dependents: SmallVec::new(),
+        }
+    }
 }
 
 /// Parallel executor for StreamLife's `update_binode` using work-stealing.
@@ -92,20 +178,24 @@ impl<'a> StreamLifeExecutor<'a> {
         let root_idx = bicache.entry(self.biroot);
         let root_status = &bicache.get(root_idx).status();
 
-        // Create worker queues and stealers
-        let mut queues = Vec::with_capacity(num_threads);
-        let mut stealers = Vec::with_capacity(num_threads);
+        // Create worker queues and stealers for both task kinds.
+        let mut bi_queues = Vec::with_capacity(num_threads);
+        let mut bi_stealers = Vec::with_capacity(num_threads);
+        let mut hash_queues = Vec::with_capacity(num_threads);
+        let mut hash_stealers = Vec::with_capacity(num_threads);
 
         for _ in 0..num_threads {
-            let queue = Worker::new_lifo();
-            let stealer = queue.stealer();
-            queues.push(queue);
-            stealers.push(stealer);
+            let bi_queue = Worker::new_lifo();
+            let hash_queue = Worker::new_lifo();
+            bi_stealers.push(bi_queue.stealer());
+            hash_stealers.push(hash_queue.stealer());
+            bi_queues.push(bi_queue);
+            hash_queues.push(hash_queue);
         }
 
         // Claim root entry and push initial task
         start_processing_entry(bicache, root_idx, smallvec![]);
-        queues[0].push(BiTask {
+        bi_queues[0].push(BiTask {
             entry_idx: root_idx,
             size_log2: self.size_log2,
         });
@@ -113,14 +203,19 @@ impl<'a> StreamLifeExecutor<'a> {
         let mut total_stats = ExecutionStatistics::new();
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(num_threads);
-            for (thread_idx, queue) in queues.into_iter().enumerate() {
+            for (thread_idx, (bi_queue, hash_queue)) in
+                bi_queues.into_iter().zip(hash_queues.into_iter()).enumerate()
+            {
                 let executor_thread = BiExecutorThread {
                     engine: self.engine,
                     bicache_ref: bicache.create_ref(thread_idx),
+                    node_ref: self.engine.base.mem.create_ref(thread_idx),
                     root_status,
                     thread_idx,
-                    queue,
-                    stealers: &stealers,
+                    bi_queue,
+                    hash_queue,
+                    bi_stealers: &bi_stealers,
+                    hash_stealers: &hash_stealers,
                 };
                 handles.push(scope.spawn(move || executor_thread.run()));
             }
@@ -131,9 +226,7 @@ impl<'a> StreamLifeExecutor<'a> {
         });
 
         if self.engine.base.mem.exceeds_load_factor() || bicache.exceeds_load_factor() {
-            // The base `NodeStore` carries no orphaned boxes: StreamLife
-            // drives it via `update_node_sync`, never via async PROCESSING.
-            self.free_orphaned_bi_processing_data();
+            self.free_orphaned_processing_data();
             return None;
         }
 
@@ -150,9 +243,12 @@ impl<'a> StreamLifeExecutor<'a> {
         Some(bicache.get(root_idx).payload.get_value())
     }
 
-    /// Binode-cache analogue of
-    /// [`HashLifeExecutor::free_orphaned_processing_data`].
-    fn free_orphaned_bi_processing_data(&self) {
+    /// Drop orphaned `ProcessingData<Dependent>` (HashLife nodes) and
+    /// `BiProcessingData` (binode entries) on cancellation. Must be called
+    /// from a single-threaded context after `thread::scope` has joined; only
+    /// PENDING slots own a live box at that point.
+    fn free_orphaned_processing_data(&self) {
+        // Binode entries
         let bicache = &self.engine.bicache;
         for idx in 0..bicache.capacity() {
             let entry = bicache.get(idx as Idx);
@@ -164,53 +260,177 @@ impl<'a> StreamLifeExecutor<'a> {
                 unsafe { drop(Box::from_raw(pd as *mut BiProcessingData)) };
             }
         }
+        // HashLife nodes processed asynchronously during this StreamLife run
+        // can also be orphaned in PENDING state. Free their
+        // `ProcessingData<Dependent>` boxes.
+        let mem = &self.engine.base.mem;
+        for idx in 0..mem.capacity() {
+            let n = mem.get(idx as Idx);
+            let status = n.status.load(Ordering::Relaxed);
+            if status == status::PENDING {
+                let pd: &mut ProcessingData<Dependent> = n.cache.get_ref();
+                // SAFETY: produced by `Box::into_raw` in
+                // `start_processing_node`; all workers have joined.
+                unsafe { drop(Box::from_raw(pd as *mut ProcessingData<Dependent>)) };
+            }
+        }
     }
 }
 
 /// Per-thread worker for the StreamLife parallel executor.
+///
+/// Holds two deques (binode and HashLife) and processes work from either
+/// kind, with a custom dual-queue fetch loop in [`Self::run`].
 struct BiExecutorThread<'a> {
     engine: &'a StreamLifeEngine,
     bicache_ref: BinodeCacheRef<'a>,
+    node_ref: NodeStoreRef<'a, u64>,
     root_status: &'a AtomicU8,
     thread_idx: usize,
-    queue: Worker<BiTask>,
-    stealers: &'a [Stealer<BiTask>],
+    bi_queue: Worker<BiTask>,
+    hash_queue: Worker<Task>,
+    bi_stealers: &'a [Stealer<BiTask>],
+    hash_stealers: &'a [Stealer<Task>],
 }
 
 impl<'a> BiExecutorThread<'a> {
+    /// Initial backoff for the steal-then-sleep loop.
+    const INITIAL_WAIT: Duration = Duration::from_micros(100);
+    /// Maximum backoff.
+    const MAX_WAIT: Duration = Duration::from_millis(100);
+    /// Number of random victims to attempt per outer iteration before sleeping.
+    const STEAL_ATTEMPTS: usize = 2;
+
     fn run(&self) -> ExecutionStatistics {
-        let mut fetcher = TaskFetcher::new(
-            self.thread_idx,
-            &self.queue,
-            self.stealers,
-            || is_finished(self.root_status),
-            || {
-                self.engine.base.mem.exceeds_load_factor()
-                    || self.bicache_ref.exceeds_load_factor()
-            },
-        );
         set_current_execution_stats();
 
-        while let Some(task) = fetcher.fetch_task() {
-            let start = Ticks::now();
-            self.process_task(task);
-            record_task_duration(Ticks::now().elapsed_since(start));
+        let mut rng = <rand_chacha::ChaCha8Rng as rand::SeedableRng>::from_os_rng();
+        let mut wait_duration = Self::INITIAL_WAIT;
+        let mut last_bi_victim = 0usize;
+        let mut last_hash_victim = 0usize;
+
+        'outer: loop {
+            // Cancellation: load factor exceeded on either store.
+            if self.engine.base.mem.exceeds_load_factor()
+                || self.bicache_ref.exceeds_load_factor()
+            {
+                break;
+            }
+
+            // Local LIFO: prefer binode work to keep the recursion stack warm,
+            // then HashLife work.
+            if let Some(task) = self.bi_queue.pop() {
+                self.timed_process_bi_task(task);
+                wait_duration = Self::INITIAL_WAIT;
+                continue;
+            }
+            if let Some(task) = self.hash_queue.pop() {
+                self.timed_process_hash_task(task);
+                wait_duration = Self::INITIAL_WAIT;
+                continue;
+            }
+
+            // Termination condition checked after local pops fail (so we
+            // drain any remaining local work).
+            if is_finished(self.root_status) {
+                break;
+            }
+
+            let n = self.bi_stealers.len();
+            if n > 1 {
+                // Try last successful victim first (locality / hot cache).
+                if let Some(task) = self.try_steal_bi(last_bi_victim) {
+                    self.timed_process_bi_task(task);
+                    wait_duration = Self::INITIAL_WAIT;
+                    continue;
+                }
+                if let Some(task) = self.try_steal_hash(last_hash_victim) {
+                    self.timed_process_hash_task(task);
+                    wait_duration = Self::INITIAL_WAIT;
+                    continue;
+                }
+
+                // Random victim selection. Prefer bi over hash from the same
+                // victim (binodes drive the work; HashLife tasks are
+                // descended from them).
+                for _ in 0..Self::STEAL_ATTEMPTS {
+                    let victim = self.random_victim(&mut rng, n);
+                    if self.bi_stealers[victim].len() > 0
+                        && let Some(task) = self.try_steal_bi(victim)
+                    {
+                        last_bi_victim = victim;
+                        self.timed_process_bi_task(task);
+                        wait_duration = Self::INITIAL_WAIT;
+                        continue 'outer;
+                    }
+                    if self.hash_stealers[victim].len() > 0
+                        && let Some(task) = self.try_steal_hash(victim)
+                    {
+                        last_hash_victim = victim;
+                        self.timed_process_hash_task(task);
+                        wait_duration = Self::INITIAL_WAIT;
+                        continue 'outer;
+                    }
+                }
+            }
+
+            thread::sleep(wait_duration);
+            wait_duration = Self::MAX_WAIT.min(wait_duration * 2);
         }
 
         take_current_execution_stats().unwrap()
     }
 
-    /// Process a single binode task.
-    ///
-    /// Flow:
-    /// 1. Acquire owner-mutex by transitioning `PENDING → ACTIVE`.
-    /// 2. Call `update_binode` to compute the result or register dependencies.
-    /// 3. If a result is ready: cross the finish barrier (`ACTIVE → PROCESSING`
-    ///    once `DEPS_LOCK` clears), drain dependents, publish the value,
-    ///    transition to `FINISHED`, and notify dependents.
-    /// 4. Otherwise: guard drop transitions `ACTIVE → PENDING` while
-    ///    preserving any in-flight `DEPS_LOCK`.
-    fn process_task(&self, task: BiTask) {
+    fn timed_process_bi_task(&self, task: BiTask) {
+        let start = Ticks::now();
+        self.process_bi_task(task);
+        record_task_duration(Ticks::now().elapsed_since(start));
+    }
+
+    fn timed_process_hash_task(&self, task: Task) {
+        let start = Ticks::now();
+        self.process_hash_task(task);
+        record_task_duration(Ticks::now().elapsed_since(start));
+    }
+
+    fn random_victim(&self, rng: &mut rand_chacha::ChaCha8Rng, n: usize) -> usize {
+        use rand::Rng;
+        // Don't steal from yourself.
+        let mut i = rng.random_range(0..n - 1);
+        if i >= self.thread_idx {
+            i += 1;
+        }
+        i
+    }
+
+    fn try_steal_bi(&self, victim: usize) -> Option<BiTask> {
+        loop {
+            let result = self.bi_stealers[victim]
+                .steal_batch_with_limit_and_pop(&self.bi_queue, 1);
+            record_steal(&result);
+            match result {
+                Steal::Success(task) => return Some(task),
+                Steal::Empty => return None,
+                Steal::Retry => continue,
+            }
+        }
+    }
+
+    fn try_steal_hash(&self, victim: usize) -> Option<Task> {
+        loop {
+            let result = self.hash_stealers[victim]
+                .steal_batch_with_limit_and_pop(&self.hash_queue, 1);
+            record_steal(&result);
+            match result {
+                Steal::Success(task) => return Some(task),
+                Steal::Empty => return None,
+                Steal::Retry => continue,
+            }
+        }
+    }
+
+    /// Process a single binode task: drive its phase machine.
+    fn process_bi_task(&self, task: BiTask) {
         let entry = self.bicache_ref.get(task.entry_idx);
         let status = entry.status();
         let mut guard = ProcessingGuard::new(status, MetricKind::ProcessTask);
@@ -224,21 +444,51 @@ impl<'a> BiExecutorThread<'a> {
             entry.payload.set_value(result);
             guard.publish_finished();
             unsafe { drop(Box::from_raw(data as *mut BiProcessingData)) };
-            self.notify_dependents(dependents);
+            self.notify_bi_dependents(dependents);
         }
     }
 
-    /// Compute binode result or identify dependencies.
+    /// Process a single HashLife task descended from a binode Phase S/B.
+    /// Mirror of HashLife's `process_task` but uses
+    /// `ProcessingData<Dependent>` so cross-engine waiters can register.
+    fn process_hash_task(&self, task: Task) {
+        let n = self.node_ref.get(task.idx);
+        let mut guard = ProcessingGuard::new(&n.status, MetricKind::ProcessTask);
+        let data: &mut ProcessingData<Dependent> = n.cache.get_ref();
+        let dep = Dependent::Node {
+            idx: task.idx,
+            size_log2: task.size_log2,
+        };
+        let parts = n.parts();
+        let result = update_node_async(
+            &self.node_ref,
+            &self.hash_queue,
+            self.engine.base.generations_per_update_log2.unwrap(),
+            &task,
+            parts,
+            data,
+            dep,
+        );
+        if let Some(result) = result {
+            guard.enter_finish_barrier(MetricKind::NotifyDep);
+            let mut dependents: SmallVec<[Dependent; 2]> = SmallVec::new();
+            mem::swap(&mut data.dependents, &mut dependents);
+            n.cache.set_value(result);
+            guard.publish_finished();
+            unsafe { drop(Box::from_raw(data as *mut ProcessingData<Dependent>)) };
+            self.notify_node_dependents(dependents);
+        }
+    }
+
+    /// Compute binode result or yield, advancing the phase machine.
     ///
-    /// Returns `Some(result)` if computation completes, `None` if waiting for dependencies.
+    /// On the first invocation, decides the phase (Solitonic / Base /
+    /// Recursive) and falls through. On subsequent invocations, reads the
+    /// stored phase and dispatches.
     ///
-    /// Three cases:
-    /// 1. **Solitonic**: Two universes are provably non-interacting. Compute each
-    ///    independently via standard HashLife. Returns immediately.
-    /// 2. **Base case** (`size_log2 == LEAF_SIZE_LOG2 + 2`): Merge universes and compute
-    ///    via HashLife. Returns immediately.
-    /// 3. **Recursive case**: Process 9+4 child binode pairs (same as HashLife structure
-    ///    but with pairs).
+    /// Returns `Some(result)` when the task can be finalized, `None` when
+    /// at least one dependency is still in flight (wake-up duty transferred
+    /// via the `waiting_cnt` bias trick).
     fn update_binode(
         &self,
         parent_entry_idx: Idx,
@@ -247,75 +497,225 @@ impl<'a> BiExecutorThread<'a> {
         data: &mut BiProcessingData,
     ) -> Option<(Idx, Idx)> {
         let engine = self.engine;
+        let gens_log2 = engine.base.generations_per_update_log2.unwrap();
 
-        // First entry into this task: check for synchronous fast-paths
-        if data.mask4_waiting == 0 && data.mask9_waiting == 0 {
-            // Solitonic: two universes don't interact, compute independently
+        // === Phase Entry: first invocation, decide which phase to enter ===
+        if data.phase == BiPhase::Entry {
+            // is_solitonic is sync; it spins on node2lanes' status_extra.
             if algorithm::is_solitonic(&engine.base.mem, &engine.base.blank_nodes, idx, size_log2) {
-                return Some(algorithm::compute_solitonic(
+                data.phase = BiPhase::Solitonic;
+                data.hash_mask = 0b11; // need both i1, i2
+            } else if size_log2 == LEAF_SIZE_LOG2 + 2 {
+                data.phase = BiPhase::Base;
+                // Synchronous: tree assembly only, no waits.
+                let merged = algorithm::merge_universes(
                     &engine.base.mem,
                     &engine.base.blank_nodes,
-                    self.engine.base.generations_per_update_log2.unwrap(),
                     idx,
                     size_log2,
-                ));
-            }
-
-            // Base case: merge universes and run standard HashLife
-            if size_log2 == LEAF_SIZE_LOG2 + 2 {
-                return Some(algorithm::compute_base_case(
-                    &engine.base.mem,
-                    &engine.base.blank_nodes,
-                    self.engine.base.generations_per_update_log2.unwrap(),
-                    idx,
-                    size_log2,
-                ));
-            }
-
-            // Recursive case: set up children for both universes
-            let generations_log2 = engine.base.generations_per_update_log2.unwrap();
-            let both_stages = generations_log2 + 2 >= size_log2;
-            let n0 = engine.base.mem.get(idx.0);
-            let n1 = engine.base.mem.get(idx.1);
-
-            if both_stages {
-                data.arr0 = algorithm::nine_children_overlapping(
-                    &engine.base.mem,
-                    n0.nw,
-                    n0.ne,
-                    n0.sw,
-                    n0.se,
                 );
-                data.arr1 = algorithm::nine_children_overlapping(
-                    &engine.base.mem,
-                    n1.nw,
-                    n1.ne,
-                    n1.sw,
-                    n1.se,
-                );
-                data.mask9_waiting = 0b1_1111_1111;
+                data.arr0[0] = merged;
+                data.hash_mask = 0b1; // need i3
             } else {
-                data.arr0 = algorithm::nine_children_disjoint(
-                    &engine.base.mem,
-                    n0.nw,
-                    n0.ne,
-                    n0.sw,
-                    n0.se,
-                    size_log2 - 1,
-                );
-                data.arr1 = algorithm::nine_children_disjoint(
-                    &engine.base.mem,
-                    n1.nw,
-                    n1.ne,
-                    n1.sw,
-                    n1.se,
-                    size_log2 - 1,
-                );
-                // Single-stage: skip directly to arr4 computation (mask9 stays 0)
+                data.phase = BiPhase::Recursive;
+                let both_stages = gens_log2 + 2 >= size_log2;
+                let n0 = engine.base.mem.get(idx.0);
+                let n1 = engine.base.mem.get(idx.1);
+                if both_stages {
+                    data.arr0 = algorithm::nine_children_overlapping(
+                        &engine.base.mem,
+                        n0.nw,
+                        n0.ne,
+                        n0.sw,
+                        n0.se,
+                    );
+                    data.arr1 = algorithm::nine_children_overlapping(
+                        &engine.base.mem,
+                        n1.nw,
+                        n1.ne,
+                        n1.sw,
+                        n1.se,
+                    );
+                    data.mask9_waiting = 0b1_1111_1111;
+                } else {
+                    data.arr0 = algorithm::nine_children_disjoint(
+                        &engine.base.mem,
+                        n0.nw,
+                        n0.ne,
+                        n0.sw,
+                        n0.se,
+                        size_log2 - 1,
+                    );
+                    data.arr1 = algorithm::nine_children_disjoint(
+                        &engine.base.mem,
+                        n1.nw,
+                        n1.ne,
+                        n1.sw,
+                        n1.se,
+                        size_log2 - 1,
+                    );
+                    // Single-stage: skip directly to arr4 (mask9 stays 0).
+                }
             }
         }
 
-        // Stage 1: Wait for 9 overlapping children (if both_stages)
+        // Dispatch by phase.
+        match data.phase {
+            BiPhase::Entry => unreachable!("Entry should have been transitioned"),
+            BiPhase::Solitonic => self.solitonic_phase(parent_entry_idx, idx, size_log2, data),
+            BiPhase::Base => self.base_phase(parent_entry_idx, size_log2, data),
+            BiPhase::Recursive => self.recursive_phase(parent_entry_idx, size_log2, data),
+        }
+    }
+
+    /// Phase Solitonic: wait for `update_node_async`-equivalent of
+    /// `idx.0` and `idx.1`, then assemble.
+    fn solitonic_phase(
+        &self,
+        parent_entry_idx: Idx,
+        idx: (Idx, Idx),
+        size_log2: u32,
+        data: &mut BiProcessingData,
+    ) -> Option<(Idx, Idx)> {
+        let engine = self.engine;
+        let targets = [idx.0, idx.1];
+        let dep = Dependent::Binode {
+            entry_idx: parent_entry_idx,
+            size_log2,
+        };
+
+        if data.hash_mask != 0 {
+            data.waiting_cnt
+                .fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            for b in 0..2 {
+                if data.hash_mask & (1 << b) == 0 {
+                    continue;
+                }
+                let target = targets[b];
+                let target_node = self.node_ref.get(target);
+                match handle_dependency(target_node, dep) {
+                    DependencyHandlingResult::Ready => {
+                        data.hash_mask &= !(1 << b);
+                        data.hash_results[b] = target_node.cache.get_value();
+                    }
+                    DependencyHandlingResult::StartedByThisThread => {
+                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        self.hash_queue.push(Task::new(target, size_log2));
+                    }
+                    DependencyHandlingResult::StartedByOtherThread => {
+                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            let prev = data
+                .waiting_cnt
+                .fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+            if data.hash_mask != 0 {
+                if prev == WAITING_BIAS {
+                    self.bi_queue.push(BiTask {
+                        entry_idx: parent_entry_idx,
+                        size_log2,
+                    });
+                }
+                return None;
+            }
+        }
+
+        // Both hash results in. Finalize per `compute_solitonic` semantics.
+        let i1 = data.hash_results[0];
+        let i2 = data.hash_results[1];
+        let b = engine.base.blank_nodes.get(size_log2);
+        let result = if idx.0 == b || idx.1 == b {
+            let (i3, ind3) = if idx.0 == b { (i2, idx.1) } else { (i1, idx.0) };
+            // Sync: lane query (kept synchronous in v1; node2lanes uses its
+            // own spinner-on-status_extra for in-flight waits).
+            let lanes = algorithm::node2lanes(&engine.base.mem, &engine.base.blank_nodes, ind3, size_log2);
+            let blank_child = engine.base.blank_nodes.get(size_log2 - 1);
+            if lanes & 0xf0 != 0 {
+                (blank_child, i3)
+            } else {
+                (i3, blank_child)
+            }
+        } else {
+            (i1, i2)
+        };
+        Some(result)
+    }
+
+    /// Phase Base: wait for `update_node_async`-equivalent of the merged
+    /// universe, then assemble.
+    fn base_phase(
+        &self,
+        parent_entry_idx: Idx,
+        size_log2: u32,
+        data: &mut BiProcessingData,
+    ) -> Option<(Idx, Idx)> {
+        let engine = self.engine;
+        let merged = data.arr0[0];
+        let dep = Dependent::Binode {
+            entry_idx: parent_entry_idx,
+            size_log2,
+        };
+
+        if data.hash_mask != 0 {
+            data.waiting_cnt
+                .fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            // Only bit 0 is used for Phase Base.
+            let target_node = self.node_ref.get(merged);
+            match handle_dependency(target_node, dep) {
+                DependencyHandlingResult::Ready => {
+                    data.hash_mask &= !0b1;
+                    data.hash_results[0] = target_node.cache.get_value();
+                }
+                DependencyHandlingResult::StartedByThisThread => {
+                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                    self.hash_queue.push(Task::new(merged, size_log2));
+                }
+                DependencyHandlingResult::StartedByOtherThread => {
+                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let prev = data
+                .waiting_cnt
+                .fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+            if data.hash_mask != 0 {
+                if prev == WAITING_BIAS {
+                    self.bi_queue.push(BiTask {
+                        entry_idx: parent_entry_idx,
+                        size_log2,
+                    });
+                }
+                return None;
+            }
+        }
+
+        let i3 = data.hash_results[0];
+        let blank_child = engine.base.blank_nodes.get(size_log2 - 1);
+        let result = if i3 != blank_child {
+            // Sync: lane query on the merged node.
+            let lanes =
+                algorithm::node2lanes(&engine.base.mem, &engine.base.blank_nodes, merged, size_log2);
+            if lanes & 0xf0 != 0 {
+                (blank_child, i3)
+            } else {
+                (i3, blank_child)
+            }
+        } else {
+            (blank_child, blank_child)
+        };
+        Some(result)
+    }
+
+    /// Phase Recursive: existing 9-then-4 binode children logic.
+    fn recursive_phase(
+        &self,
+        parent_entry_idx: Idx,
+        size_log2: u32,
+        data: &mut BiProcessingData,
+    ) -> Option<(Idx, Idx)> {
+        let engine = self.engine;
+
+        // Stage 1: Wait for 9 overlapping children (if both_stages).
         if data.mask4_waiting == 0 && data.mask9_waiting != 0 {
             data.waiting_cnt
                 .fetch_add(WAITING_BIAS, Ordering::Relaxed);
@@ -325,7 +725,6 @@ impl<'a> BiExecutorThread<'a> {
                 }
                 let child_key = (data.arr0[i], data.arr1[i]);
                 let child_idx = self.bicache_ref.entry(child_key);
-
                 match handle_bi_dependency(&engine.bicache, child_idx, parent_entry_idx, size_log2)
                 {
                     BiDependencyResult::Ready => {
@@ -336,7 +735,7 @@ impl<'a> BiExecutorThread<'a> {
                     }
                     BiDependencyResult::StartedByThisThread => {
                         data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                        self.queue.push(BiTask {
+                        self.bi_queue.push(BiTask {
                             entry_idx: child_idx,
                             size_log2: size_log2 - 1,
                         });
@@ -349,13 +748,9 @@ impl<'a> BiExecutorThread<'a> {
             let prev = data
                 .waiting_cnt
                 .fetch_sub(WAITING_BIAS, Ordering::AcqRel);
-
             if data.mask9_waiting != 0 {
                 if prev == WAITING_BIAS {
-                    // All registered deps already notified during the scan;
-                    // re-queue ourselves to re-scan with their now-`Ready`
-                    // status.
-                    self.queue.push(BiTask {
+                    self.bi_queue.push(BiTask {
                         entry_idx: parent_entry_idx,
                         size_log2,
                     });
@@ -364,7 +759,8 @@ impl<'a> BiExecutorThread<'a> {
             }
         }
 
-        // Transition: compute arr4 from the 9 results (or from disjoint children)
+        // Transition: compute arr4 from the 9 results (or from disjoint
+        // children when single-stage).
         if data.mask4_waiting == 0 {
             let arr40 = algorithm::four_children_overlapping(&engine.base.mem, &data.arr0);
             let arr41 = algorithm::four_children_overlapping(&engine.base.mem, &data.arr1);
@@ -373,53 +769,47 @@ impl<'a> BiExecutorThread<'a> {
             data.mask4_waiting = 0b1111;
         }
 
-        // Stage 2: Wait for 4 final children
-        {
-            data.waiting_cnt
-                .fetch_add(WAITING_BIAS, Ordering::Relaxed);
-            for i in 0..4 {
-                if data.mask4_waiting & (1 << i) == 0 {
-                    continue;
-                }
-                let child_key = (data.arr0[i], data.arr1[i]);
-                let child_idx = self.bicache_ref.entry(child_key);
-
-                match handle_bi_dependency(&engine.bicache, child_idx, parent_entry_idx, size_log2)
-                {
-                    BiDependencyResult::Ready => {
-                        data.mask4_waiting &= !(1 << i);
-                        let val = self.bicache_ref.get(child_idx).payload.get_value();
-                        data.arr0[i] = val.0;
-                        data.arr1[i] = val.1;
-                    }
-                    BiDependencyResult::StartedByThisThread => {
-                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                        self.queue.push(BiTask {
-                            entry_idx: child_idx,
-                            size_log2: size_log2 - 1,
-                        });
-                    }
-                    BiDependencyResult::StartedByOtherThread => {
-                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+        // Stage 2: Wait for 4 final children.
+        data.waiting_cnt
+            .fetch_add(WAITING_BIAS, Ordering::Relaxed);
+        for i in 0..4 {
+            if data.mask4_waiting & (1 << i) == 0 {
+                continue;
             }
-            let prev = data
-                .waiting_cnt
-                .fetch_sub(WAITING_BIAS, Ordering::AcqRel);
-
-            if data.mask4_waiting != 0 {
-                if prev == WAITING_BIAS {
-                    self.queue.push(BiTask {
-                        entry_idx: parent_entry_idx,
-                        size_log2,
+            let child_key = (data.arr0[i], data.arr1[i]);
+            let child_idx = self.bicache_ref.entry(child_key);
+            match handle_bi_dependency(&engine.bicache, child_idx, parent_entry_idx, size_log2) {
+                BiDependencyResult::Ready => {
+                    data.mask4_waiting &= !(1 << i);
+                    let val = self.bicache_ref.get(child_idx).payload.get_value();
+                    data.arr0[i] = val.0;
+                    data.arr1[i] = val.1;
+                }
+                BiDependencyResult::StartedByThisThread => {
+                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                    self.bi_queue.push(BiTask {
+                        entry_idx: child_idx,
+                        size_log2: size_log2 - 1,
                     });
                 }
-                return None;
+                BiDependencyResult::StartedByOtherThread => {
+                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
+        let prev = data
+            .waiting_cnt
+            .fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+        if data.mask4_waiting != 0 {
+            if prev == WAITING_BIAS {
+                self.bi_queue.push(BiTask {
+                    entry_idx: parent_entry_idx,
+                    size_log2,
+                });
+            }
+            return None;
+        }
 
-        // Assemble final result from the 4 completed children
         Some((
             engine.base.mem.find_or_create_node(
                 data.arr0[0],
@@ -436,23 +826,55 @@ impl<'a> BiExecutorThread<'a> {
         ))
     }
 
-    /// Notify dependent entries that this dependency has completed.
+    /// Notify dependents of a finished binode entry.
     ///
-    /// Atomically decrements each dependent's `waiting_cnt`. The thread that
-    /// drives the counter to zero (this notifier or the owner's own
-    /// `fetch_sub(WAITING_BIAS)`) re-queues the parent task. No lock is taken
-    /// on the dependent entry: `BiProcessingData` is alive until `FINISHED`,
-    /// which only its owner can publish, after `waiting_cnt == 0`.
-    fn notify_dependents(&self, dependents: SmallVec<[BiTask; 2]>) {
+    /// Atomically decrements each dependent's `waiting_cnt`. The thread
+    /// that drives the counter to zero re-queues the parent BiTask.
+    fn notify_bi_dependents(&self, dependents: SmallVec<[BiTask; 2]>) {
         for dep in dependents {
             let entry = self.bicache_ref.get(dep.entry_idx);
             let dep_data: &BiProcessingData = entry.payload.get_ref();
             let prev = dep_data.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
             if prev == 1 {
-                self.queue.push(BiTask {
+                self.bi_queue.push(BiTask {
                     entry_idx: dep.entry_idx,
                     size_log2: dep.size_log2,
                 });
+            }
+        }
+    }
+
+    /// Notify dependents of a finished HashLife node, dispatching by
+    /// `Dependent` variant.
+    ///
+    /// Each variant's `size_log2` field carries the dependent's level
+    /// directly — this decouples the notify path from any assumption about
+    /// the relationship between dependency level and dependent level.
+    fn notify_node_dependents(&self, dependents: SmallVec<[Dependent; 2]>) {
+        for dep in dependents {
+            match dep {
+                Dependent::Node { idx, size_log2 } => {
+                    let n = self.node_ref.get(idx);
+                    let pd: &ProcessingData<Dependent> = n.cache.get_ref();
+                    let prev = pd.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
+                    if prev == 1 {
+                        self.hash_queue.push(Task::new(idx, size_log2));
+                    }
+                }
+                Dependent::Binode {
+                    entry_idx,
+                    size_log2,
+                } => {
+                    let entry = self.bicache_ref.get(entry_idx);
+                    let pd: &BiProcessingData = entry.payload.get_ref();
+                    let prev = pd.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
+                    if prev == 1 {
+                        self.bi_queue.push(BiTask {
+                            entry_idx,
+                            size_log2,
+                        });
+                    }
+                }
             }
         }
     }
