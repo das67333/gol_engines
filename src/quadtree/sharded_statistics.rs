@@ -116,11 +116,7 @@ mod enabled {
     impl Ticks {
         #[inline(always)]
         pub fn now() -> Self {
-            let value: u64;
-            unsafe {
-                core::arch::asm!("mrs {0}, cntvct_el0", out(reg) value);
-            }
-            Self(value)
+            Self(Self::read_timestamp())
         }
 
         #[inline(always)]
@@ -130,6 +126,24 @@ mod enabled {
 
         fn raw(self) -> u64 {
             self.0
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        #[inline(always)]
+        fn read_timestamp() -> u64 {
+            let value: u64;
+            unsafe {
+                core::arch::asm!("mrs {0}, cntvct_el0", out(reg) value);
+            }
+            value
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        #[inline(always)]
+        fn read_timestamp() -> u64 {
+            unsafe {
+                core::arch::x86_64::_rdtsc()
+            }
         }
     }
 
@@ -377,6 +391,26 @@ mod enabled {
         if sci.len() < plain.len() { sci } else { plain }
     }
 
+    /// Query the timer frequency (ticks per second) for the current platform.
+    fn timer_frequency() -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let value: u64;
+            unsafe {
+                core::arch::asm!("mrs {0}, cntfrq_el0", out(reg) value);
+            }
+            value
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // TSC frequency is not trivially queryable; use a reasonable
+            // estimate.  For accurate results consider calibrating at startup.
+            // We default to a typical ~3 GHz.
+            3_000_000_000u64
+        }
+    }
+
     fn fmt_distribution(
         f: &mut std::fmt::Formatter<'_>,
         kind: MetricKind,
@@ -395,7 +429,7 @@ mod enabled {
             })
             .sum::<f64>() as u64;
         let percentiles = compute_percentiles(dist);
-        let ns_per_tick = 1e9 / cntfrq() as f64;
+        let ns_per_tick = 1e9 / timer_frequency() as f64;
         let nnz: u64 = cnt - dist[0];
         let sum_str = if kind.is_duration() {
             format_ns(sum as f64 * ns_per_tick)
@@ -419,14 +453,6 @@ mod enabled {
             }
         }
         writeln!(f)
-    }
-
-    fn cntfrq() -> u64 {
-        let value: u64;
-        unsafe {
-            core::arch::asm!("mrs {0}, cntfrq_el0", out(reg) value);
-        }
-        value
     }
 
     impl std::fmt::Display for ExecutionStatistics {
