@@ -339,12 +339,16 @@ impl<'a> BiExecutorThread<'a> {
             let n = self.bi_stealers.len();
             if n > 1 {
                 // Try last successful victim first (locality / hot cache).
-                if let Some(task) = self.try_steal_bi(last_bi_victim) {
+                let bi_lv = self.try_steal_bi(last_bi_victim);
+                record_last_victim_steal(&bi_lv);
+                if let Some(task) = bi_lv {
                     self.timed_process_bi_task(task);
                     wait_duration = Self::INITIAL_WAIT;
                     continue;
                 }
-                if let Some(task) = self.try_steal_hash(last_hash_victim) {
+                let hash_lv = self.try_steal_hash(last_hash_victim);
+                record_last_victim_steal(&hash_lv);
+                if let Some(task) = hash_lv {
                     self.timed_process_hash_task(task);
                     wait_duration = Self::INITIAL_WAIT;
                     continue;

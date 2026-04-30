@@ -2,7 +2,7 @@ use gol_engines::*;
 use num_bigint::BigInt;
 
 const POP_REF: u64 = 93_235_805;
-const REPS: usize = 3;
+const REPS: usize = 10;
 
 struct EngineConfig {
     mem_mib: u32,
@@ -43,7 +43,7 @@ fn run_bench<E: GoLEngine>(name: &str, cfg: &EngineConfig, threads: usize, patte
 }
 
 fn main() {
-    let threads_list = [16, 32, 64, 128, 256];
+    let threads_list = [256];
 
     let pattern = Pattern::from_file("res/very_large_patterns/0e0p-metaglider.mc.gz").unwrap();
     assert_eq!(pattern.population(), BigInt::from(POP_REF));
