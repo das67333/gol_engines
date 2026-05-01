@@ -504,16 +504,23 @@ impl<'a> BiExecutorThread<'a> {
         let gens_log2 = engine.base.generations_per_update_log2.unwrap();
 
         // === Phase Entry: first invocation, decide which phase to enter ===
+        //
+        // Invariant: every call into algorithm:: from this executor must go
+        // through `self.node_ref` (a per-thread `NodeStoreRef`) so that
+        // allocations land in this thread's chunk pool and free list. Calling
+        // `engine.base.mem.find_or_create_*` directly funnels every worker
+        // through shard 0 of the underlying `ConcurrentHashTable`, which races
+        // on the bump pointer / free list and produces torn slot bodies.
         if data.phase == BiPhase::Entry {
             // is_solitonic is sync; it spins on node2lanes' status_extra.
-            if algorithm::is_solitonic(&engine.base.mem, &engine.base.blank_nodes, idx, size_log2) {
+            if algorithm::is_solitonic(&self.node_ref, &engine.base.blank_nodes, idx, size_log2) {
                 data.phase = BiPhase::Solitonic;
                 data.hash_mask = 0b11; // need both i1, i2
             } else if size_log2 == LEAF_SIZE_LOG2 + 2 {
                 data.phase = BiPhase::Base;
                 // Synchronous: tree assembly only, no waits.
                 let merged = algorithm::merge_universes(
-                    &engine.base.mem,
+                    &self.node_ref,
                     &engine.base.blank_nodes,
                     idx,
                     size_log2,
@@ -523,18 +530,18 @@ impl<'a> BiExecutorThread<'a> {
             } else {
                 data.phase = BiPhase::Recursive;
                 let both_stages = gens_log2 + 2 >= size_log2;
-                let n0 = engine.base.mem.get(idx.0);
-                let n1 = engine.base.mem.get(idx.1);
+                let n0 = self.node_ref.get(idx.0);
+                let n1 = self.node_ref.get(idx.1);
                 if both_stages {
                     data.arr0 = algorithm::nine_children_overlapping(
-                        &engine.base.mem,
+                        &self.node_ref,
                         n0.nw,
                         n0.ne,
                         n0.sw,
                         n0.se,
                     );
                     data.arr1 = algorithm::nine_children_overlapping(
-                        &engine.base.mem,
+                        &self.node_ref,
                         n1.nw,
                         n1.ne,
                         n1.sw,
@@ -543,7 +550,7 @@ impl<'a> BiExecutorThread<'a> {
                     data.mask9_waiting = 0b1_1111_1111;
                 } else {
                     data.arr0 = algorithm::nine_children_disjoint(
-                        &engine.base.mem,
+                        &self.node_ref,
                         n0.nw,
                         n0.ne,
                         n0.sw,
@@ -551,7 +558,7 @@ impl<'a> BiExecutorThread<'a> {
                         size_log2 - 1,
                     );
                     data.arr1 = algorithm::nine_children_disjoint(
-                        &engine.base.mem,
+                        &self.node_ref,
                         n1.nw,
                         n1.ne,
                         n1.sw,
@@ -633,7 +640,7 @@ impl<'a> BiExecutorThread<'a> {
             let (i3, ind3) = if idx.0 == b { (i2, idx.1) } else { (i1, idx.0) };
             // Sync: lane query (kept synchronous in v1; node2lanes uses its
             // own spinner-on-status_extra for in-flight waits).
-            let lanes = algorithm::node2lanes(&engine.base.mem, &engine.base.blank_nodes, ind3, size_log2);
+            let lanes = algorithm::node2lanes(&self.node_ref, &engine.base.blank_nodes, ind3, size_log2);
             let blank_child = engine.base.blank_nodes.get(size_log2 - 1);
             if lanes & 0xf0 != 0 {
                 (blank_child, i3)
@@ -698,7 +705,7 @@ impl<'a> BiExecutorThread<'a> {
         let result = if i3 != blank_child {
             // Sync: lane query on the merged node.
             let lanes =
-                algorithm::node2lanes(&engine.base.mem, &engine.base.blank_nodes, merged, size_log2);
+                algorithm::node2lanes(&self.node_ref, &engine.base.blank_nodes, merged, size_log2);
             if lanes & 0xf0 != 0 {
                 (blank_child, i3)
             } else {
@@ -766,8 +773,8 @@ impl<'a> BiExecutorThread<'a> {
         // Transition: compute arr4 from the 9 results (or from disjoint
         // children when single-stage).
         if data.mask4_waiting == 0 {
-            let arr40 = algorithm::four_children_overlapping(&engine.base.mem, &data.arr0);
-            let arr41 = algorithm::four_children_overlapping(&engine.base.mem, &data.arr1);
+            let arr40 = algorithm::four_children_overlapping(&self.node_ref, &data.arr0);
+            let arr41 = algorithm::four_children_overlapping(&self.node_ref, &data.arr1);
             data.arr0[..4].copy_from_slice(&arr40);
             data.arr1[..4].copy_from_slice(&arr41);
             data.mask4_waiting = 0b1111;
@@ -815,13 +822,13 @@ impl<'a> BiExecutorThread<'a> {
         }
 
         Some((
-            engine.base.mem.find_or_create_node(
+            self.node_ref.find_or_create_node(
                 data.arr0[0],
                 data.arr0[1],
                 data.arr0[2],
                 data.arr0[3],
             ),
-            engine.base.mem.find_or_create_node(
+            self.node_ref.find_or_create_node(
                 data.arr1[0],
                 data.arr1[1],
                 data.arr1[2],
