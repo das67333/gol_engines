@@ -72,7 +72,6 @@ impl<'a> LengthShard<'a> {
 /// Metric kind for log2 histogram distributions.
 /// Spin-count metrics store raw spin iterations.
 /// TaskDuration stores raw timer ticks.
-/// Probe metrics store per-call probe counts (slots inspected before returning).
 #[derive(Clone, Copy)]
 #[repr(usize)]
 #[cfg_attr(not(feature = "statistics"), allow(dead_code))]
@@ -89,11 +88,6 @@ pub(super) enum MetricKind {
     Node2Lanes = 6,
     // Task duration (raw timer ticks)
     TaskDuration = 7,
-    // Probe length per find_or_create call (slots inspected)
-    NodeStoreFindProbes = 8,
-    NodeStoreCreateProbes = 9,
-    BinodeCacheFindProbes = 10,
-    BinodeCacheCreateProbes = 11,
 }
 
 // ============================================================================
@@ -171,7 +165,7 @@ mod enabled {
 
     impl ExecutionStatistics {
         const DISTRIBUTION_BUCKETS: usize = 40;
-        const METRIC_COUNT: usize = 12;
+        const METRIC_COUNT: usize = 8;
 
         pub fn new() -> Self {
             Self {
@@ -219,10 +213,6 @@ mod enabled {
             Self::HandleBiDep,
             Self::Node2Lanes,
             Self::TaskDuration,
-            Self::NodeStoreFindProbes,
-            Self::NodeStoreCreateProbes,
-            Self::BinodeCacheFindProbes,
-            Self::BinodeCacheCreateProbes,
         ];
 
         fn label(self) -> &'static str {
@@ -235,10 +225,6 @@ mod enabled {
                 Self::HandleBiDep => "Spin [handle_bi_dep]",
                 Self::Node2Lanes => "Spin [node2lanes]",
                 Self::TaskDuration => "Task duration",
-                Self::NodeStoreFindProbes => "Probes [node_store find]",
-                Self::NodeStoreCreateProbes => "Probes [node_store create]",
-                Self::BinodeCacheFindProbes => "Probes [binode_cache find]",
-                Self::BinodeCacheCreateProbes => "Probes [binode_cache create]",
             }
         }
 

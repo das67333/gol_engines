@@ -138,9 +138,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         &self,
         hash: usize,
         is_leaf: bool,
-        lock_kind: MetricKind,
-        find_probes_kind: MetricKind,
-        create_probes_kind: MetricKind,
+        kind: MetricKind,
         key_matches: impl Fn(*const E) -> bool,
         init: impl FnOnce(*mut E),
     ) -> (Idx, bool) {
@@ -148,10 +146,8 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         let mut index = hash & mask;
         let target_leaf_bit: u8 = if is_leaf { FLAG_LEAF } else { 0 };
         let final_flags: u8 = FLAG_USED | target_leaf_bit;
-        let mut probes: u64 = 0;
 
         loop {
-            probes += 1;
             let slot = unsafe { UnsafeCell::raw_get(self.hashtable.as_ptr().add(index)) };
             let flags = unsafe { (*slot).flags() };
 
@@ -162,7 +158,6 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
                 if (current_flags & FLAG_LEAF) == target_leaf_bit
                     && key_matches(slot as *const E)
                 {
-                    record_metric(probes, find_probes_kind);
                     return (index as Idx, false);
                 }
                 index = index.wrapping_add(1) & mask;
@@ -178,7 +173,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
                 while flags.load(Ordering::Acquire) & FLAG_LOCKED != 0 {
                     spinner.spin();
                 }
-                record_metric(spinner.count(), lock_kind);
+                record_metric(spinner.count(), kind);
                 continue;
             }
 
@@ -189,7 +184,6 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
             {
                 init(slot);
                 flags.store(final_flags, Ordering::Release);
-                record_metric(probes, create_probes_kind);
                 return (index as Idx, true);
             }
             // Lost the race. Retry the same index; the next iteration will see
@@ -340,8 +334,6 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
             hash,
             true,
             MetricKind::NodeStoreLock,
-            MetricKind::NodeStoreFindProbes,
-            MetricKind::NodeStoreCreateProbes,
             |slot| unsafe { ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) == (nw, ne, sw, se) },
             |slot| unsafe {
                 ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) = (nw, ne, sw, se);
@@ -364,8 +356,6 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
             hash,
             false,
             MetricKind::NodeStoreLock,
-            MetricKind::NodeStoreFindProbes,
-            MetricKind::NodeStoreCreateProbes,
             |slot| unsafe { ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) == (nw, ne, sw, se) },
             |slot| unsafe {
                 ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) = (nw, ne, sw, se);
@@ -528,8 +518,6 @@ impl BinodeCache {
             hash,
             false,
             MetricKind::BinodeCacheLock,
-            MetricKind::BinodeCacheFindProbes,
-            MetricKind::BinodeCacheCreateProbes,
             |slot| unsafe { (*slot).key == key },
             |slot| unsafe {
                 (*slot).key = key;
