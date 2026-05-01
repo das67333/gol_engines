@@ -94,9 +94,6 @@ pub(super) enum MetricKind {
     NodeStoreCreateProbes = 9,
     BinodeCacheFindProbes = 10,
     BinodeCacheCreateProbes = 11,
-    // Per-call duration of find_or_create (raw timer ticks, formatted as ns)
-    NodeStoreCycles = 12,
-    BinodeCacheCycles = 13,
 }
 
 // ============================================================================
@@ -133,7 +130,7 @@ mod enabled {
             Self(self.0.wrapping_sub(start.0))
         }
 
-        pub fn raw(self) -> u64 {
+        fn raw(self) -> u64 {
             self.0
         }
 
@@ -174,7 +171,7 @@ mod enabled {
 
     impl ExecutionStatistics {
         const DISTRIBUTION_BUCKETS: usize = 40;
-        const METRIC_COUNT: usize = 14;
+        const METRIC_COUNT: usize = 12;
 
         pub fn new() -> Self {
             Self {
@@ -226,8 +223,6 @@ mod enabled {
             Self::NodeStoreCreateProbes,
             Self::BinodeCacheFindProbes,
             Self::BinodeCacheCreateProbes,
-            Self::NodeStoreCycles,
-            Self::BinodeCacheCycles,
         ];
 
         fn label(self) -> &'static str {
@@ -244,16 +239,11 @@ mod enabled {
                 Self::NodeStoreCreateProbes => "Probes [node_store create]",
                 Self::BinodeCacheFindProbes => "Probes [binode_cache find]",
                 Self::BinodeCacheCreateProbes => "Probes [binode_cache create]",
-                Self::NodeStoreCycles => "Cycles [node_store call]",
-                Self::BinodeCacheCycles => "Cycles [binode_cache call]",
             }
         }
 
         fn is_duration(self) -> bool {
-            matches!(
-                self,
-                Self::TaskDuration | Self::NodeStoreCycles | Self::BinodeCacheCycles
-            )
+            matches!(self, Self::TaskDuration)
         }
     }
 
@@ -527,11 +517,6 @@ mod disabled {
         #[inline(always)]
         pub fn elapsed_since(self, _start: Ticks) -> Self {
             Self
-        }
-
-        #[inline(always)]
-        pub fn raw(self) -> u64 {
-            0
         }
     }
 
