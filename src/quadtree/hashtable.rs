@@ -124,66 +124,70 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
 
     /// Find an entry matching the given criteria; if not found, create one.
     ///
-    /// Uses optimistic lock-free reading for the common case (entry exists),
-    /// falling back to per-slot locking for creation.
+    /// Probing is fully lock-free: published (USED) slots have immutable bodies,
+    /// so probers can read and compare keys without any per-slot lock. The slot
+    /// lock is acquired only at the actual insertion site (an empty slot we
+    /// claim via CAS). This eliminates the cascading-spinlock pathology where
+    /// readers and probers were serializing through long collision chains.
+    ///
+    /// Invariant — once `FLAG_USED` is set, the entry's body (key fields) is
+    /// final and never modified again. The only mutation is the
+    /// `0 → LOCKED → USED` transition, performed under exclusive ownership of
+    /// the lock by the thread that won the CAS.
     fn find_or_create(
         &self,
         hash: usize,
-        target_flags: u8,
+        is_leaf: bool,
         kind: MetricKind,
         key_matches: impl Fn(*const E) -> bool,
         init: impl FnOnce(*mut E),
     ) -> (Idx, bool) {
         let mask = self.hashtable.len() - 1;
         let mut index = hash & mask;
+        let target_leaf_bit: u8 = if is_leaf { FLAG_LEAF } else { 0 };
+        let final_flags: u8 = FLAG_USED | target_leaf_bit;
 
         loop {
             let slot = unsafe { UnsafeCell::raw_get(self.hashtable.as_ptr().add(index)) };
             let flags = unsafe { (*slot).flags() };
 
-            // STEP 1: Optimistic read WITHOUT lock
-            let mut current_flags = flags.load(Ordering::Acquire);
-            if current_flags == target_flags && key_matches(slot as *const E) {
-                return (index as Idx, false);
+            let current_flags = flags.load(Ordering::Acquire);
+
+            // Fast path: published slot. Body is immutable; key check is lock-free.
+            if current_flags & FLAG_USED != 0 {
+                if (current_flags & FLAG_LEAF) == target_leaf_bit
+                    && key_matches(slot as *const E)
+                {
+                    return (index as Idx, false);
+                }
+                index = index.wrapping_add(1) & mask;
+                continue;
             }
 
-            // STEP 2: Acquire slot lock
-            let mut spinner = Spinner::new();
-            loop {
-                while current_flags & FLAG_LOCKED != 0 {
-                    current_flags = flags.load(Ordering::Relaxed);
+            // Slot is not yet published. If another thread is mid-insert
+            // (LOCKED but not USED), wait for the in-progress insert to finish
+            // so we can decide whether the resulting entry matches our key
+            // (return), differs (skip), or never materializes (re-claim).
+            if current_flags & FLAG_LOCKED != 0 {
+                let mut spinner = Spinner::new();
+                while flags.load(Ordering::Acquire) & FLAG_LOCKED != 0 {
                     spinner.spin();
                 }
-                match flags.compare_exchange_weak(
-                    current_flags,
-                    current_flags | FLAG_LOCKED,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        record_metric(spinner.count(), kind);
-                        break;
-                    }
-                    Err(value) => current_flags = value,
-                }
+                record_metric(spinner.count(), kind);
+                continue;
             }
 
-            // STEP 3: Double-check under lock
-            if current_flags == target_flags && key_matches(slot as *const E) {
-                flags.store(target_flags, Ordering::Release);
-                return (index as Idx, false);
-            }
-
-            // STEP 4: Slot is free - create entry
-            if current_flags & FLAG_USED == 0 {
+            // Slot is genuinely empty (0). Try to claim it.
+            if flags
+                .compare_exchange_weak(0, FLAG_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
                 init(slot);
-                flags.store(target_flags, Ordering::Release);
+                flags.store(final_flags, Ordering::Release);
                 return (index as Idx, true);
             }
-
-            // STEP 5: Collision - move to next slot
-            flags.store(current_flags, Ordering::Release);
-            index = index.wrapping_add(1) & mask;
+            // Lost the race. Retry the same index; the next iteration will see
+            // either LOCKED (wait) or USED (skip-or-match).
         }
     }
 
@@ -326,10 +330,9 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
         let ne = u32::from_le_bytes(rows[4..8].try_into().unwrap());
         let (sw, se) = (0, 0);
         let hash = compute_hash(nw, ne, sw, se);
-        let target_flags = FLAG_LEAF | FLAG_USED;
         self.inner.find_or_create(
             hash,
-            target_flags,
+            true,
             MetricKind::NodeStoreLock,
             |slot| unsafe { ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) == (nw, ne, sw, se) },
             |slot| unsafe {
@@ -349,10 +352,9 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
 
     fn find_or_create_node_inner(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> (Idx, bool) {
         let hash = compute_hash(nw, ne, sw, se);
-        let target_flags = FLAG_USED;
         self.inner.find_or_create(
             hash,
-            target_flags,
+            false,
             MetricKind::NodeStoreLock,
             |slot| unsafe { ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) == (nw, ne, sw, se) },
             |slot| unsafe {
@@ -514,7 +516,7 @@ impl BinodeCache {
         };
         self.inner.find_or_create(
             hash,
-            FLAG_USED,
+            false,
             MetricKind::BinodeCacheLock,
             |slot| unsafe { (*slot).key == key },
             |slot| unsafe {
