@@ -1,28 +1,89 @@
-use super::{node::QuadTreeNode, sharded_statistics::*, spin::Spinner};
+//! # Concurrent chained hashtable with per-thread node chunks
+//!
+//! See `chained_hashtable_design.md` for the full design rationale.
+//!
+//! ## Layout
+//!
+//! - A fixed-size **bucket array** of `AtomicU32`. Each bucket holds the
+//!   `Idx` of the head of its chain (or `NULL_IDX = 0` for empty).
+//! - A fixed-size **chunks table** (`Box<[Chunk<E>]>`). Each `Chunk<E>`
+//!   has an `AtomicPtr` to its node storage, lazily allocated on first
+//!   claim. `chunks[0]` is reserved (its storage stays null) so that any
+//!   `Idx` with `chunk_id == 0` is null.
+//! - One **`ThreadState`** per shard, holding the thread's current chunk,
+//!   bump-pointer offset within it, and a thread-local free-list head.
+//! - A global `next_chunk_id: AtomicU32` bumped via `fetch_add` to claim
+//!   new chunks.
+//!
+//! ## Idx encoding
+//!
+//! ```text
+//! ┌────────────────────────┬────────────────────────┐
+//! │       chunk_id         │       offset           │
+//! │      32 - CHUNK_LOG2   │      CHUNK_LOG2        │
+//! └────────────────────────┴────────────────────────┘
+//! ```
+//!
+//! `Idx = 0` (chunk_id=0, offset=0) means null.
+//!
+//! ## Lock-free `find_or_create`
+//!
+//! Walk chain → if key matches, return that Idx. Otherwise allocate a new
+//! slot from this thread's pool, initialize, set `next` to current head,
+//! Release-CAS the bucket head. On CAS failure, walk only the *new*
+//! portion of the chain looking for the same key (someone else may have
+//! inserted it concurrently); if not found, update `next` to the new head
+//! and retry the CAS.
+//!
+//! Under same-key contention, only the first thread does the CAS; all
+//! others find their key on retry. No spinlock; no per-slot lock.
+
+use super::{node::QuadTreeNode, sharded_statistics::*};
 use std::{
     cell::UnsafeCell,
     hash::{Hash, Hasher},
     mem, ptr,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, Ordering},
 };
 
-/// Index into a [`ConcurrentHashTable`].
+/// Index into a [`ConcurrentHashTable`]. Encoded as `(chunk_id, offset)`;
+/// see module-level docs.
 pub(super) type Idx = u32;
 
+/// The null Idx. Chunk 0 is reserved (its storage is never allocated), so
+/// any encoded Idx with `chunk_id == 0` is null. `Idx::default()` is `0`.
+pub(super) const NULL_IDX: Idx = 0;
+
+/// Log2 of the per-chunk node count. 16 → 64 K nodes per chunk.
+const CHUNK_LOG2: u32 = 16;
+const CHUNK_SIZE: u32 = 1 << CHUNK_LOG2;
+const OFFSET_MASK: u32 = CHUNK_SIZE - 1;
+
+/// Maximum load: when `len() > length_limit`, callers abort and retry.
+/// In the chained design this is essentially the average-chain-length
+/// budget: at this point, average chain length ≈ MAX_LOAD_FACTOR.
 const MAX_LOAD_FACTOR: f64 = 0.75;
 
-// Flag constants for slot flags field.
-// Bit 0 is type-specific (e.g., FLAG_LEAF for QuadTreeNode).
-const FLAG_USED: u8 = 1 << 1;
-const FLAG_LOCKED: u8 = 1 << 2;
-const FLAG_LEAF: u8 = 1 << 0;
+#[inline(always)]
+fn chunk_id(idx: Idx) -> u32 {
+    idx >> CHUNK_LOG2
+}
 
-/// Trait for types that can be stored as entries in a [`ConcurrentHashTable`].
-///
-/// Implementors must provide access to an [`AtomicU8`] flags field that the
-/// hash table uses for per-slot locking and occupancy tracking.
+#[inline(always)]
+fn offset_in_chunk(idx: Idx) -> u32 {
+    idx & OFFSET_MASK
+}
+
+#[inline(always)]
+fn encode_idx(chunk_id: u32, offset: u32) -> Idx {
+    assert!(offset < CHUNK_SIZE);
+    (chunk_id << CHUNK_LOG2) | offset
+}
+
+/// Trait for types that can be stored in a [`ConcurrentHashTable`].
 pub(super) trait HashtableSlot: Default + Sync {
-    fn flags(&self) -> &AtomicU8;
+    /// The chain pointer (also doubles as free-list link when freed).
+    fn next(&self) -> &AtomicU32;
 }
 
 /// Union that stores either a type-erased pointer or an inline value.
@@ -87,104 +148,303 @@ impl<V: Copy> CacheField<V> {
     }
 }
 
-/// A concurrent open-addressing hashtable with linear probing.
+/// One chunk's storage. Lazy-allocated on first claim; `storage` is null
+/// until then. The `Box<[UnsafeCell<E>]>` is reconstructed from the raw
+/// pointer + known length (`CHUNK_SIZE`) in [`Chunk::release`] for drop.
+struct Chunk<E> {
+    storage: AtomicPtr<UnsafeCell<E>>,
+}
+
+impl<E> Chunk<E> {
+    fn new() -> Self {
+        Self {
+            storage: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    /// Get a raw pointer to a slot inside this chunk. Caller must have
+    /// observed (e.g. via Acquire load through bucket head) that the
+    /// chunk has been claimed.
+    #[inline(always)]
+    fn slot(&self, offset: u32) -> *mut UnsafeCell<E> {
+        let base = self.storage.load(Ordering::Acquire);
+        assert!(!base.is_null(), "lookup of Idx in unclaimed chunk");
+        unsafe { base.add(offset as usize) }
+    }
+
+    /// Drop the storage and reset to null. Single-threaded use only
+    /// (called from `clear()` and `Drop`).
+    fn release(&mut self) {
+        let raw = *self.storage.get_mut();
+        *self.storage.get_mut() = ptr::null_mut();
+        if !raw.is_null() {
+            unsafe {
+                let slice = ptr::slice_from_raw_parts_mut(raw, CHUNK_SIZE as usize);
+                drop(Box::from_raw(slice));
+            }
+        }
+    }
+}
+
+impl<E> Drop for Chunk<E> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Per-thread allocator state. Owner-only mutation; other threads only
+/// read via `Idx` lookups (which go through the chunks table, not the
+/// thread state).
+struct ThreadState {
+    /// Chunk this thread is currently allocating from. `0` = none yet.
+    current_chunk_id: u32,
+    /// Bump-pointer offset within `current_chunk_id`.
+    next_offset_in_chunk: u32,
+    /// Head of this thread's free list (or `NULL_IDX` if empty).
+    free_list_head: Idx,
+}
+
+impl ThreadState {
+    fn new() -> Self {
+        Self {
+            current_chunk_id: 0,
+            next_offset_in_chunk: 0,
+            free_list_head: NULL_IDX,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+/// Concurrent chained hashtable backed by per-thread node chunks.
 ///
-/// Uses per-slot locking via atomic flags. The table never grows;
-/// capacity is fixed at creation time.
-struct ConcurrentHashTable<E> {
-    hashtable: Box<[UnsafeCell<E>]>,
+/// See module docs for the full design.
+pub(super) struct ConcurrentHashTable<E> {
+    /// Bucket array. Each entry is the head Idx of a chain.
+    buckets: Box<[AtomicU32]>,
+    /// Chunks table. `chunks[0]` is reserved as null; chunks[1..] are
+    /// claimed lazily by threads via `next_chunk_id.fetch_add`.
+    chunks: Box<[Chunk<E>]>,
+    /// Bump pointer for chunk claims. Starts at 1 (chunk 0 reserved).
+    next_chunk_id: AtomicU32,
+    /// Per-thread allocator state (one entry per shard).
+    thread_states: Box<[UnsafeCell<ThreadState>]>,
+    /// Length tracking (existing sharded mechanism).
     length: ShardedLength,
     length_limit: usize,
 }
 
-// SAFETY: Concurrent access is protected by per-slot atomic flags.
+// SAFETY:
+// - `buckets`, `chunks`, `next_chunk_id`, `length` are all atomic / Sync.
+// - `thread_states[i]` is mutated only by shard `i` (or single-threadedly
+//   in `clear()`/`Drop`); other threads do not access `thread_states`.
+// - `Chunk<E>::storage` is an `AtomicPtr` published with Release before
+//   any Idx into the chunk can be observed by other threads.
 unsafe impl<E: Sync> Sync for ConcurrentHashTable<E> {}
 
 impl<E: HashtableSlot> ConcurrentHashTable<E> {
-    /// Create a new hash table with capacity `2^cap_log2`.
+    /// Create a new table with `2^cap_log2` buckets and node capacity
+    /// large enough to hold ~`MAX_LOAD_FACTOR × 2^cap_log2` nodes.
+    ///
+    /// `threads_cnt` is the number of shards (one `ThreadState` per shard).
     fn new(cap_log2: u32, threads_cnt: usize) -> Self {
         let max_cap_log2 = mem::size_of::<Idx>() as u32 * 8;
         assert!(
             cap_log2 <= max_cap_log2,
             "Hashtables bigger than 2^{max_cap_log2} are not supported"
         );
+        let bucket_count = 1usize << cap_log2;
+        // length_limit chosen to keep avg chain length ≤ MAX_LOAD_FACTOR.
+        let length_limit = (bucket_count as f64 * MAX_LOAD_FACTOR) as usize;
+        // Provision enough chunks to hold `length_limit` nodes plus
+        // headroom (callers abort once length_limit is exceeded, but we
+        // need a few more chunks of headroom to absorb in-flight allocs
+        // and `next_chunk_id` overshoot before everyone notices).
+        // chunks[0] is reserved → +1.
+        let needed_chunks = length_limit.div_ceil(CHUNK_SIZE as usize) + 2;
+        let chunks: Box<[Chunk<E>]> = (0..needed_chunks).map(|_| Chunk::new()).collect();
+
+        let buckets: Box<[AtomicU32]> = (0..bucket_count).map(|_| AtomicU32::new(NULL_IDX)).collect();
+
+        let thread_states: Box<[UnsafeCell<ThreadState>]> = (0..threads_cnt)
+            .map(|_| UnsafeCell::new(ThreadState::new()))
+            .collect();
+
         Self {
-            hashtable: (0..1u64 << cap_log2)
-                .map(|_| UnsafeCell::new(E::default()))
-                .collect(),
+            buckets,
+            chunks,
+            // Skip chunk 0 (reserved as null sentinel).
+            next_chunk_id: AtomicU32::new(1),
+            thread_states,
             length: ShardedLength::new(threads_cnt),
-            length_limit: (2f64.powi(cap_log2 as i32) * MAX_LOAD_FACTOR) as usize,
+            length_limit,
         }
     }
 
-    /// Get a reference to the entry at the given index.
+    /// Get a reference to the entry at the given `Idx`.
+    ///
+    /// # Panics (debug)
+    /// If `idx == NULL_IDX` or its chunk is not yet claimed.
     fn get(&self, idx: Idx) -> &E {
-        unsafe { &*self.hashtable.get_unchecked(idx as usize).get() }
+        assert!(idx != NULL_IDX, "get(NULL_IDX)");
+        let cid = chunk_id(idx);
+        let off = offset_in_chunk(idx);
+        let slot_ptr = self.chunks[cid as usize].slot(off);
+        unsafe { &*(*slot_ptr).get() }
     }
 
-    /// Find an entry matching the given criteria; if not found, create one.
+    /// Mutable raw access for the inserting thread, before publication.
+    /// SAFETY: caller guarantees no other thread can observe this slot
+    /// (i.e. this slot has just been allocated and the publishing CAS
+    /// has not yet run).
+    fn get_uninit_mut(&self, idx: Idx) -> *mut E {
+        let cid = chunk_id(idx);
+        let off = offset_in_chunk(idx);
+        let slot_ptr = self.chunks[cid as usize].slot(off);
+        unsafe { (*slot_ptr).get() }
+    }
+
+    /// Find an entry matching `key_matches`; if not found, allocate a new
+    /// slot, run `init` to populate the key fields, and publish into the
+    /// chain via Release-CAS on the bucket head.
     ///
-    /// Uses optimistic lock-free reading for the common case (entry exists),
-    /// falling back to per-slot locking for creation.
+    /// Returns `(idx, was_inserted)`.
+    ///
+    /// `shard_idx` selects the per-thread allocator (and matters only if
+    /// allocation occurs).
     fn find_or_create(
         &self,
         hash: usize,
-        target_flags: u8,
-        kind: MetricKind,
-        key_matches: impl Fn(*const E) -> bool,
+        shard_idx: usize,
+        key_matches: impl Fn(&E) -> bool,
         init: impl FnOnce(*mut E),
     ) -> (Idx, bool) {
-        let mask = self.hashtable.len() - 1;
-        let mut index = hash & mask;
+        let bucket_mask = self.buckets.len() - 1;
+        let bucket = hash & bucket_mask;
 
-        loop {
-            let slot = unsafe { UnsafeCell::raw_get(self.hashtable.as_ptr().add(index)) };
-            let flags = unsafe { (*slot).flags() };
-
-            // STEP 1: Optimistic read WITHOUT lock
-            let mut current_flags = flags.load(Ordering::Acquire);
-            if current_flags == target_flags && key_matches(slot as *const E) {
-                return (index as Idx, false);
+        // Phase 1: walk chain looking for an existing match.
+        let mut head = self.buckets[bucket].load(Ordering::Acquire);
+        let mut cur = head;
+        while cur != NULL_IDX {
+            let entry = self.get(cur);
+            if key_matches(entry) {
+                return (cur, false);
             }
-
-            // STEP 2: Acquire slot lock
-            let mut spinner = Spinner::new();
-            loop {
-                while current_flags & FLAG_LOCKED != 0 {
-                    current_flags = flags.load(Ordering::Relaxed);
-                    spinner.spin();
-                }
-                match flags.compare_exchange_weak(
-                    current_flags,
-                    current_flags | FLAG_LOCKED,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        record_metric(spinner.count(), kind);
-                        break;
-                    }
-                    Err(value) => current_flags = value,
-                }
-            }
-
-            // STEP 3: Double-check under lock
-            if current_flags == target_flags && key_matches(slot as *const E) {
-                flags.store(target_flags, Ordering::Release);
-                return (index as Idx, false);
-            }
-
-            // STEP 4: Slot is free - create entry
-            if current_flags & FLAG_USED == 0 {
-                init(slot);
-                flags.store(target_flags, Ordering::Release);
-                return (index as Idx, true);
-            }
-
-            // STEP 5: Collision - move to next slot
-            flags.store(current_flags, Ordering::Release);
-            index = index.wrapping_add(1) & mask;
+            cur = entry.next().load(Ordering::Acquire);
         }
+
+        // Phase 2: allocate from this thread's pool; populate fields.
+        let new_idx = self.allocate(shard_idx);
+        // SAFETY: the freshly-allocated slot is owned by this thread until
+        // the publishing CAS in Phase 3.
+        let new_ptr = self.get_uninit_mut(new_idx);
+        unsafe {
+            // Reset all fields to default state (handles free-list reuse
+            // where the previous occupant left arbitrary contents).
+            ptr::write(new_ptr, E::default());
+            // Run caller-supplied initializer for the key fields.
+            init(new_ptr);
+            // Set the chain link.
+            (*new_ptr).next().store(head, Ordering::Relaxed);
+        }
+
+        // Phase 3: publish via Release-CAS on bucket head.
+        loop {
+            match self.buckets[bucket].compare_exchange_weak(
+                head,
+                new_idx,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return (new_idx, true),
+                Err(actual_head) => {
+                    // Walk only the *new* portion of the chain (from
+                    // actual_head down to old head) looking for our key
+                    // (someone may have inserted it concurrently).
+                    let mut cur = actual_head;
+                    while cur != head {
+                        let entry = self.get(cur);
+                        if key_matches(entry) {
+                            // Lost the race; recycle our slot.
+                            self.deallocate(shard_idx, new_idx);
+                            return (cur, false);
+                        }
+                        cur = entry.next().load(Ordering::Acquire);
+                    }
+                    head = actual_head;
+                    unsafe {
+                        (*new_ptr).next().store(head, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Allocate a fresh `Idx` from the given thread's pool. Prefers the
+    /// free list; falls back to bumping within the current chunk;
+    /// claims a new chunk if the current one is full.
+    fn allocate(&self, shard_idx: usize) -> Idx {
+        let ts = self.thread_state_mut(shard_idx);
+
+        // Free list first.
+        if ts.free_list_head != NULL_IDX {
+            let idx = ts.free_list_head;
+            // SAFETY: the freed slot's `next` field points to the next
+            // free entry (set in `deallocate`).
+            let entry = self.get(idx);
+            ts.free_list_head = entry.next().load(Ordering::Relaxed);
+            return idx;
+        }
+
+        // Bump within current chunk.
+        if ts.current_chunk_id != 0 && ts.next_offset_in_chunk < CHUNK_SIZE {
+            let off = ts.next_offset_in_chunk;
+            ts.next_offset_in_chunk = off + 1;
+            return encode_idx(ts.current_chunk_id, off);
+        }
+
+        // Claim a new chunk.
+        self.claim_chunk(ts);
+        let off = ts.next_offset_in_chunk;
+        ts.next_offset_in_chunk = off + 1;
+        encode_idx(ts.current_chunk_id, off)
+    }
+
+    fn claim_chunk(&self, ts: &mut ThreadState) {
+        let id = self.next_chunk_id.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            (id as usize) < self.chunks.len(),
+            "chunks table exhausted (id={}, max={})",
+            id,
+            self.chunks.len()
+        );
+        // Allocate storage for this chunk.
+        let storage: Box<[UnsafeCell<E>]> = (0..CHUNK_SIZE as usize)
+            .map(|_| UnsafeCell::new(E::default()))
+            .collect();
+        let raw = Box::into_raw(storage) as *mut UnsafeCell<E>;
+        // Publish: any subsequent observation of an Idx in this chunk
+        // (via a Release-CAS on a bucket head) synchronizes with this
+        // Release.
+        self.chunks[id as usize].storage.store(raw, Ordering::Release);
+        ts.current_chunk_id = id;
+        ts.next_offset_in_chunk = 0;
+    }
+
+    fn deallocate(&self, shard_idx: usize, idx: Idx) {
+        let ts = self.thread_state_mut(shard_idx);
+        let entry = self.get(idx);
+        entry.next().store(ts.free_list_head, Ordering::Relaxed);
+        ts.free_list_head = idx;
+    }
+
+    /// SAFETY: caller must access only their own shard. We rely on
+    /// the executor's per-thread sharding discipline.
+    #[allow(clippy::mut_from_ref)]
+    fn thread_state_mut(&self, shard_idx: usize) -> &mut ThreadState {
+        unsafe { &mut *self.thread_states[shard_idx].get() }
     }
 
     fn increment_length(&self) {
@@ -195,21 +455,42 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         self.length.shard(shard_idx)
     }
 
+    /// Reset the table: clear buckets, drop all chunk storages, reset
+    /// per-thread states, and reset the chunk-id counter. Single-threaded
+    /// (called between updates).
     fn clear(&mut self) {
-        self.hashtable.fill_with(UnsafeCell::default);
+        for b in self.buckets.iter() {
+            b.store(NULL_IDX, Ordering::Relaxed);
+        }
+        for chunk in self.chunks.iter_mut() {
+            chunk.release();
+        }
+        self.next_chunk_id.store(1, Ordering::Relaxed);
+        for ts in self.thread_states.iter_mut() {
+            ts.get_mut().reset();
+        }
         self.length.clear();
     }
 
     fn bytes_total(&self) -> usize {
-        self.hashtable.len() * std::mem::size_of::<E>()
+        let next = self.next_chunk_id.load(Ordering::Relaxed) as usize;
+        // Chunks 1..next have been claimed and have allocated storage.
+        // Chunk 0 is reserved (no storage).
+        let chunk_storage = next.saturating_sub(1) * CHUNK_SIZE as usize * mem::size_of::<E>();
+        let chunks_table = self.chunks.len() * mem::size_of::<Chunk<E>>();
+        let buckets = self.buckets.len() * mem::size_of::<AtomicU32>();
+        let thread_states = self.thread_states.len() * mem::size_of::<UnsafeCell<ThreadState>>();
+        chunk_storage + chunks_table + buckets + thread_states
     }
 
     fn len(&self) -> usize {
         self.length.len_exact()
     }
 
+    /// Maximum nodes addressable: chunks_count × CHUNK_SIZE (excluding
+    /// reserved chunk 0).
     fn capacity(&self) -> usize {
-        self.hashtable.len()
+        (self.chunks.len() - 1) * CHUNK_SIZE as usize
     }
 
     fn exceeds_load_factor(&self) -> bool {
@@ -240,9 +521,11 @@ impl<Meta: Default + Sync> NodeAccess<Meta> for NodeStore<Meta> {
     }
 }
 
-/// A per-thread reference to a store that uses local sharding for length tracking.
+/// A per-thread reference to a store that uses local sharding for length
+/// tracking *and* per-thread chunk allocation.
 pub(super) struct ShardedRef<'a, S> {
     base: &'a S,
+    shard_idx: usize,
     length_shard: LengthShard<'a>,
 }
 
@@ -270,9 +553,9 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
         self.inner.get(idx)
     }
 
-    /// Find a leaf node with the given parts (4x4 grids as 16-bit integers).
+    /// Find a leaf node with the given parts (4×4 grids as 16-bit integers).
     pub(super) fn find_or_create_leaf_from_parts(&self, nw: u16, ne: u16, sw: u16, se: u16) -> Idx {
-        let (result, inserted) = self.find_or_create_leaf_from_parts_inner(nw, ne, sw, se);
+        let (result, inserted) = self.find_or_create_leaf_from_parts_inner(0, nw, ne, sw, se);
         if inserted {
             self.inner.increment_length();
         }
@@ -281,6 +564,7 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
 
     fn find_or_create_leaf_from_parts_inner(
         &self,
+        shard_idx: usize,
         nw: u16,
         ne: u16,
         sw: u16,
@@ -308,55 +592,68 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
             shift += 4;
         }
 
-        self.find_or_create_leaf_from_u64_inner(cells)
+        self.find_or_create_leaf_from_u64_inner(shard_idx, cells)
     }
 
-    /// Find a leaf node with the given cells (8x8 grid as 64-bit integer).
+    /// Find a leaf node with the given cells (8×8 grid as 64-bit integer).
     pub(super) fn find_or_create_leaf_from_u64(&self, value: u64) -> Idx {
-        let (result, inserted) = self.find_or_create_leaf_from_u64_inner(value);
+        let (result, inserted) = self.find_or_create_leaf_from_u64_inner(0, value);
         if inserted {
             self.inner.increment_length();
         }
         result
     }
 
-    fn find_or_create_leaf_from_u64_inner(&self, value: u64) -> (Idx, bool) {
+    fn find_or_create_leaf_from_u64_inner(&self, shard_idx: usize, value: u64) -> (Idx, bool) {
         let rows = value.to_le_bytes();
         let nw = u32::from_le_bytes(rows[0..4].try_into().unwrap());
         let ne = u32::from_le_bytes(rows[4..8].try_into().unwrap());
-        let (sw, se) = (0, 0);
-        let hash = compute_hash(nw, ne, sw, se);
-        let target_flags = FLAG_LEAF | FLAG_USED;
+        // Leaves: sw == 0 && se == 0 (the leaf marker; see node.rs docs).
+        let hash = compute_hash(nw, ne, 0, 0);
         self.inner.find_or_create(
             hash,
-            target_flags,
-            MetricKind::NodeStoreLock,
-            |slot| unsafe { ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) == (nw, ne, sw, se) },
+            shard_idx,
+            |slot| (slot.nw, slot.ne, slot.sw, slot.se) == (nw, ne, 0, 0),
             |slot| unsafe {
-                ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) = (nw, ne, sw, se);
+                (*slot).nw = nw;
+                (*slot).ne = ne;
+                (*slot).sw = 0;
+                (*slot).se = 0;
             },
         )
     }
 
     /// Find a node with the given children. If not found, it is created.
     pub(super) fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx {
-        let (result, inserted) = self.find_or_create_node_inner(nw, ne, sw, se);
+        let (result, inserted) = self.find_or_create_node_inner(0, nw, ne, sw, se);
         if inserted {
             self.inner.increment_length();
         }
         result
     }
 
-    fn find_or_create_node_inner(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> (Idx, bool) {
+    fn find_or_create_node_inner(
+        &self,
+        shard_idx: usize,
+        nw: Idx,
+        ne: Idx,
+        sw: Idx,
+        se: Idx,
+    ) -> (Idx, bool) {
+        assert!(
+            nw != NULL_IDX && ne != NULL_IDX && sw != NULL_IDX && se != NULL_IDX,
+            "internal nodes must have non-null children (Idx 0 = null); got nw={nw} ne={ne} sw={sw} se={se}"
+        );
         let hash = compute_hash(nw, ne, sw, se);
-        let target_flags = FLAG_USED;
         self.inner.find_or_create(
             hash,
-            target_flags,
-            MetricKind::NodeStoreLock,
-            |slot| unsafe { ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) == (nw, ne, sw, se) },
+            shard_idx,
+            |slot| (slot.nw, slot.ne, slot.sw, slot.se) == (nw, ne, sw, se),
             |slot| unsafe {
-                ((*slot).nw, (*slot).ne, (*slot).sw, (*slot).se) = (nw, ne, sw, se);
+                (*slot).nw = nw;
+                (*slot).ne = ne;
+                (*slot).sw = sw;
+                (*slot).se = se;
             },
         )
     }
@@ -364,6 +661,7 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
     pub(super) fn create_ref(&self, shard_idx: usize) -> NodeStoreRef<'_, Meta> {
         ShardedRef {
             base: self,
+            shard_idx,
             length_shard: self.inner.shard(shard_idx),
         }
     }
@@ -405,9 +703,9 @@ impl<'a, Meta: Default + Sync> NodeStoreRef<'a, Meta> {
     }
 
     pub(super) fn find_or_create_leaf_from_parts(&self, nw: u16, ne: u16, sw: u16, se: u16) -> Idx {
-        let (result, inserted) = self
-            .base
-            .find_or_create_leaf_from_parts_inner(nw, ne, sw, se);
+        let (result, inserted) =
+            self.base
+                .find_or_create_leaf_from_parts_inner(self.shard_idx, nw, ne, sw, se);
         if inserted {
             self.length_shard.increment();
         }
@@ -415,7 +713,9 @@ impl<'a, Meta: Default + Sync> NodeStoreRef<'a, Meta> {
     }
 
     pub(super) fn find_or_create_leaf_from_u64(&self, value: u64) -> Idx {
-        let (result, inserted) = self.base.find_or_create_leaf_from_u64_inner(value);
+        let (result, inserted) = self
+            .base
+            .find_or_create_leaf_from_u64_inner(self.shard_idx, value);
         if inserted {
             self.length_shard.increment();
         }
@@ -423,7 +723,9 @@ impl<'a, Meta: Default + Sync> NodeStoreRef<'a, Meta> {
     }
 
     pub(super) fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx {
-        let (result, inserted) = self.base.find_or_create_node_inner(nw, ne, sw, se);
+        let (result, inserted) = self
+            .base
+            .find_or_create_node_inner(self.shard_idx, nw, ne, sw, se);
         if inserted {
             self.length_shard.increment();
         }
@@ -454,9 +756,9 @@ pub(super) struct CacheEntry {
     key: (Idx, Idx),
     /// Dual-purpose field: computed binode result or processing data pointer.
     pub(super) payload: CacheField<(Idx, Idx)>,
+    /// Chain pointer (also free-list link when freed).
+    pub(super) next: AtomicU32,
     status: AtomicU8,
-    /// Slot flags for ConcurrentHashTable (IS_USED, IS_LOCKED, etc.)
-    flags: AtomicU8,
 }
 
 impl Default for CacheEntry {
@@ -464,19 +766,19 @@ impl Default for CacheEntry {
         Self {
             key: (0, 0),
             payload: CacheField::default(),
+            next: AtomicU32::new(NULL_IDX),
             status: AtomicU8::new(0),
-            flags: AtomicU8::new(0),
         }
     }
 }
 
 // SAFETY: Concurrent access is protected by the status state machine
-// and the per-slot flags in ConcurrentHashTable.
+// (for `payload` and `status`) and by atomic chain operations on `next`.
 unsafe impl Sync for CacheEntry {}
 
 impl HashtableSlot for CacheEntry {
-    fn flags(&self) -> &AtomicU8 {
-        &self.flags
+    fn next(&self) -> &AtomicU32 {
+        &self.next
     }
 }
 
@@ -506,7 +808,7 @@ impl BinodeCache {
 
     /// Find or create a cache entry for the given binode key.
     /// Returns `(index, was_inserted)`.
-    fn entry_inner(&self, key: (Idx, Idx)) -> (Idx, bool) {
+    fn entry_inner(&self, shard_idx: usize, key: (Idx, Idx)) -> (Idx, bool) {
         let hash = {
             let mut hasher = self.hasher.clone();
             key.hash(&mut hasher);
@@ -514,20 +816,17 @@ impl BinodeCache {
         };
         self.inner.find_or_create(
             hash,
-            FLAG_USED,
-            MetricKind::BinodeCacheLock,
-            |slot| unsafe { (*slot).key == key },
+            shard_idx,
+            |slot| slot.key == key,
             |slot| unsafe {
                 (*slot).key = key;
-                (*slot).payload = CacheField::default();
-                (*slot).status = AtomicU8::new(0);
             },
         )
     }
 
     /// Find or create a cache entry. Uses the global (non-sharded) length counter.
     pub(super) fn entry(&self, key: (Idx, Idx)) -> Idx {
-        let (idx, inserted) = self.entry_inner(key);
+        let (idx, inserted) = self.entry_inner(0, key);
         if inserted {
             self.inner.increment_length();
         }
@@ -541,6 +840,7 @@ impl BinodeCache {
     pub(super) fn create_ref(&self, shard_idx: usize) -> BinodeCacheRef<'_> {
         ShardedRef {
             base: self,
+            shard_idx,
             length_shard: self.inner.shard(shard_idx),
         }
     }
@@ -571,7 +871,7 @@ impl BinodeCache {
 impl<'a> BinodeCacheRef<'a> {
     /// Find or create a cache entry. Uses the per-thread sharded length counter.
     pub(super) fn entry(&self, key: (Idx, Idx)) -> Idx {
-        let (idx, inserted) = self.base.entry_inner(key);
+        let (idx, inserted) = self.base.entry_inner(self.shard_idx, key);
         if inserted {
             self.length_shard.increment();
         }
