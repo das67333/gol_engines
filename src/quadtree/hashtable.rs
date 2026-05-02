@@ -59,10 +59,17 @@ const CHUNK_LOG2: u32 = 16;
 const CHUNK_SIZE: u32 = 1 << CHUNK_LOG2;
 const OFFSET_MASK: u32 = CHUNK_SIZE - 1;
 
-/// Maximum load: when `len() > length_limit`, callers abort and retry.
-/// In the chained design this is essentially the average-chain-length
-/// budget: at this point, average chain length ≈ MAX_LOAD_FACTOR.
-const MAX_LOAD_FACTOR: f64 = 0.75;
+/// Bound on the number of `find_or_create_*` allocations a worker may issue
+/// inside a single `process_task` invocation. The cancellation flag is read
+/// only between tasks, so once a task starts it can claim up to this many
+/// new slots before observing the flag. Used to size the safety margin
+/// between [`ConcurrentHashTable::length_limit`] (cancellation threshold)
+/// and the table's hard capacity.
+///
+/// 64 is a generous upper bound — measured worst-case is ~14
+/// (`nine_children_disjoint` 9 + `four_children_overlapping` 4 + final result
+/// 1).
+pub(super) const MAX_ALLOCS_PER_TASK: usize = 64;
 
 #[inline(always)]
 fn chunk_id(idx: Idx) -> u32 {
@@ -233,7 +240,17 @@ pub(super) struct ConcurrentHashTable<E> {
     thread_states: Box<[UnsafeCell<ThreadState>]>,
     /// Length tracking (existing sharded mechanism).
     length: ShardedLength,
+    /// Cancellation threshold: when `len_upper_bound > length_limit`, callers
+    /// stop fetching new tasks. Set below `capacity` by [`MAX_ALLOCS_PER_TASK`]
+    /// × `threads_cnt` so that the post-cancel allocation burst can complete
+    /// without exceeding `capacity` or exhausting the chunks table.
     length_limit: usize,
+    /// Hard cap: maximum number of nodes the table can hold. Equal to
+    /// `bucket_count` (load factor 1) when the chunks table can address that
+    /// many; capped tighter at the boundary `cap_log2 ≈ 32` where the chunk
+    /// table cannot host both the storage chunks and one partial chunk per
+    /// thread without exceeding the 16-bit chunk-id space.
+    capacity: usize,
 }
 
 // SAFETY:
@@ -245,8 +262,27 @@ pub(super) struct ConcurrentHashTable<E> {
 unsafe impl<E: Sync> Sync for ConcurrentHashTable<E> {}
 
 impl<E: HashtableSlot> ConcurrentHashTable<E> {
-    /// Create a new table with `2^cap_log2` buckets and node capacity
-    /// large enough to hold ~`MAX_LOAD_FACTOR × 2^cap_log2` nodes.
+    /// Create a new table with `2^cap_log2` buckets and node capacity equal
+    /// to `bucket_count` (load factor 1), capped by what the chunks table
+    /// can address.
+    ///
+    /// ## Cancellation budget
+    ///
+    /// `length_limit = capacity − threads × MAX_ALLOCS_PER_TASK` is the
+    /// soft cancellation threshold. A worker observes the threshold only
+    /// between tasks; once inside `process_task` it can claim up to
+    /// [`MAX_ALLOCS_PER_TASK`] new slots before re-checking. Reserving
+    /// `threads × MAX_ALLOCS_PER_TASK` slots of headroom guarantees the
+    /// post-cancel burst stays within `capacity`, so we never need to
+    /// over-provision chunks beyond what's addressable.
+    ///
+    /// ## Chunks table sizing
+    ///
+    /// The table must address `capacity` nodes plus one partial chunk per
+    /// thread (each thread can be mid-fill on its own chunk), plus the
+    /// reserved chunk 0. The maximum chunk id is `2^(32 - CHUNK_LOG2)`
+    /// (the `Idx = (chunk_id, offset)` encoding); when that limit binds
+    /// (`cap_log2 ≈ 32`), `capacity` is reduced accordingly.
     ///
     /// `threads_cnt` is the number of shards (one `ThreadState` per shard).
     fn new(cap_log2: u32, threads_cnt: usize) -> Self {
@@ -256,14 +292,35 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
             "Hashtables bigger than 2^{max_cap_log2} are not supported"
         );
         let bucket_count = 1usize << cap_log2;
-        // length_limit chosen to keep avg chain length ≤ MAX_LOAD_FACTOR.
-        let length_limit = (bucket_count as f64 * MAX_LOAD_FACTOR) as usize;
-        // Provision enough chunks to hold `length_limit` nodes plus
-        // headroom (callers abort once length_limit is exceeded, but we
-        // need a few more chunks of headroom to absorb in-flight allocs
-        // and `next_chunk_id` overshoot before everyone notices).
-        // chunks[0] is reserved → +1.
-        let needed_chunks = length_limit.div_ceil(CHUNK_SIZE as usize) + 2;
+
+        // Hard ceiling from the `Idx` encoding: chunk id fits in
+        // `32 - CHUNK_LOG2` bits, so there are `2^(32 - CHUNK_LOG2)` chunk
+        // slots in total (chunk 0 reserved as the null sentinel).
+        let chunk_id_count = 1usize << (mem::size_of::<Idx>() as u32 * 8 - CHUNK_LOG2);
+        // Reserve one chunk per shard for partial-chunk in-flight allocations
+        // (each thread can have its own current_chunk only partially filled).
+        // Plus chunk 0 reserved.
+        let max_storage_chunks = chunk_id_count
+            .saturating_sub(1)
+            .saturating_sub(threads_cnt);
+        let max_storage_nodes = max_storage_chunks * CHUNK_SIZE as usize;
+
+        // Load factor 1 capped by chunk-table addressability.
+        let capacity = bucket_count.min(max_storage_nodes);
+
+        // Cancellation threshold: leaves room for in-flight post-cancel
+        // allocations.
+        let safety_margin = threads_cnt.saturating_mul(MAX_ALLOCS_PER_TASK);
+        let length_limit = capacity.saturating_sub(safety_margin);
+
+        // Pre-allocate enough chunk slots to back `capacity` nodes plus per-
+        // thread partial chunks plus the reserved chunk 0. Cap at the hard
+        // ceiling.
+        let needed_chunks = capacity
+            .div_ceil(CHUNK_SIZE as usize)
+            .saturating_add(threads_cnt)
+            .saturating_add(1)
+            .min(chunk_id_count);
         let chunks: Box<[Chunk<E>]> = (0..needed_chunks).map(|_| Chunk::new()).collect();
 
         let buckets: Box<[AtomicU32]> = (0..bucket_count).map(|_| AtomicU32::new(NULL_IDX)).collect();
@@ -280,6 +337,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
             thread_states,
             length: ShardedLength::new(threads_cnt),
             length_limit,
+            capacity,
         }
     }
 
@@ -487,14 +545,39 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         self.length.len_exact()
     }
 
-    /// Maximum nodes addressable: chunks_count × CHUNK_SIZE (excluding
-    /// reserved chunk 0).
+    /// Hard cap on the number of nodes this table can hold without
+    /// exceeding the chunk-table addressability bound. Equals `bucket_count`
+    /// (load factor 1) except at the `cap_log2 ≈ 32` boundary, where the
+    /// 16-bit chunk-id space forces a tighter cap.
     fn capacity(&self) -> usize {
-        (self.chunks.len() - 1) * CHUNK_SIZE as usize
+        self.capacity
     }
 
     fn exceeds_load_factor(&self) -> bool {
         self.length.len_upper_bound() > self.length_limit
+    }
+
+    /// Invoke `f` once per `Idx` whose backing storage has been allocated
+    /// (i.e. every offset of every claimed chunk: chunk_id ∈ [1,
+    /// next_chunk_id), offset ∈ [0, CHUNK_SIZE)).
+    ///
+    /// `0..capacity()` is **not** a valid Idx range — `Idx` is encoded
+    /// `(chunk_id << CHUNK_LOG2) | offset`, so iteration must walk the
+    /// chunk/offset axes explicitly. Some yielded Idxs may have status
+    /// `NOT_STARTED` (slot was never published, was on a thread's free
+    /// list, or sits past a chunk's high-water mark); callers must filter
+    /// on the slot's own state.
+    ///
+    /// SAFETY: single-threaded use only — does not synchronize with
+    /// concurrent `claim_chunk` / `allocate`. Intended for cancellation /
+    /// GC paths after `thread::scope` has joined.
+    fn for_each_idx(&self, mut f: impl FnMut(Idx)) {
+        let next_id = self.next_chunk_id.load(Ordering::Relaxed);
+        for cid in 1..next_id {
+            for off in 0..CHUNK_SIZE {
+                f(encode_idx(cid, off));
+            }
+        }
     }
 }
 
@@ -682,6 +765,11 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
         self.inner.capacity()
     }
 
+    /// See [`ConcurrentHashTable::for_each_idx`]. Single-threaded use only.
+    pub(super) fn for_each_idx(&self, f: impl FnMut(Idx)) {
+        self.inner.for_each_idx(f);
+    }
+
     pub(super) fn exceeds_load_factor(&self) -> bool {
         self.inner.exceeds_load_factor()
     }
@@ -859,6 +947,11 @@ impl BinodeCache {
 
     pub(super) fn capacity(&self) -> usize {
         self.inner.capacity()
+    }
+
+    /// See [`ConcurrentHashTable::for_each_idx`]. Single-threaded use only.
+    pub(super) fn for_each_idx(&self, f: impl FnMut(Idx)) {
+        self.inner.for_each_idx(f);
     }
 
     pub(super) fn exceeds_load_factor(&self) -> bool {

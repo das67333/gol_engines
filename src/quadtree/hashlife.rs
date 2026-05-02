@@ -121,13 +121,15 @@ impl<Meta: Default + Sync> HashLifeEngine<Meta> {
 
 impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
     fn new(mem_limit_mib: u32, threads_cnt: usize) -> Self {
-        let nodes =
-            ((mem_limit_mib as u64) << 20) / std::mem::size_of::<QuadTreeNode<Meta>>() as u64;
-        // previous power of two
-        let cap_log2 = (nodes / 2 + 1)
-            .checked_next_power_of_two()
-            .unwrap()
-            .trailing_zeros();
+        // Memory accounting: at full load (load factor = 1) the table holds
+        // `bucket_count` nodes plus a `bucket_count`-sized array of bucket
+        // heads. Per-bucket cost: one `AtomicU32` (4 B) plus one node body.
+        // We pick the largest power-of-2 `bucket_count` fitting the budget.
+        let mem_bytes = (mem_limit_mib as u64) << 20;
+        let per_bucket = std::mem::size_of::<std::sync::atomic::AtomicU32>()
+            + std::mem::size_of::<QuadTreeNode<Meta>>();
+        let max_buckets = (mem_bytes / per_bucket as u64).max(1);
+        let cap_log2 = max_buckets.ilog2();
         Self::with_capacity(cap_log2, threads_cnt)
     }
 

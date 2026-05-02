@@ -252,8 +252,8 @@ impl<'a> StreamLifeExecutor<'a> {
     fn free_orphaned_processing_data(&self) {
         // Binode entries
         let bicache = &self.engine.bicache;
-        for idx in 0..bicache.capacity() {
-            let entry = bicache.get(idx as Idx);
+        bicache.for_each_idx(|idx| {
+            let entry = bicache.get(idx);
             let status = entry.status().load(Ordering::Relaxed);
             if status == status::PENDING {
                 let pd: &mut BiProcessingData = entry.payload.get_ref();
@@ -261,13 +261,13 @@ impl<'a> StreamLifeExecutor<'a> {
                 // `start_processing_entry`; all workers have joined.
                 unsafe { drop(Box::from_raw(pd as *mut BiProcessingData)) };
             }
-        }
+        });
         // HashLife nodes processed asynchronously during this StreamLife run
         // can also be orphaned in PENDING state. Free their
         // `ProcessingData<Dependent>` boxes.
         let mem = &self.engine.base.mem;
-        for idx in 0..mem.capacity() {
-            let n = mem.get(idx as Idx);
+        mem.for_each_idx(|idx| {
+            let n = mem.get(idx);
             let status = n.status.load(Ordering::Relaxed);
             if status == status::PENDING {
                 let pd: &mut ProcessingData<Dependent> = n.cache.get_ref();
@@ -275,7 +275,7 @@ impl<'a> StreamLifeExecutor<'a> {
                 // `start_processing_node`; all workers have joined.
                 unsafe { drop(Box::from_raw(pd as *mut ProcessingData<Dependent>)) };
             }
-        }
+        });
     }
 }
 

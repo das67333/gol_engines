@@ -48,13 +48,16 @@ impl StreamLifeEngine {
 
 impl GoLEngine for StreamLifeEngine {
     fn new(mem_limit_mib: u32, threads_cnt: usize) -> Self {
-        let nodes = ((mem_limit_mib as u64) << 20)
-            / (std::mem::size_of::<QuadTreeNode<u64>>() + std::mem::size_of::<CacheEntry>()) as u64;
-        // previous power of two
-        let cap_log2 = (nodes / 2 + 1)
-            .checked_next_power_of_two()
-            .unwrap()
-            .trailing_zeros();
+        // Memory accounting: NodeStore<u64> and BinodeCache share the same
+        // `bucket_count`. Per-bucket cost = (bucket_head + node body) +
+        // (bucket_head + cache entry).
+        let mem_bytes = (mem_limit_mib as u64) << 20;
+        let per_bucket = std::mem::size_of::<std::sync::atomic::AtomicU32>()
+            + std::mem::size_of::<QuadTreeNode<u64>>()
+            + std::mem::size_of::<std::sync::atomic::AtomicU32>()
+            + std::mem::size_of::<CacheEntry>();
+        let max_buckets = (mem_bytes / per_bucket as u64).max(1);
+        let cap_log2 = max_buckets.ilog2();
         Self {
             base: HashLifeEngine::<u64>::with_capacity(cap_log2, threads_cnt),
             biroot: None,
