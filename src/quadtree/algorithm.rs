@@ -2,7 +2,11 @@ use super::{
     LEAF_SIZE_LOG2,
     blank::BlankNodes,
     hashtable::{Idx, NodeAccess},
+    sharded_statistics::{MetricKind, record_metric},
+    spin::Spinner,
+    status,
 };
+use std::sync::atomic::Ordering;
 
 /// Apply Conway's Game of Life rules to a row of cells.
 ///
@@ -274,50 +278,87 @@ fn determine_direction<Meta: Default + Sync>(
     dmap | (lmask << 32)
 }
 
-/// Pure: decide solitonic-ness from two pre-computed lane descriptors.
+/// Compute lane descriptors for a node. Thread-safe (uses CAS on `status_extra`).
 ///
-/// Caller must have lanes for both halves of the binode at the same
-/// `size_log2` available; in the async executor those are produced by
-/// `LaneTask`s that finalize before this function is called.
-pub(super) fn is_solitonic_from_lanes(lanes1: u64, lanes2: u64) -> bool {
-    if lanes1 & 255 == 0 {
-        return false;
-    }
-    if lanes2 & 255 == 0 {
-        return false;
-    }
-    let commonlanes = (lanes1 & lanes2) >> 32;
-    if commonlanes != 0 {
-        return false;
-    }
-    (((lanes1 >> 4) & lanes2) | ((lanes2 >> 4) & lanes1)) & 15 != 0
-}
-
-/// Lane descriptor for the LL+1 base case. Pure (no caching).
-pub(super) fn lane_base_case(
+/// Currently kept synchronous (kept-as-Spinner-based) per the v1 plan in
+/// `streamlife_async_design.md §8.1`. Called from both `is_solitonic` (the
+/// solitonic check inside the binode phase machine) and from the
+/// finalization steps of Phases Solitonic / Base.
+pub(super) fn node2lanes(
     mem: &impl NodeAccess<u64>,
-    nw: Idx,
-    ne: Idx,
-    sw: Idx,
-    se: Idx,
-) -> u64 {
-    determine_direction(mem, nw, ne, sw, se)
-}
-
-/// Compute the 5 middle children needed by the recursive lane phase, in the
-/// order [tc, cl, cc, cr, bc] (corresponding to slot indices 1, 3, 4, 5, 7).
-///
-/// `size_log2` is the size of the parent node. For LL+2 the middle children
-/// are leaves, prepared by recombining 4-cell slices; for the general case
-/// they are interior nodes constructed via `find_or_create_node`.
-pub(super) fn lane_middle_children(
-    mem: &impl NodeAccess<u64>,
-    nw: Idx,
-    ne: Idx,
-    sw: Idx,
-    se: Idx,
+    blank_nodes: &BlankNodes,
+    idx: Idx,
     size_log2: u32,
-) -> [Idx; 5] {
+) -> u64 {
+    if idx == blank_nodes.get(size_log2) {
+        // blank node
+        return 0xffff;
+    }
+
+    let n = mem.get(idx);
+    let status = n.status_extra.load(Ordering::Acquire);
+    if status == status::FINISHED {
+        return unsafe { *n.extra.get() };
+    }
+
+    if !(status == status::NOT_STARTED
+        && n.status_extra
+            .compare_exchange(
+                status::NOT_STARTED,
+                status::PROCESSING,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok())
+    {
+        let mut spinner = Spinner::new();
+        while n.status_extra.load(Ordering::Acquire) != status::FINISHED {
+            spinner.spin();
+        }
+        record_metric(spinner.count(), MetricKind::Node2Lanes);
+        return unsafe { *n.extra.get() };
+    }
+
+    if size_log2 == LEAF_SIZE_LOG2 + 1 {
+        let extra = determine_direction(mem, n.nw, n.ne, n.sw, n.se);
+        unsafe { *n.extra.get() = extra };
+        n.status_extra.store(status::FINISHED, Ordering::Release);
+        return extra;
+    }
+
+    let (nw, ne, sw, se) = {
+        let n = mem.get(idx);
+        (n.nw, n.ne, n.sw, n.se)
+    };
+
+    let mut childlanes = [0u64; 9];
+    let mut adml = 0xff;
+    /*
+     * Short-circuit evaluation using the corner children
+     * This will handle the vast majority of random tiles.
+     */
+    if adml != 0 {
+        childlanes[0] = node2lanes(mem, blank_nodes, nw, size_log2 - 1);
+        adml &= childlanes[0];
+    }
+    if adml != 0 {
+        childlanes[2] = node2lanes(mem, blank_nodes, ne, size_log2 - 1);
+        adml &= childlanes[2];
+    }
+    if adml != 0 {
+        childlanes[6] = node2lanes(mem, blank_nodes, sw, size_log2 - 1);
+        adml &= childlanes[6];
+    }
+    if adml != 0 {
+        childlanes[8] = node2lanes(mem, blank_nodes, se, size_log2 - 1);
+        adml &= childlanes[8];
+    }
+    if adml == 0 {
+        unsafe { *n.extra.get() = 0 };
+        n.status_extra.store(status::FINISHED, Ordering::Release);
+        return 0;
+    }
+
     if size_log2 == LEAF_SIZE_LOG2 + 2 {
         let tlx = {
             let nw = mem.get(nw);
@@ -349,13 +390,11 @@ pub(super) fn lane_middle_children(
             let se = mem.find_or_create_leaf_from_u64(x[3]);
             mem.find_or_create_node(nw, ne, sw, se)
         };
-        [
-            prepared(&tc),
-            prepared(&cl),
-            prepared(&cc),
-            prepared(&cr),
-            prepared(&bc),
-        ]
+
+        for (i, x) in [(1, &tc), (3, &cl), (4, &cc), (5, &cr), (7, &bc)] {
+            childlanes[i] = node2lanes(mem, blank_nodes, prepared(x), size_log2 - 1);
+        }
+        adml &= childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
     } else {
         let pptr_tl = mem.get(nw);
         let pptr_tr = mem.get(ne);
@@ -368,44 +407,24 @@ pub(super) fn lane_middle_children(
         let cr = [pptr_tr.sw, pptr_tr.se, pptr_br.nw, pptr_br.ne];
 
         let prepared = |x: &[Idx; 4]| mem.find_or_create_node(x[0], x[1], x[2], x[3]);
-        [
-            prepared(&tc),
-            prepared(&cl),
-            prepared(&cc),
-            prepared(&cr),
-            prepared(&bc),
-        ]
+
+        for (i, x) in [(1, &tc), (3, &cl), (4, &cc), (5, &cr), (7, &bc)] {
+            childlanes[i] = node2lanes(mem, blank_nodes, prepared(x), size_log2 - 1);
+        }
+        adml &= childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
     }
-}
-
-/// Combine 9 child lane descriptors into the parent's lane descriptor.
-/// Pure: assumes all 9 child lanes are computed.
-///
-/// `child_lanes` are indexed `[nw, tc, ne, cl, cc, cr, sw, bc, se]`
-/// (i.e., spatial 3×3 rows; corners at 0,2,6,8; middles at 1,3,4,5,7).
-/// Returns `adml | (lanes << 32)`. If the corner-AND `adml` would be 0, the
-/// caller can short-circuit before calling this; if all middles are zero
-/// after a non-zero corner-AND, this still returns a valid (zero) result.
-pub(super) fn lane_combine(child_lanes: &[u64; 9], size_log2: u32) -> u64 {
-    let adml = child_lanes[0]
-        & child_lanes[1]
-        & child_lanes[2]
-        & child_lanes[3]
-        & child_lanes[4]
-        & child_lanes[5]
-        & child_lanes[6]
-        & child_lanes[7]
-        & child_lanes[8]
-        & 0xff;
-    if adml == 0 {
-        return 0;
+    for x in &mut childlanes {
+        *x >>= 32;
     }
+    let mut lanes = 0;
 
-    let shifted: [u64; 9] = std::array::from_fn(|i| child_lanes[i] >> 32);
+    let rotr32 = |x, y| (x >> y) | (x << (32 - y));
+    let rotl32 = |x, y| (x << y) | (x >> (32 - y));
 
-    let rotr32 = |x: u64, y: u64| (x >> y) | (x << (32 - y));
-    let rotl32 = |x: u64, y: u64| (x << y) | (x >> (32 - y));
-
+    /*
+     * Lane numbers are modulo 32, with each lane being either
+     * 8 rows, 8 columns, or 8hd (in either diagonal direction)
+     */
     let a: u64 = if size_log2 - LEAF_SIZE_LOG2 - 2 <= 4 {
         1 << (size_log2 - LEAF_SIZE_LOG2 - 2)
     } else {
@@ -413,35 +432,63 @@ pub(super) fn lane_combine(child_lanes: &[u64; 9], size_log2: u32) -> u64 {
     };
     let a2 = (2 * a) & 31;
 
-    let mut lanes = 0u64;
     if adml & 0x88 != 0 {
         // Horizontal lanes
-        lanes |= rotl32(shifted[0] | shifted[1] | shifted[2], a);
-        lanes |= shifted[3] | shifted[4] | shifted[5];
-        lanes |= rotr32(shifted[6] | shifted[7] | shifted[8], a);
-    }
-    if adml & 0x44 != 0 {
-        lanes |= rotl32(shifted[0], a2);
-        lanes |= rotl32(shifted[3] | shifted[1], a);
-        lanes |= shifted[6] | shifted[4] | shifted[2];
-        lanes |= rotr32(shifted[7] | shifted[5], a);
-        lanes |= rotr32(shifted[8], a2);
-    }
-    if adml & 0x22 != 0 {
-        // Vertical lanes
-        lanes |= rotl32(shifted[0] | shifted[3] | shifted[6], a);
-        lanes |= shifted[1] | shifted[4] | shifted[7];
-        lanes |= rotr32(shifted[2] | shifted[5] | shifted[8], a);
-    }
-    if adml & 0x11 != 0 {
-        lanes |= rotl32(shifted[2], a2);
-        lanes |= rotl32(shifted[1] | shifted[5], a);
-        lanes |= shifted[0] | shifted[4] | shifted[8];
-        lanes |= rotr32(shifted[3] | shifted[7], a);
-        lanes |= rotr32(shifted[6], a2);
+        lanes |= rotl32(childlanes[0] | childlanes[1] | childlanes[2], a);
+        lanes |= childlanes[3] | childlanes[4] | childlanes[5];
+        lanes |= rotr32(childlanes[6] | childlanes[7] | childlanes[8], a);
     }
 
-    adml | (lanes << 32)
+    if adml & 0x44 != 0 {
+        lanes |= rotl32(childlanes[0], a2);
+        lanes |= rotl32(childlanes[3] | childlanes[1], a);
+        lanes |= childlanes[6] | childlanes[4] | childlanes[2];
+        lanes |= rotr32(childlanes[7] | childlanes[5], a);
+        lanes |= rotr32(childlanes[8], a2);
+    }
+
+    if adml & 0x22 != 0 {
+        // Vertical lanes
+        lanes |= rotl32(childlanes[0] | childlanes[3] | childlanes[6], a);
+        lanes |= childlanes[1] | childlanes[4] | childlanes[7];
+        lanes |= rotr32(childlanes[2] | childlanes[5] | childlanes[8], a);
+    }
+
+    if adml & 0x11 != 0 {
+        lanes |= rotl32(childlanes[2], a2);
+        lanes |= rotl32(childlanes[1] | childlanes[5], a);
+        lanes |= childlanes[0] | childlanes[4] | childlanes[8];
+        lanes |= rotr32(childlanes[3] | childlanes[7], a);
+        lanes |= rotr32(childlanes[6], a2);
+    }
+
+    let extra = adml | (lanes << 32);
+    unsafe { *n.extra.get() = extra };
+    n.status_extra.store(status::FINISHED, Ordering::Release);
+    extra
+}
+
+/// Check if two universes are provably non-interacting (solitonic).
+/// Thread-safe.
+pub(super) fn is_solitonic(
+    mem: &impl NodeAccess<u64>,
+    blank_nodes: &BlankNodes,
+    idx: (Idx, Idx),
+    size_log2: u32,
+) -> bool {
+    let lanes1 = node2lanes(mem, blank_nodes, idx.0, size_log2);
+    if lanes1 & 255 == 0 {
+        return false;
+    }
+    let lanes2 = node2lanes(mem, blank_nodes, idx.1, size_log2);
+    if lanes2 & 255 == 0 {
+        return false;
+    }
+    let commonlanes = (lanes1 & lanes2) >> 32;
+    if commonlanes != 0 {
+        return false;
+    }
+    (((lanes1 >> 4) & lanes2) | ((lanes2 >> 4) & lanes1)) & 15 != 0
 }
 
 /// Merge two non-overlapping universes into a single node. Thread-safe.

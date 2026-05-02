@@ -84,8 +84,8 @@ pub(super) enum MetricKind {
     NotifyDep = 3,
     HandleDep = 4,
     HandleBiDep = 5,
-    // Spin in handle_lane_dependency (status barrier wait, lanes path)
-    HandleLaneDep = 6,
+    // Algorithm spin-wait on FINISHED (spin count)
+    Node2Lanes = 6,
     // Task duration (raw timer ticks)
     TaskDuration = 7,
 }
@@ -211,7 +211,7 @@ mod enabled {
             Self::NotifyDep,
             Self::HandleDep,
             Self::HandleBiDep,
-            Self::HandleLaneDep,
+            Self::Node2Lanes,
             Self::TaskDuration,
         ];
 
@@ -223,7 +223,7 @@ mod enabled {
                 Self::NotifyDep => "Spin [notify_dep]",
                 Self::HandleDep => "Spin [handle_dep]",
                 Self::HandleBiDep => "Spin [handle_bi_dep]",
-                Self::HandleLaneDep => "Spin [handle_lane_dep]",
+                Self::Node2Lanes => "Spin [node2lanes]",
                 Self::TaskDuration => "Task duration",
             }
         }
