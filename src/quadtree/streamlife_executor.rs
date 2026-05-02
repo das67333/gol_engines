@@ -338,9 +338,11 @@ impl<'a> StreamLifeExecutor<'a> {
         assert!(is_finished(root_status));
         println!("Time spent on streamlife executor: {:?}", timer.elapsed());
         println!(
-            "Nodes count: {}, BiCache count: {}",
+            "Nodes count: {} / {}, BiCache count: {} / {}",
             self.engine.base.mem.len(),
-            bicache.len()
+            self.engine.base.mem.capacity(),
+            bicache.len(),
+            bicache.capacity()
         );
         #[cfg(feature = "statistics")]
         println!("{total_stats}");

@@ -312,7 +312,11 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
 
         assert!(is_finished(&self.mem.get(self.root).status));
         println!("Time spent on hashlife executor: {:?}", timer.elapsed());
-        println!("Nodes count: {}", self.mem.len());
+        println!(
+            "Nodes count: {} / {}",
+            self.mem.len(),
+            self.mem.capacity()
+        );
         #[cfg(feature = "statistics")]
         println!("{total_stats}");
 
