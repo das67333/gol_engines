@@ -217,6 +217,17 @@ pub(super) fn four_children_overlapping<Meta: Default + Sync>(
     ]
 }
 
+/// Compute the lane descriptor for a node at level `LEAF_SIZE_LOG2 + 1`
+/// (a 2×2 block of 8×8 leaves, i.e. a 16×16 grid).
+///
+/// Returns a `u64` with the encoding used by [`node2lanes`]:
+/// - bits 0–7: `adml` (admissible-lane mask) — which lane types are present.
+/// - bits 32–63: `lanes` — active lane numbers mod 32.
+///
+/// The direction map `dmap` checks whether the center 8×8 result (simulated 4
+/// steps forward) matches the center pattern shifted by ±1 or ±2 cells in each
+/// of the 8 compass directions. Each matching shift sets a bit in `dmap`.
+/// `lmask` then encodes which lane types those directions belong to.
 fn determine_direction<Meta: Default + Sync>(
     mem: &impl NodeAccess<Meta>,
     nw: Idx,
@@ -280,10 +291,11 @@ fn determine_direction<Meta: Default + Sync>(
 
 /// Compute lane descriptors for a node. Thread-safe (uses CAS on `status_extra`).
 ///
-/// Currently kept synchronous (kept-as-Spinner-based) per the v1 plan in
-/// `streamlife_async_design.md §8.1`. Called from both `is_solitonic` (the
-/// solitonic check inside the binode phase machine) and from the
-/// finalization steps of Phases Solitonic / Base.
+/// Kept synchronous: `node2lanes` is idempotent and cheap to spin on (it only
+/// needs the already-present cell data, not async HashLife results), so a
+/// simple CAS + spinner avoids the cost of adding a BiTask phase for it.
+/// Called from both `is_solitonic` (the solitonic check inside the binode
+/// phase machine) and from the finalization steps of Phases Solitonic / Base.
 pub(super) fn node2lanes(
     mem: &impl NodeAccess<u64>,
     blank_nodes: &BlankNodes,

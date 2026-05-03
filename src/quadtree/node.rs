@@ -87,6 +87,11 @@ pub(super) struct QuadTreeNode<Meta> {
     /// Lane-descriptor status (StreamLife only).
     pub(super) status_extra: AtomicU8,
     /// Lane descriptor metadata (StreamLife only; zero-sized for HashLife).
+    ///
+    /// When `Meta = u64` the encoding is:
+    /// - bits 0–7: `adml` — admissible-lane mask (which lane types are active).
+    ///   Zero means the node is non-solitonic (no lanes).
+    /// - bits 32–63: `lanes` — set of active lane numbers (mod 32), one bit per lane.
     pub(super) extra: UnsafeCell<Meta>,
 }
 

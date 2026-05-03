@@ -12,8 +12,8 @@ use num_bigint::BigInt;
 
 /// Parallel implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife).
 ///
-/// Stores nodes in a single pre-allocated open-addressing hashtable with
-/// linear probing, and the hashtable never grows.
+/// Stores nodes in a chained hashtable backed by per-thread chunk allocators.
+/// The table is pre-sized at construction and never resizes.
 pub struct HashLifeEngine<Meta> {
     pub(super) size_log2: u32,
     pub(super) root: Idx,
@@ -200,16 +200,6 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
             self.add_frame(&mut dx, &mut dy);
         }
 
-        // let mut builder = tokio::runtime::Builder::new_multi_thread();
-        // if num_threads > 0 {
-        //     builder.worker_threads(num_threads as usize);
-        // }
-
-        // builder
-        //     .build()
-        //     .unwrap()
-        //     .block_on(async { self.update_node_async(self.root, self.size_log2).await })
-        // self.update_node_sync(self.root, self.size_log2)
         self.root = if let Some(x) = HashLifeExecutor::new(self).run(self.threads_cnt) {
             x
         } else {

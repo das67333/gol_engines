@@ -1,7 +1,5 @@
 //! # Concurrent chained hashtable with per-thread node chunks
 //!
-//! See `chained_hashtable_design.md` for the full design rationale.
-//!
 //! ## Layout
 //!
 //! - A fixed-size **bucket array** of `AtomicU32`. Each bucket holds the

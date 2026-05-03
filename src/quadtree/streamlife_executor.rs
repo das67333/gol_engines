@@ -3,8 +3,7 @@
 //! Work-stealing parallel executor for the StreamLife algorithm's
 //! `update_binode` operation, with cross-engine async cooperation: HashLife
 //! sub-results required by `update_binode`'s solitonic / base fast-paths are
-//! computed asynchronously rather than via the synchronous `update_node_sync`
-//! path. See `streamlife_async_design.md` for the full design.
+//! computed asynchronously rather than via a synchronous recursive call.
 //!
 //! ## Two queues per worker
 //!
@@ -85,8 +84,6 @@ pub(super) enum Dependent {
 
 /// Phase tag for a `BiTask`'s state machine. Set on the first invocation
 /// (Phase Entry) and read on every subsequent invocation to dispatch.
-///
-/// See `streamlife_async_design.md §3` for the full state machine.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum BiPhase {
     /// First invocation; phase not yet decided.

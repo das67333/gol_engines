@@ -93,9 +93,9 @@ const WAITING_BIAS: u16 = 1 << 15;
 /// Stored via pointer in the node's `cache` field.
 ///
 /// Generic over `Dep`, the dependent type. Pure HashLife runs use
-/// `ProcessingData<Idx>` (today's layout). StreamLife runs that drive
-/// HashLife nodes asynchronously use `ProcessingData<Dependent>` so a binode
-/// task can register itself as a waiter. The `cache` field on
+/// `ProcessingData<Idx>`. StreamLife runs that drive HashLife nodes
+/// asynchronously use `ProcessingData<Dependent>` so a binode task can
+/// register itself as a waiter. The `cache` field on
 /// [`super::node::QuadTreeNode`] is type-erased, so per-run instantiation is
 /// safe as long as a single run is consistent (cleared via `run_gc` /
 /// `load_pattern` between runs).
@@ -534,7 +534,7 @@ where
     let both_stages = generations_log2 + 2 >= task.size_log2;
     let [nw, ne, sw, se] = parts;
     if task.size_log2 == LEAF_SIZE_LOG2 + 1 {
-        // base case: node consists of leaves
+        // base case: all four children are leaves
         let steps = if both_stages {
             LEAF_SIZE / 2
         } else {
@@ -544,7 +544,7 @@ where
     }
 
     if data.mask4_waiting == 0 {
-        // arr4 is not ready
+        // Stage 2 not yet initialized
         if !both_stages {
             data.arr = algorithm::nine_children_disjoint(mem, nw, ne, sw, se, task.size_log2 - 1);
         } else {

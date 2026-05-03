@@ -205,6 +205,7 @@ fn bin_range(i: usize) -> (f64, f64) {
     }
 }
 
+// Nines notation: p(n) = (1 - 10^-n)th percentile, e.g. p(2) = 99th, p(3) = 99.9th.
 const PERCENTILES: &[(f64, &str)] = &[
     (0.50, "p50"),
     (0.9, "p(1)"),
@@ -213,8 +214,6 @@ const PERCENTILES: &[(f64, &str)] = &[
     (0.9999, "p(4)"),
     (0.99999, "p(5)"),
     (0.999999, "p(6)"),
-    (0.9999999, "p(7)"),
-    (0.99999999, "p(8)"),
     (1.0, "max"),
 ];
 
