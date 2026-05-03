@@ -38,25 +38,24 @@
 //! Under same-key contention, only the first thread does the CAS; all
 //! others find their key on retry. No spinlock; no per-slot lock.
 
-use super::{node::QuadTreeNode, sharded_statistics::*};
+use super::super::sharded_statistics::{LengthShard, ShardedLength};
 use std::{
     cell::UnsafeCell,
-    hash::{Hash, Hasher},
     mem, ptr,
-    sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
 
 /// Index into a [`ConcurrentHashTable`]. Encoded as `(chunk_id, offset)`;
 /// see module-level docs.
-pub(super) type Idx = u32;
+pub type Idx = u32;
 
 /// The null Idx. Chunk 0 is reserved (its storage is never allocated), so
 /// any encoded Idx with `chunk_id == 0` is null. `Idx::default()` is `0`.
-pub(super) const NULL_IDX: Idx = 0;
+pub const NULL_IDX: Idx = 0;
 
 /// Log2 of the per-chunk node count. 16 → 64 K nodes per chunk.
-const CHUNK_LOG2: u32 = 16;
-const CHUNK_SIZE: u32 = 1 << CHUNK_LOG2;
+pub const CHUNK_LOG2: u32 = 16;
+pub const CHUNK_SIZE: u32 = 1 << CHUNK_LOG2;
 const OFFSET_MASK: u32 = CHUNK_SIZE - 1;
 
 /// Bound on the number of `find_or_create_*` allocations a worker may issue
@@ -69,26 +68,26 @@ const OFFSET_MASK: u32 = CHUNK_SIZE - 1;
 /// 64 is a generous upper bound — measured worst-case is ~14
 /// (`nine_children_disjoint` 9 + `four_children_overlapping` 4 + final result
 /// 1).
-pub(super) const MAX_ALLOCS_PER_TASK: usize = 64;
+pub const MAX_ALLOCS_PER_TASK: usize = 64;
 
 #[inline(always)]
-fn chunk_id(idx: Idx) -> u32 {
+pub(super) fn chunk_id(idx: Idx) -> u32 {
     idx >> CHUNK_LOG2
 }
 
 #[inline(always)]
-fn offset_in_chunk(idx: Idx) -> u32 {
+pub(super) fn offset_in_chunk(idx: Idx) -> u32 {
     idx & OFFSET_MASK
 }
 
 #[inline(always)]
-fn encode_idx(chunk_id: u32, offset: u32) -> Idx {
+pub(super) fn encode_idx(chunk_id: u32, offset: u32) -> Idx {
     assert!(offset < CHUNK_SIZE);
     (chunk_id << CHUNK_LOG2) | offset
 }
 
 /// Trait for types that can be stored in a [`ConcurrentHashTable`].
-pub(super) trait HashtableSlot: Default + Sync {
+pub trait HashtableSlot: Default + Sync {
     /// The chain pointer (also doubles as free-list link when freed).
     fn next(&self) -> &AtomicU32;
 }
@@ -115,7 +114,7 @@ union PtrOrValue<V: Copy> {
 ///   `DEPS_LOCK`).
 /// - The final value is written by the owner during the `PROCESSING`
 ///   finish barrier and is then immutable.
-pub(super) struct CacheField<V: Copy>(UnsafeCell<PtrOrValue<V>>);
+pub struct CacheField<V: Copy>(UnsafeCell<PtrOrValue<V>>);
 
 // SAFETY: Protected by the status state machine.
 unsafe impl<V: Copy> Sync for CacheField<V> {}
@@ -135,22 +134,22 @@ impl<V: Copy> std::fmt::Debug for CacheField<V> {
 }
 
 impl<V: Copy> CacheField<V> {
-    pub(super) fn get_value(&self) -> V {
+    pub fn get_value(&self) -> V {
         unsafe { (*self.0.get()).value }
     }
 
-    pub(super) fn set_value(&self, v: V) {
+    pub fn set_value(&self, v: V) {
         unsafe { (*self.0.get()).value = v }
     }
 
     /// # Safety (interior mutability)
     /// The status state machine guarantees only one thread accesses this at a time.
     #[allow(clippy::mut_from_ref)]
-    pub(super) fn get_ref<T>(&self) -> &mut T {
+    pub fn get_ref<T>(&self) -> &mut T {
         unsafe { &mut *((*self.0.get()).ptr as *mut T) }
     }
 
-    pub(super) fn set_ptr<T>(&self, ptr: *mut T) {
+    pub fn set_ptr<T>(&self, ptr: *mut T) {
         unsafe { (*self.0.get()).ptr = ptr as *mut u8 }
     }
 }
@@ -158,12 +157,12 @@ impl<V: Copy> CacheField<V> {
 /// One chunk's storage. Lazy-allocated on first claim; `storage` is null
 /// until then. The `Box<[UnsafeCell<E>]>` is reconstructed from the raw
 /// pointer + known length (`CHUNK_SIZE`) in [`Chunk::release`] for drop.
-struct Chunk<E> {
+pub(super) struct Chunk<E> {
     storage: AtomicPtr<UnsafeCell<E>>,
 }
 
 impl<E> Chunk<E> {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             storage: AtomicPtr::new(ptr::null_mut()),
         }
@@ -173,7 +172,7 @@ impl<E> Chunk<E> {
     /// observed (e.g. via Acquire load through bucket head) that the
     /// chunk has been claimed.
     #[inline(always)]
-    fn slot(&self, offset: u32) -> *mut UnsafeCell<E> {
+    pub(super) fn slot(&self, offset: u32) -> *mut UnsafeCell<E> {
         let base = self.storage.load(Ordering::Acquire);
         assert!(!base.is_null(), "lookup of Idx in unclaimed chunk");
         unsafe { base.add(offset as usize) }
@@ -181,7 +180,7 @@ impl<E> Chunk<E> {
 
     /// Drop the storage and reset to null. Single-threaded use only
     /// (called from `clear()` and `Drop`).
-    fn release(&mut self) {
+    pub(super) fn release(&mut self) {
         let raw = *self.storage.get_mut();
         *self.storage.get_mut() = ptr::null_mut();
         if !raw.is_null() {
@@ -202,17 +201,17 @@ impl<E> Drop for Chunk<E> {
 /// Per-thread allocator state. Owner-only mutation; other threads only
 /// read via `Idx` lookups (which go through the chunks table, not the
 /// thread state).
-struct ThreadState {
+pub(super) struct ThreadState {
     /// Chunk this thread is currently allocating from. `0` = none yet.
-    current_chunk_id: u32,
+    pub(super) current_chunk_id: u32,
     /// Bump-pointer offset within `current_chunk_id`.
-    next_offset_in_chunk: u32,
+    pub(super) next_offset_in_chunk: u32,
     /// Head of this thread's free list (or `NULL_IDX` if empty).
-    free_list_head: Idx,
+    pub(super) free_list_head: Idx,
 }
 
 impl ThreadState {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             current_chunk_id: 0,
             next_offset_in_chunk: 0,
@@ -220,7 +219,7 @@ impl ThreadState {
         }
     }
 
-    fn reset(&mut self) {
+    pub(super) fn reset(&mut self) {
         *self = Self::new();
     }
 }
@@ -230,27 +229,27 @@ impl ThreadState {
 /// See module docs for the full design.
 pub(super) struct ConcurrentHashTable<E> {
     /// Bucket array. Each entry is the head Idx of a chain.
-    buckets: Box<[AtomicU32]>,
+    pub(super) buckets: Box<[AtomicU32]>,
     /// Chunks table. `chunks[0]` is reserved as null; chunks[1..] are
     /// claimed lazily by threads via `next_chunk_id.fetch_add`.
-    chunks: Box<[Chunk<E>]>,
+    pub(super) chunks: Box<[Chunk<E>]>,
     /// Bump pointer for chunk claims. Starts at 1 (chunk 0 reserved).
-    next_chunk_id: AtomicU32,
+    pub(super) next_chunk_id: AtomicU32,
     /// Per-thread allocator state (one entry per shard).
-    thread_states: Box<[UnsafeCell<ThreadState>]>,
+    pub(super) thread_states: Box<[UnsafeCell<ThreadState>]>,
     /// Length tracking (existing sharded mechanism).
-    length: ShardedLength,
+    pub(super) length: ShardedLength,
     /// Cancellation threshold: when `len_upper_bound > length_limit`, callers
     /// stop fetching new tasks. Set below `capacity` by [`MAX_ALLOCS_PER_TASK`]
     /// × `threads_cnt` so that the post-cancel allocation burst can complete
     /// without exceeding `capacity` or exhausting the chunks table.
-    length_limit: usize,
+    pub(super) length_limit: usize,
     /// Hard cap: maximum number of nodes the table can hold. Equal to
     /// `bucket_count` (load factor 1) when the chunks table can address that
     /// many; capped tighter at the boundary `cap_log2 ≈ 32` where the chunk
     /// table cannot host both the storage chunks and one partial chunk per
     /// thread without exceeding the 16-bit chunk-id space.
-    capacity: usize,
+    pub(super) capacity: usize,
 }
 
 // SAFETY:
@@ -285,7 +284,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     /// (`cap_log2 ≈ 32`), `capacity` is reduced accordingly.
     ///
     /// `threads_cnt` is the number of shards (one `ThreadState` per shard).
-    fn new(cap_log2: u32, threads_cnt: usize) -> Self {
+    pub(super) fn new(cap_log2: u32, threads_cnt: usize) -> Self {
         let max_cap_log2 = mem::size_of::<Idx>() as u32 * 8;
         assert!(
             cap_log2 <= max_cap_log2,
@@ -300,9 +299,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         // Reserve one chunk per shard for partial-chunk in-flight allocations
         // (each thread can have its own current_chunk only partially filled).
         // Plus chunk 0 reserved.
-        let max_storage_chunks = chunk_id_count
-            .saturating_sub(1)
-            .saturating_sub(threads_cnt);
+        let max_storage_chunks = chunk_id_count.saturating_sub(1).saturating_sub(threads_cnt);
         let max_storage_nodes = max_storage_chunks * CHUNK_SIZE as usize;
 
         // Load factor 1 capped by chunk-table addressability.
@@ -323,7 +320,9 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
             .min(chunk_id_count);
         let chunks: Box<[Chunk<E>]> = (0..needed_chunks).map(|_| Chunk::new()).collect();
 
-        let buckets: Box<[AtomicU32]> = (0..bucket_count).map(|_| AtomicU32::new(NULL_IDX)).collect();
+        let buckets: Box<[AtomicU32]> = (0..bucket_count)
+            .map(|_| AtomicU32::new(NULL_IDX))
+            .collect();
 
         let thread_states: Box<[UnsafeCell<ThreadState>]> = (0..threads_cnt)
             .map(|_| UnsafeCell::new(ThreadState::new()))
@@ -345,7 +344,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     ///
     /// # Panics (debug)
     /// If `idx == NULL_IDX` or its chunk is not yet claimed.
-    fn get(&self, idx: Idx) -> &E {
+    pub(super) fn get(&self, idx: Idx) -> &E {
         assert!(idx != NULL_IDX, "get(NULL_IDX)");
         let cid = chunk_id(idx);
         let off = offset_in_chunk(idx);
@@ -357,7 +356,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     /// SAFETY: caller guarantees no other thread can observe this slot
     /// (i.e. this slot has just been allocated and the publishing CAS
     /// has not yet run).
-    fn get_uninit_mut(&self, idx: Idx) -> *mut E {
+    pub(super) fn get_uninit_mut(&self, idx: Idx) -> *mut E {
         let cid = chunk_id(idx);
         let off = offset_in_chunk(idx);
         let slot_ptr = self.chunks[cid as usize].slot(off);
@@ -372,7 +371,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     ///
     /// `shard_idx` selects the per-thread allocator (and matters only if
     /// allocation occurs).
-    fn find_or_create(
+    pub(super) fn find_or_create(
         &self,
         hash: usize,
         shard_idx: usize,
@@ -443,7 +442,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     /// Allocate a fresh `Idx` from the given thread's pool. Prefers the
     /// free list; falls back to bumping within the current chunk;
     /// claims a new chunk if the current one is full.
-    fn allocate(&self, shard_idx: usize) -> Idx {
+    pub(super) fn allocate(&self, shard_idx: usize) -> Idx {
         let ts = self.thread_state_mut(shard_idx);
 
         // Free list first.
@@ -486,12 +485,14 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         // Publish: any subsequent observation of an Idx in this chunk
         // (via a Release-CAS on a bucket head) synchronizes with this
         // Release.
-        self.chunks[id as usize].storage.store(raw, Ordering::Release);
+        self.chunks[id as usize]
+            .storage
+            .store(raw, Ordering::Release);
         ts.current_chunk_id = id;
         ts.next_offset_in_chunk = 0;
     }
 
-    fn deallocate(&self, shard_idx: usize, idx: Idx) {
+    pub(super) fn deallocate(&self, shard_idx: usize, idx: Idx) {
         let ts = self.thread_state_mut(shard_idx);
         let entry = self.get(idx);
         entry.next().store(ts.free_list_head, Ordering::Relaxed);
@@ -501,22 +502,22 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     /// SAFETY: caller must access only their own shard. We rely on
     /// the executor's per-thread sharding discipline.
     #[allow(clippy::mut_from_ref)]
-    fn thread_state_mut(&self, shard_idx: usize) -> &mut ThreadState {
+    pub(super) fn thread_state_mut(&self, shard_idx: usize) -> &mut ThreadState {
         unsafe { &mut *self.thread_states[shard_idx].get() }
     }
 
-    fn increment_length(&self) {
+    pub(super) fn increment_length(&self) {
         self.length.inc_global();
     }
 
-    fn shard(&self, shard_idx: usize) -> LengthShard<'_> {
+    pub(super) fn shard(&self, shard_idx: usize) -> LengthShard<'_> {
         self.length.shard(shard_idx)
     }
 
     /// Reset the table: clear buckets, drop all chunk storages, reset
     /// per-thread states, and reset the chunk-id counter. Single-threaded
     /// (called between updates).
-    fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         for b in self.buckets.iter() {
             b.store(NULL_IDX, Ordering::Relaxed);
         }
@@ -530,7 +531,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         self.length.clear();
     }
 
-    fn bytes_total(&self) -> usize {
+    pub(super) fn bytes_total(&self) -> usize {
         let next = self.next_chunk_id.load(Ordering::Relaxed) as usize;
         // Chunks 1..next have been claimed and have allocated storage.
         // Chunk 0 is reserved (no storage).
@@ -541,7 +542,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         chunk_storage + chunks_table + buckets + thread_states
     }
 
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.length.len_exact()
     }
 
@@ -549,11 +550,11 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     /// exceeding the chunk-table addressability bound. Equals `bucket_count`
     /// (load factor 1) except at the `cap_log2 ≈ 32` boundary, where the
     /// 16-bit chunk-id space forces a tighter cap.
-    fn capacity(&self) -> usize {
+    pub(super) fn capacity(&self) -> usize {
         self.capacity
     }
 
-    fn exceeds_load_factor(&self) -> bool {
+    pub(super) fn exceeds_load_factor(&self) -> bool {
         self.length.len_upper_bound() > self.length_limit
     }
 
@@ -571,7 +572,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     /// SAFETY: single-threaded use only — does not synchronize with
     /// concurrent `claim_chunk` / `allocate`. Intended for cancellation /
     /// GC paths after `thread::scope` has joined.
-    fn for_each_idx(&self, mut f: impl FnMut(Idx)) {
+    pub(super) fn for_each_idx(&self, mut f: impl FnMut(Idx)) {
         let next_id = self.next_chunk_id.load(Ordering::Relaxed);
         for cid in 1..next_id {
             for off in 0..CHUNK_SIZE {
@@ -581,401 +582,12 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     }
 }
 
-/// Shared interface for accessing nodes.
-pub(super) trait NodeAccess<Meta: Default + Sync> {
-    fn get(&self, idx: Idx) -> &QuadTreeNode<Meta>;
-    fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx;
-    fn find_or_create_leaf_from_u64(&self, value: u64) -> Idx;
-    fn find_or_create_leaf_from_parts(&self, nw: u16, ne: u16, sw: u16, se: u16) -> Idx;
-}
-
-impl<Meta: Default + Sync> NodeAccess<Meta> for NodeStore<Meta> {
-    fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
-        self.get(idx)
-    }
-    fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx {
-        self.find_or_create_node(nw, ne, sw, se)
-    }
-    fn find_or_create_leaf_from_u64(&self, value: u64) -> Idx {
-        self.find_or_create_leaf_from_u64(value)
-    }
-    fn find_or_create_leaf_from_parts(&self, nw: u16, ne: u16, sw: u16, se: u16) -> Idx {
-        self.find_or_create_leaf_from_parts(nw, ne, sw, se)
-    }
-}
-
-/// A per-thread reference to a store that uses local sharding for length
-/// tracking *and* per-thread chunk allocation.
-pub(super) struct ShardedRef<'a, S> {
-    base: &'a S,
-    shard_idx: usize,
-    length_shard: LengthShard<'a>,
-}
-
-/// Type alias for per-thread NodeStore references.
-pub(super) type NodeStoreRef<'a, Meta> = ShardedRef<'a, NodeStore<Meta>>;
-
-/// Type alias for per-thread BinodeCache references.
-pub(super) type BinodeCacheRef<'a> = ShardedRef<'a, BinodeCache>;
-
-/// Stores the nodes of the quadtree.
-pub(super) struct NodeStore<Meta> {
-    inner: ConcurrentHashTable<QuadTreeNode<Meta>>,
-}
-
-unsafe impl<Meta: Sync> Sync for NodeStore<Meta> {}
-
-impl<Meta: Default + Sync> NodeStore<Meta> {
-    pub(super) fn new(cap_log2: u32, threads_cnt: usize) -> Self {
-        Self {
-            inner: ConcurrentHashTable::new(cap_log2, threads_cnt),
-        }
-    }
-
-    pub(super) fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
-        self.inner.get(idx)
-    }
-
-    /// Find a leaf node with the given parts (4×4 grids as 16-bit integers).
-    pub(super) fn find_or_create_leaf_from_parts(&self, nw: u16, ne: u16, sw: u16, se: u16) -> Idx {
-        let (result, inserted) = self.find_or_create_leaf_from_parts_inner(0, nw, ne, sw, se);
-        if inserted {
-            self.inner.increment_length();
-        }
-        result
-    }
-
-    fn find_or_create_leaf_from_parts_inner(
-        &self,
-        shard_idx: usize,
-        nw: u16,
-        ne: u16,
-        sw: u16,
-        se: u16,
-    ) -> (Idx, bool) {
-        // See Morton order: https://en.wikipedia.org/wiki/Z-order_curve
-        let (mut nw, mut ne) = (nw as u64, ne as u64);
-        let mut cells = 0;
-        let mut shift = 0;
-        for _ in 0..4 {
-            cells |= (nw & 0xF) << shift;
-            nw >>= 4;
-            shift += 4;
-            cells |= (ne & 0xF) << shift;
-            ne >>= 4;
-            shift += 4;
-        }
-        let (mut sw, mut se) = (sw as u64, se as u64);
-        for _ in 0..4 {
-            cells |= (sw & 0xF) << shift;
-            sw >>= 4;
-            shift += 4;
-            cells |= (se & 0xF) << shift;
-            se >>= 4;
-            shift += 4;
-        }
-
-        self.find_or_create_leaf_from_u64_inner(shard_idx, cells)
-    }
-
-    /// Find a leaf node with the given cells (8×8 grid as 64-bit integer).
-    pub(super) fn find_or_create_leaf_from_u64(&self, value: u64) -> Idx {
-        let (result, inserted) = self.find_or_create_leaf_from_u64_inner(0, value);
-        if inserted {
-            self.inner.increment_length();
-        }
-        result
-    }
-
-    fn find_or_create_leaf_from_u64_inner(&self, shard_idx: usize, value: u64) -> (Idx, bool) {
-        let rows = value.to_le_bytes();
-        let nw = u32::from_le_bytes(rows[0..4].try_into().unwrap());
-        let ne = u32::from_le_bytes(rows[4..8].try_into().unwrap());
-        // Leaves: sw == 0 && se == 0 (the leaf marker; see node.rs docs).
-        let hash = compute_hash(nw, ne, 0, 0);
-        self.inner.find_or_create(
-            hash,
-            shard_idx,
-            |slot| (slot.nw, slot.ne, slot.sw, slot.se) == (nw, ne, 0, 0),
-            |slot| unsafe {
-                (*slot).nw = nw;
-                (*slot).ne = ne;
-                (*slot).sw = 0;
-                (*slot).se = 0;
-            },
-        )
-    }
-
-    /// Find a node with the given children. If not found, it is created.
-    pub(super) fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx {
-        let (result, inserted) = self.find_or_create_node_inner(0, nw, ne, sw, se);
-        if inserted {
-            self.inner.increment_length();
-        }
-        result
-    }
-
-    fn find_or_create_node_inner(
-        &self,
-        shard_idx: usize,
-        nw: Idx,
-        ne: Idx,
-        sw: Idx,
-        se: Idx,
-    ) -> (Idx, bool) {
-        assert!(
-            nw != NULL_IDX && ne != NULL_IDX && sw != NULL_IDX && se != NULL_IDX,
-            "internal nodes must have non-null children (Idx 0 = null); got nw={nw} ne={ne} sw={sw} se={se}"
-        );
-        let hash = compute_hash(nw, ne, sw, se);
-        self.inner.find_or_create(
-            hash,
-            shard_idx,
-            |slot| (slot.nw, slot.ne, slot.sw, slot.se) == (nw, ne, sw, se),
-            |slot| unsafe {
-                (*slot).nw = nw;
-                (*slot).ne = ne;
-                (*slot).sw = sw;
-                (*slot).se = se;
-            },
-        )
-    }
-
-    pub(super) fn create_ref(&self, shard_idx: usize) -> NodeStoreRef<'_, Meta> {
-        ShardedRef {
-            base: self,
-            shard_idx,
-            length_shard: self.inner.shard(shard_idx),
-        }
-    }
-
-    pub(super) fn clear(&mut self) {
-        self.inner.clear();
-    }
-
-    pub(super) fn bytes_total(&self) -> usize {
-        self.inner.bytes_total()
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub(super) fn capacity(&self) -> usize {
-        self.inner.capacity()
-    }
-
-    /// See [`ConcurrentHashTable::for_each_idx`]. Single-threaded use only.
-    pub(super) fn for_each_idx(&self, f: impl FnMut(Idx)) {
-        self.inner.for_each_idx(f);
-    }
-
-    pub(super) fn exceeds_load_factor(&self) -> bool {
-        self.inner.exceeds_load_factor()
-    }
-}
-
 /// Hash function for node hashtable lookup (polynomial hash with mixing).
-fn compute_hash(nw: Idx, ne: Idx, sw: Idx, se: Idx) -> usize {
+pub(super) fn compute_hash(nw: Idx, ne: Idx, sw: Idx, se: Idx) -> usize {
     let h = 0u32
         .wrapping_add(nw.wrapping_mul(5))
         .wrapping_add(ne.wrapping_mul(17))
         .wrapping_add(sw.wrapping_mul(257))
         .wrapping_add(se.wrapping_mul(65537));
     h.wrapping_add(h >> 11) as usize
-}
-
-impl<'a, Meta: Default + Sync> NodeStoreRef<'a, Meta> {
-    pub(super) fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
-        self.base.get(idx)
-    }
-
-    pub(super) fn find_or_create_leaf_from_parts(&self, nw: u16, ne: u16, sw: u16, se: u16) -> Idx {
-        let (result, inserted) =
-            self.base
-                .find_or_create_leaf_from_parts_inner(self.shard_idx, nw, ne, sw, se);
-        if inserted {
-            self.length_shard.increment();
-        }
-        result
-    }
-
-    pub(super) fn find_or_create_leaf_from_u64(&self, value: u64) -> Idx {
-        let (result, inserted) = self
-            .base
-            .find_or_create_leaf_from_u64_inner(self.shard_idx, value);
-        if inserted {
-            self.length_shard.increment();
-        }
-        result
-    }
-
-    pub(super) fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx {
-        let (result, inserted) = self
-            .base
-            .find_or_create_node_inner(self.shard_idx, nw, ne, sw, se);
-        if inserted {
-            self.length_shard.increment();
-        }
-        result
-    }
-
-    pub(super) fn exceeds_load_factor(&self) -> bool {
-        self.base.exceeds_load_factor()
-    }
-}
-
-impl<'a, Meta: Default + Sync> NodeAccess<Meta> for NodeStoreRef<'a, Meta> {
-    fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
-        self.get(idx)
-    }
-    fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx {
-        self.find_or_create_node(nw, ne, sw, se)
-    }
-    fn find_or_create_leaf_from_u64(&self, value: u64) -> Idx {
-        self.find_or_create_leaf_from_u64(value)
-    }
-    fn find_or_create_leaf_from_parts(&self, nw: u16, ne: u16, sw: u16, se: u16) -> Idx {
-        self.find_or_create_leaf_from_parts(nw, ne, sw, se)
-    }
-}
-
-pub(super) struct CacheEntry {
-    key: (Idx, Idx),
-    /// Dual-purpose field: computed binode result or processing data pointer.
-    pub(super) payload: CacheField<(Idx, Idx)>,
-    /// Chain pointer (also free-list link when freed).
-    pub(super) next: AtomicU32,
-    status: AtomicU8,
-}
-
-impl Default for CacheEntry {
-    fn default() -> Self {
-        Self {
-            key: (0, 0),
-            payload: CacheField::default(),
-            next: AtomicU32::new(NULL_IDX),
-            status: AtomicU8::new(0),
-        }
-    }
-}
-
-// SAFETY: Concurrent access is protected by the status state machine
-// (for `payload` and `status`) and by atomic chain operations on `next`.
-unsafe impl Sync for CacheEntry {}
-
-impl HashtableSlot for CacheEntry {
-    fn next(&self) -> &AtomicU32 {
-        &self.next
-    }
-}
-
-impl CacheEntry {
-    pub(super) fn key(&self) -> (Idx, Idx) {
-        self.key
-    }
-
-    pub(super) fn status(&self) -> &AtomicU8 {
-        &self.status
-    }
-}
-
-/// Caches results of StreamLife's `update_binode` operation.
-pub(super) struct BinodeCache {
-    inner: ConcurrentHashTable<CacheEntry>,
-    hasher: ahash::AHasher,
-}
-
-impl BinodeCache {
-    pub(super) fn new(cap_log2: u32, threads_cnt: usize) -> Self {
-        Self {
-            inner: ConcurrentHashTable::new(cap_log2, threads_cnt),
-            hasher: ahash::AHasher::default(),
-        }
-    }
-
-    /// Find or create a cache entry for the given binode key.
-    /// Returns `(index, was_inserted)`.
-    fn entry_inner(&self, shard_idx: usize, key: (Idx, Idx)) -> (Idx, bool) {
-        let hash = {
-            let mut hasher = self.hasher.clone();
-            key.hash(&mut hasher);
-            hasher.finish() as usize
-        };
-        self.inner.find_or_create(
-            hash,
-            shard_idx,
-            |slot| slot.key == key,
-            |slot| unsafe {
-                (*slot).key = key;
-            },
-        )
-    }
-
-    /// Find or create a cache entry. Uses the global (non-sharded) length counter.
-    pub(super) fn entry(&self, key: (Idx, Idx)) -> Idx {
-        let (idx, inserted) = self.entry_inner(0, key);
-        if inserted {
-            self.inner.increment_length();
-        }
-        idx
-    }
-
-    pub(super) fn get(&self, idx: Idx) -> &CacheEntry {
-        self.inner.get(idx)
-    }
-
-    pub(super) fn create_ref(&self, shard_idx: usize) -> BinodeCacheRef<'_> {
-        ShardedRef {
-            base: self,
-            shard_idx,
-            length_shard: self.inner.shard(shard_idx),
-        }
-    }
-
-    pub(super) fn clear(&mut self) {
-        self.inner.clear();
-    }
-
-    pub(super) fn bytes_total(&self) -> usize {
-        self.inner.bytes_total()
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub(super) fn capacity(&self) -> usize {
-        self.inner.capacity()
-    }
-
-    /// See [`ConcurrentHashTable::for_each_idx`]. Single-threaded use only.
-    pub(super) fn for_each_idx(&self, f: impl FnMut(Idx)) {
-        self.inner.for_each_idx(f);
-    }
-
-    pub(super) fn exceeds_load_factor(&self) -> bool {
-        self.inner.exceeds_load_factor()
-    }
-}
-
-// -- BinodeCacheRef methods --
-
-impl<'a> BinodeCacheRef<'a> {
-    /// Find or create a cache entry. Uses the per-thread sharded length counter.
-    pub(super) fn entry(&self, key: (Idx, Idx)) -> Idx {
-        let (idx, inserted) = self.base.entry_inner(self.shard_idx, key);
-        if inserted {
-            self.length_shard.increment();
-        }
-        idx
-    }
-
-    pub(super) fn get(&self, idx: Idx) -> &CacheEntry {
-        self.base.get(idx)
-    }
-
-    pub(super) fn exceeds_load_factor(&self) -> bool {
-        self.base.exceeds_load_factor()
-    }
 }

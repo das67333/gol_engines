@@ -12,12 +12,11 @@ categories = ["algorithms", "concurrency", "simulation"]
 include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
 
 [features]
-# Gather and print per-thread runtime statistics (steal attempts, status
-# transitions, lock-spin/latency histograms, task duration). Opt in with
-# `--features statistics`; otherwise the recording/printing code paths
-# are eliminated entirely.
+# Gather and print per-thread runtime statistics.
+# Opt in with `--features statistics`; otherwise the recording/printing code paths are eliminated entirely.
 statistics = []
 cli_deps = ["chrono", "clap", "num-format"]
+# default = ["statistics"]
 
 [[bin]]
 name = "gol_engines_cli"

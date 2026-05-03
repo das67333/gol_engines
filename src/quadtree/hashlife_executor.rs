@@ -312,11 +312,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
 
         assert!(is_finished(&self.mem.get(self.root).status));
         println!("Time spent on hashlife executor: {:?}", timer.elapsed());
-        println!(
-            "Nodes count: {} / {}",
-            self.mem.len(),
-            self.mem.capacity()
-        );
+        println!("Nodes count: {} / {}", self.mem.len(), self.mem.capacity());
         #[cfg(feature = "statistics")]
         println!("{total_stats}");
 
@@ -421,8 +417,21 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
     /// `waiting_cnt` bias trick: whichever thread observes the counter become
     /// zero (this owner via `fetch_sub(WAITING_BIAS)` or the last notifier
     /// via `fetch_sub(1)`) is responsible for re-queuing the parent task.
-    fn update_node(&self, task: &Task, parts: [Idx; 4], data: &mut ProcessingData<Idx>) -> Option<Idx> {
-        update_node_async(&self.mem, &self.queue, self.generations_log2, task, parts, data, task.idx)
+    fn update_node(
+        &self,
+        task: &Task,
+        parts: [Idx; 4],
+        data: &mut ProcessingData<Idx>,
+    ) -> Option<Idx> {
+        update_node_async(
+            &self.mem,
+            &self.queue,
+            self.generations_log2,
+            task,
+            parts,
+            data,
+            task.idx,
+        )
     }
 
     /// Notify dependent nodes that this dependency has completed.
@@ -537,14 +546,7 @@ where
     if data.mask4_waiting == 0 {
         // arr4 is not ready
         if !both_stages {
-            data.arr = algorithm::nine_children_disjoint(
-                mem,
-                nw,
-                ne,
-                sw,
-                se,
-                task.size_log2 - 1,
-            );
+            data.arr = algorithm::nine_children_disjoint(mem, nw, ne, sw, se, task.size_log2 - 1);
         } else {
             if data.mask9_waiting == 0 {
                 data.arr = algorithm::nine_children_overlapping(mem, nw, ne, sw, se);
@@ -553,8 +555,7 @@ where
 
             // Bias `waiting_cnt` so concurrent notifiers cannot drive it
             // to zero while we are still scanning.
-            data.waiting_cnt
-                .fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
             for (i, x) in data.arr.iter_mut().enumerate() {
                 if data.mask9_waiting & (1 << i) == 0 {
                     continue;
@@ -592,8 +593,7 @@ where
         data.mask4_waiting = 0b1111;
     }
 
-    data.waiting_cnt
-        .fetch_add(WAITING_BIAS, Ordering::Relaxed);
+    data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
     for (i, x) in data.arr.iter_mut().take(4).enumerate() {
         if data.mask4_waiting & (1 << i) == 0 {
             continue;
@@ -756,8 +756,7 @@ pub(super) fn handle_dependency<Meta: Default + Sync, Dep: Copy>(
         // `cur` has `PENDING` or `ACTIVE` set and no `DEPS_LOCK`. Try to
         // grab the lock without disturbing the work-status bits.
         let want = cur | status::DEPS_LOCK;
-        if n
-            .status
+        if n.status
             .compare_exchange_weak(cur, want, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
@@ -765,8 +764,7 @@ pub(super) fn handle_dependency<Meta: Default + Sync, Dep: Copy>(
                 .get_ref::<ProcessingData<Dep>>()
                 .dependents
                 .push(dep);
-            n.status
-                .fetch_and(!status::DEPS_LOCK, Ordering::Release);
+            n.status.fetch_and(!status::DEPS_LOCK, Ordering::Release);
             record_metric(spinner.count(), MetricKind::HandleDep);
             return DependencyHandlingResult::StartedByOtherThread;
         }

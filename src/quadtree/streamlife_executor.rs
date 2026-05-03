@@ -204,7 +204,7 @@ impl<'a> StreamLifeExecutor<'a> {
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(num_threads);
             for (thread_idx, (bi_queue, hash_queue)) in
-                bi_queues.into_iter().zip(hash_queues.into_iter()).enumerate()
+                bi_queues.into_iter().zip(hash_queues).enumerate()
             {
                 let executor_thread = BiExecutorThread {
                     engine: self.engine,
@@ -313,8 +313,7 @@ impl<'a> BiExecutorThread<'a> {
 
         'outer: loop {
             // Cancellation: load factor exceeded on either store.
-            if self.engine.base.mem.exceeds_load_factor()
-                || self.bicache_ref.exceeds_load_factor()
+            if self.engine.base.mem.exceeds_load_factor() || self.bicache_ref.exceeds_load_factor()
             {
                 break;
             }
@@ -361,7 +360,7 @@ impl<'a> BiExecutorThread<'a> {
                 // descended from them).
                 for _ in 0..Self::STEAL_ATTEMPTS {
                     let victim = self.random_victim(&mut rng, n);
-                    if self.bi_stealers[victim].len() > 0
+                    if !self.bi_stealers[victim].is_empty()
                         && let Some(task) = self.try_steal_bi(victim)
                     {
                         last_bi_victim = victim;
@@ -369,7 +368,7 @@ impl<'a> BiExecutorThread<'a> {
                         wait_duration = Self::INITIAL_WAIT;
                         continue 'outer;
                     }
-                    if self.hash_stealers[victim].len() > 0
+                    if !self.hash_stealers[victim].is_empty()
                         && let Some(task) = self.try_steal_hash(victim)
                     {
                         last_hash_victim = victim;
@@ -411,8 +410,7 @@ impl<'a> BiExecutorThread<'a> {
 
     fn try_steal_bi(&self, victim: usize) -> Option<BiTask> {
         loop {
-            let result = self.bi_stealers[victim]
-                .steal_batch_with_limit_and_pop(&self.bi_queue, 1);
+            let result = self.bi_stealers[victim].steal_batch_with_limit_and_pop(&self.bi_queue, 1);
             record_steal(&result);
             match result {
                 Steal::Success(task) => return Some(task),
@@ -424,8 +422,8 @@ impl<'a> BiExecutorThread<'a> {
 
     fn try_steal_hash(&self, victim: usize) -> Option<Task> {
         loop {
-            let result = self.hash_stealers[victim]
-                .steal_batch_with_limit_and_pop(&self.hash_queue, 1);
+            let result =
+                self.hash_stealers[victim].steal_batch_with_limit_and_pop(&self.hash_queue, 1);
             record_steal(&result);
             match result {
                 Steal::Success(task) => return Some(task),
@@ -598,14 +596,12 @@ impl<'a> BiExecutorThread<'a> {
         };
 
         if data.hash_mask != 0 {
-            data.waiting_cnt
-                .fetch_add(WAITING_BIAS, Ordering::Relaxed);
-            for b in 0..2 {
+            data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            for (b, target) in targets.iter().enumerate() {
                 if data.hash_mask & (1 << b) == 0 {
                     continue;
                 }
-                let target = targets[b];
-                let target_node = self.node_ref.get(target);
+                let target_node = self.node_ref.get(*target);
                 match handle_dependency(target_node, dep) {
                     DependencyHandlingResult::Ready => {
                         data.hash_mask &= !(1 << b);
@@ -613,16 +609,14 @@ impl<'a> BiExecutorThread<'a> {
                     }
                     DependencyHandlingResult::StartedByThisThread => {
                         data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                        self.hash_queue.push(Task::new(target, size_log2));
+                        self.hash_queue.push(Task::new(*target, size_log2));
                     }
                     DependencyHandlingResult::StartedByOtherThread => {
                         data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
-            let prev = data
-                .waiting_cnt
-                .fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+            let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
             if data.hash_mask != 0 {
                 if prev == WAITING_BIAS {
                     self.bi_queue.push(BiTask {
@@ -642,7 +636,8 @@ impl<'a> BiExecutorThread<'a> {
             let (i3, ind3) = if idx.0 == b { (i2, idx.1) } else { (i1, idx.0) };
             // Sync: lane query (kept synchronous in v1; node2lanes uses its
             // own spinner-on-status_extra for in-flight waits).
-            let lanes = algorithm::node2lanes(&self.node_ref, &engine.base.blank_nodes, ind3, size_log2);
+            let lanes =
+                algorithm::node2lanes(&self.node_ref, &engine.base.blank_nodes, ind3, size_log2);
             let blank_child = engine.base.blank_nodes.get(size_log2 - 1);
             if lanes & 0xf0 != 0 {
                 (blank_child, i3)
@@ -671,8 +666,7 @@ impl<'a> BiExecutorThread<'a> {
         };
 
         if data.hash_mask != 0 {
-            data.waiting_cnt
-                .fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
             // Only bit 0 is used for Phase Base.
             let target_node = self.node_ref.get(merged);
             match handle_dependency(target_node, dep) {
@@ -688,9 +682,7 @@ impl<'a> BiExecutorThread<'a> {
                     data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            let prev = data
-                .waiting_cnt
-                .fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+            let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
             if data.hash_mask != 0 {
                 if prev == WAITING_BIAS {
                     self.bi_queue.push(BiTask {
@@ -730,8 +722,7 @@ impl<'a> BiExecutorThread<'a> {
 
         // Stage 1: Wait for 9 overlapping children (if both_stages).
         if data.mask4_waiting == 0 && data.mask9_waiting != 0 {
-            data.waiting_cnt
-                .fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
             for i in 0..9 {
                 if data.mask9_waiting & (1 << i) == 0 {
                     continue;
@@ -758,9 +749,7 @@ impl<'a> BiExecutorThread<'a> {
                     }
                 }
             }
-            let prev = data
-                .waiting_cnt
-                .fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+            let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
             if data.mask9_waiting != 0 {
                 if prev == WAITING_BIAS {
                     self.bi_queue.push(BiTask {
@@ -783,8 +772,7 @@ impl<'a> BiExecutorThread<'a> {
         }
 
         // Stage 2: Wait for 4 final children.
-        data.waiting_cnt
-            .fetch_add(WAITING_BIAS, Ordering::Relaxed);
+        data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
         for i in 0..4 {
             if data.mask4_waiting & (1 << i) == 0 {
                 continue;
@@ -810,9 +798,7 @@ impl<'a> BiExecutorThread<'a> {
                 }
             }
         }
-        let prev = data
-            .waiting_cnt
-            .fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+        let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
         if data.mask4_waiting != 0 {
             if prev == WAITING_BIAS {
                 self.bi_queue.push(BiTask {

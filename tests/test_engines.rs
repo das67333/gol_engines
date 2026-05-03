@@ -83,9 +83,7 @@ mod tests {
                 for engine_kind in ["hashlife", "streamlife"] {
                     let mut engine: Box<dyn GoLEngine> = match engine_kind {
                         "hashlife" => Box::new(HashLifeEngine::new(mem_limit_mib, threads_cnt)),
-                        "streamlife" => {
-                            Box::new(StreamLifeEngine::new(mem_limit_mib, threads_cnt))
-                        }
+                        "streamlife" => Box::new(StreamLifeEngine::new(mem_limit_mib, threads_cnt)),
                         _ => unreachable!(),
                     };
                     engine.load_pattern(&pattern, Topology::Torus).unwrap();
