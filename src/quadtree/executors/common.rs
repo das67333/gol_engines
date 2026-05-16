@@ -1,13 +1,5 @@
-//! # Parallel Hashlife Executor
-//!
-//! This module implements a work-stealing parallel executor for the Hashlife algorithm.
-//!
-//! ## Architecture
-//!
-//! The executor uses thread-local LIFO queues with work-stealing for load balancing:
-//! - Each thread has its own `Worker<Task>` queue
-//! - When a thread runs out of work, it steals from other threads via `Stealer`
-//! - No global queue is used - all tasks go directly to thread-local queues
+//! Shared executor primitives: status state machine, processing data,
+//! task types, work-stealing fetcher, and dependency handling.
 //!
 //! ## Status State Machine
 //!
@@ -63,10 +55,9 @@
 //! thread that observes the counter become zero (either the owner upon
 //! `fetch_sub(BIAS)` or the last notifier) re-queues the parent task.
 
-use super::{
+use super::super::{
     LEAF_SIZE, LEAF_SIZE_LOG2, algorithm,
-    hashlife::HashLifeEngine,
-    hashtable::{Idx, NodeAccess, NodeStore, NodeStoreRef},
+    hashtable::{Idx, NodeAccess},
     node::QuadTreeNode,
     sharded_statistics::*,
     spin::Spinner,
@@ -85,7 +76,7 @@ use std::{
 /// value strictly greater than the maximum number of in-flight registrations
 /// per scan suffices; we choose a clearly out-of-band value so the counter
 /// never collides with a real outstanding-dependency count.
-const WAITING_BIAS: u16 = 1 << 15;
+pub const WAITING_BIAS: u16 = 1 << 15;
 
 /// Temporary data allocated during node processing.
 ///
@@ -96,29 +87,29 @@ const WAITING_BIAS: u16 = 1 << 15;
 /// `ProcessingData<Idx>`. StreamLife runs that drive HashLife nodes
 /// asynchronously use `ProcessingData<Dependent>` so a binode task can
 /// register itself as a waiter. The `cache` field on
-/// [`super::node::QuadTreeNode`] is type-erased, so per-run instantiation is
+/// [`QuadTreeNode`] is type-erased, so per-run instantiation is
 /// safe as long as a single run is consistent (cleared via `run_gc` /
 /// `load_pattern` between runs).
 ///
 /// `dependents` uses `SmallVec<[_; 2]>` to avoid heap allocation in the
 /// common case (>>99.99% of nodes have 1 dependent). A capacity of 2 is used
 /// because it does not increase the struct size vs. a capacity of 1.
-pub(super) struct ProcessingData<Dep> {
+pub struct ProcessingData<Dep> {
     /// Intermediate child node results (up to 9 for overlapping, 4 for final stage).
-    pub(super) arr: [Idx; 9],
+    pub arr: [Idx; 9],
     /// Bitmask: bit `i` set if `arr[i]` (among first 9) is not yet computed.
-    pub(super) mask9_waiting: u32,
+    pub mask9_waiting: u32,
     /// Bitmask: bit `i` set if `arr[i]` (among first 4) is not yet computed.
-    pub(super) mask4_waiting: u32,
+    pub mask4_waiting: u32,
     /// Count of dependencies still being computed. The node resumes when this
     /// reaches 0. Manipulated lock-free with the bias trick (see module docs).
-    pub(super) waiting_cnt: AtomicU16,
+    pub waiting_cnt: AtomicU16,
     /// Nodes / binodes that registered as dependents of this node.
     /// Notified when this node finishes.
     ///
     /// Mutated by the owner exclusively during the init/finish barriers, and
     /// by pushers in parallel under [`status::DEPS_LOCK`].
-    pub(super) dependents: SmallVec<[Dep; 2]>,
+    pub dependents: SmallVec<[Dep; 2]>,
 }
 
 impl<Dep> Default for ProcessingData<Dep> {
@@ -134,18 +125,18 @@ impl<Dep> Default for ProcessingData<Dep> {
 }
 
 /// A unit of work representing a node to be processed.
-pub(super) struct Task {
-    pub(super) idx: Idx,
-    pub(super) size_log2: u32,
+pub struct Task {
+    pub idx: Idx,
+    pub size_log2: u32,
 }
 
 impl Task {
-    pub(super) fn new(idx: Idx, size_log2: u32) -> Self {
+    pub fn new(idx: Idx, size_log2: u32) -> Self {
         Self { idx, size_log2 }
     }
 }
 
-pub(super) struct TaskFetcher<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> {
+pub struct TaskFetcher<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> {
     thread_idx: usize,
     queue: &'a Worker<T>,
     stealers: &'a [Stealer<T>],
@@ -161,7 +152,7 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
     const INITIAL_WAIT_DURATION: Duration = Duration::from_micros(100);
     const MAX_WAIT_DURATION: Duration = Duration::from_millis(100);
 
-    pub(super) fn new(
+    pub fn new(
         thread_idx: usize,
         queue: &'a Worker<T>,
         stealers: &'a [Stealer<T>],
@@ -181,7 +172,7 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
 
     /// Fetch a task from local queue or steal from other threads.
     /// Records steal/last-victim stats via thread-local execution statistics.
-    pub(super) fn fetch_task(&mut self) -> Option<T> {
+    pub fn fetch_task(&mut self) -> Option<T> {
         if (self.cancel_condition)() {
             return None;
         }
@@ -250,213 +241,8 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
     }
 }
 
-/// Parallel executor for Hashlife algorithm using work-stealing.
-pub(super) struct HashLifeExecutor<'a, Meta: Default + Sync> {
-    root: Idx,
-    size_log2: u32,
-    generations_log2: u32,
-    mem: &'a NodeStore<Meta>,
-}
-
-impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
-    pub(super) fn new(base: &'a HashLifeEngine<Meta>) -> Self {
-        Self {
-            root: base.root,
-            size_log2: base.size_log2,
-            generations_log2: base.generations_per_update_log2.unwrap(),
-            mem: &base.mem,
-        }
-    }
-
-    pub(super) fn run(&self, num_threads: usize) -> Option<Idx> {
-        let timer = std::time::Instant::now();
-        // Create worker queues and stealers
-        let mut queues = Vec::with_capacity(num_threads);
-        let mut stealers = Vec::with_capacity(num_threads);
-
-        for _ in 0..num_threads {
-            let queue = Worker::new_lifo();
-            let stealer = queue.stealer();
-            queues.push(queue);
-            stealers.push(stealer);
-        }
-
-        let root_node = self.mem.get(self.root);
-        start_processing_node::<Meta, Idx>(root_node, smallvec![]);
-        queues[0].push(Task::new(self.root, self.size_log2));
-
-        let mut total_stats = ExecutionStatistics::new();
-        thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(num_threads);
-            for (thread_idx, queue) in queues.into_iter().enumerate() {
-                let executor_thread = ExecutorThread {
-                    root_node,
-                    generations_log2: self.generations_log2,
-                    mem: self.mem.create_ref(thread_idx),
-                    thread_idx,
-                    queue,
-                    stealers: &stealers,
-                };
-                handles.push(scope.spawn(move || executor_thread.run()));
-            }
-
-            for handle in handles {
-                total_stats.merge_from(&handle.join().unwrap());
-            }
-        });
-
-        if self.mem.exceeds_load_factor() {
-            self.free_orphaned_processing_data();
-            return None;
-        }
-
-        assert!(is_finished(&self.mem.get(self.root).status));
-        println!("Time spent on hashlife executor: {:?}", timer.elapsed());
-        println!("Nodes count: {} / {}", self.mem.len(), self.mem.capacity());
-        #[cfg(feature = "statistics")]
-        println!("{total_stats}");
-
-        Some(root_node.cache.get_value())
-    }
-
-    /// Drop `ProcessingData` boxes orphaned by cancellation. Must be called
-    /// from a single-threaded context after `thread::scope` has joined; only
-    /// PENDING slots own a live box at that point.
-    fn free_orphaned_processing_data(&self) {
-        self.mem.for_each_idx(|idx| {
-            let n = self.mem.get(idx);
-            let status = n.status.load(Ordering::Relaxed);
-            if status == status::PENDING {
-                let pd: &mut ProcessingData<Idx> = n.cache.get_ref();
-                // SAFETY: produced by `Box::into_raw` in
-                // `start_processing_node`; all workers have joined.
-                unsafe { drop(Box::from_raw(pd as *mut ProcessingData<Idx>)) };
-            }
-        });
-    }
-}
-
-struct ExecutorThread<'a, Meta: Default + Sync> {
-    root_node: &'a QuadTreeNode<Meta>,
-    generations_log2: u32,
-    mem: NodeStoreRef<'a, Meta>,
-    thread_idx: usize,
-    queue: Worker<Task>,
-    stealers: &'a [Stealer<Task>],
-}
-
-impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
-    fn run(&self) -> ExecutionStatistics {
-        let mut fetcher = TaskFetcher::new(
-            self.thread_idx,
-            &self.queue,
-            self.stealers,
-            || is_finished(&self.root_node.status),
-            || self.mem.exceeds_load_factor(),
-        );
-        set_current_execution_stats();
-
-        while let Some(task) = fetcher.fetch_task() {
-            let start = Ticks::now();
-            self.process_task(task);
-            record_task_duration(Ticks::now().elapsed_since(start));
-        }
-
-        take_current_execution_stats().unwrap()
-    }
-
-    /// Process a single task: compute the node's result or park it.
-    ///
-    /// Flow:
-    /// 1. Acquire owner-mutex by transitioning `PENDING → ACTIVE` (preserving
-    ///    any currently-held `DEPS_LOCK`).
-    /// 2. Call `update_node` to compute the result or register dependencies.
-    /// 3. If a result is ready: cross the finish barrier (`ACTIVE → PROCESSING`
-    ///    once `DEPS_LOCK` clears), drain the dependents list, publish the
-    ///    value, transition to `FINISHED`, and notify dependents.
-    /// 4. If dependencies are needed: guard drop transitions `ACTIVE → PENDING`
-    ///    while preserving `DEPS_LOCK`.
-    fn process_task(&self, task: Task) {
-        let n = self.mem.get(task.idx);
-        let mut guard = ProcessingGuard::new(&n.status, MetricKind::ProcessTask);
-        let data: &mut ProcessingData<Idx> = n.cache.get_ref();
-        if let Some(result) = self.update_node(&task, n.parts(), data) {
-            // Cross the finish barrier so pushers stop touching `data` and the
-            // cache slot, then drain dependents, publish the value, and mark
-            // the node FINISHED.
-            guard.enter_finish_barrier(MetricKind::NotifyDep);
-            let mut dependents = SmallVec::new();
-            mem::swap(&mut data.dependents, &mut dependents);
-            n.cache.set_value(result);
-            guard.publish_finished();
-            unsafe { drop(Box::from_raw(data as *mut ProcessingData<Idx>)) };
-            self.notify_dependents(&task, dependents);
-        }
-    }
-
-    /// Compute node result by processing its children/dependencies.
-    ///
-    /// Returns `Some(result)` if computation completes, `None` if waiting for dependencies.
-    ///
-    /// ## Hashlife Algorithm
-    ///
-    /// For non-leaf nodes, computation happens in stages:
-    /// 1. **Stage 1** (if `both_stages`): Compute 9 overlapping children
-    /// 2. **Stage 2**: Compute 4 final children from the 9 (or directly if single-stage)
-    /// 3. Combine the 4 children into final result
-    ///
-    /// ## Dependency Handling
-    ///
-    /// When a child is not ready:
-    /// - `Ready`: Child already computed, use cached result
-    /// - `StartedByThisThread`: We claimed the child, register as dependent, push to local queue
-    /// - `StartedByOtherThread`: Another thread processing it, register as dependent
-    ///
-    /// When the function returns `None` because at least one child is still
-    /// in flight, ownership of "wake-up duty" is transferred via the
-    /// `waiting_cnt` bias trick: whichever thread observes the counter become
-    /// zero (this owner via `fetch_sub(WAITING_BIAS)` or the last notifier
-    /// via `fetch_sub(1)`) is responsible for re-queuing the parent task.
-    fn update_node(
-        &self,
-        task: &Task,
-        parts: [Idx; 4],
-        data: &mut ProcessingData<Idx>,
-    ) -> Option<Idx> {
-        update_node_async(
-            &self.mem,
-            &self.queue,
-            self.generations_log2,
-            task,
-            parts,
-            data,
-            task.idx,
-        )
-    }
-
-    /// Notify dependent nodes that this dependency has completed.
-    ///
-    /// For each dependent we atomically decrement its `waiting_cnt`. The
-    /// thread that drives the counter to zero (this notifier or the owner's
-    /// own `fetch_sub(WAITING_BIAS)` at the end of its scan) is responsible
-    /// for re-queuing the parent. Notifiers do not take any lock on the
-    /// dependent node: `waiting_cnt` is atomic, and `ProcessingData` stays
-    /// alive until `FINISHED` (which only the owner can publish, after the
-    /// counter has dropped to zero).
-    fn notify_dependents(&self, task: &Task, dependents: SmallVec<[Idx; 2]>) {
-        for &dependent in dependents.iter() {
-            let n = self.mem.get(dependent);
-            let dep_data: &ProcessingData<Idx> = n.cache.get_ref();
-            let prev = dep_data.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
-            if prev == 1 {
-                self.queue.push(Task::new(dependent, task.size_log2 + 1));
-            }
-        }
-    }
-}
-
 /// Check if a status field indicates FINISHED.
-pub(super) fn is_finished(status: &AtomicU8) -> bool {
+pub fn is_finished(status: &AtomicU8) -> bool {
     status.load(Ordering::Acquire) & status::FINISHED != 0
 }
 
@@ -471,7 +257,7 @@ pub(super) fn is_finished(status: &AtomicU8) -> bool {
 /// 3. `fetch_xor` flips `PROCESSING → PENDING`, releasing the barrier with
 ///    Release semantics so subsequent pushers observe the freshly-installed
 ///    `ProcessingData`.
-pub(super) fn start_processing_node<Meta: Default + Sync, Dep>(
+pub fn start_processing_node<Meta: Default + Sync, Dep>(
     node: &QuadTreeNode<Meta>,
     dependents: SmallVec<[Dep; 2]>,
 ) -> bool {
@@ -518,7 +304,7 @@ pub(super) fn start_processing_node<Meta: Default + Sync, Dep>(
 /// `Dep = Dependent` and a tagged-enum value identifying the parent task.
 /// HashLife runtime path is unchanged: monomorphization with `Dep = Idx`
 /// emits today's exact code.
-pub(super) fn update_node_async<Meta, Dep>(
+pub fn update_node_async<Meta, Dep>(
     mem: &impl NodeAccess<Meta>,
     queue: &Worker<Task>,
     generations_log2: u32,
@@ -631,7 +417,7 @@ where
 /// `DEPS_LOCK` overlay bit. If neither `enter_finish_barrier` nor
 /// `publish_finished` is called, `Drop` reverts `ACTIVE → PENDING` (again
 /// preserving `DEPS_LOCK`).
-pub(super) struct ProcessingGuard<'a> {
+pub struct ProcessingGuard<'a> {
     status: &'a AtomicU8,
     released: bool,
 }
@@ -639,7 +425,7 @@ pub(super) struct ProcessingGuard<'a> {
 impl<'a> ProcessingGuard<'a> {
     /// Acquire the owner-mutex by transitioning `PENDING → ACTIVE`. Spins
     /// while `PENDING` is not observable (e.g. `PROCESSING` init barrier).
-    pub(super) fn new(status: &'a AtomicU8, kind: MetricKind) -> Self {
+    pub fn new(status: &'a AtomicU8, kind: MetricKind) -> Self {
         let mut spinner = Spinner::new();
         loop {
             let cur = status.load(Ordering::Acquire);
@@ -664,7 +450,7 @@ impl<'a> ProcessingGuard<'a> {
     /// `DEPS_LOCK` is clear. After this returns, no pusher can observe the
     /// node as live, so the caller may safely write the result into the
     /// cache slot and drain the dependents list.
-    pub(super) fn enter_finish_barrier(&mut self, kind: MetricKind) {
+    pub fn enter_finish_barrier(&mut self, kind: MetricKind) {
         let mut spinner = Spinner::new();
         while self
             .status
@@ -686,7 +472,7 @@ impl<'a> ProcessingGuard<'a> {
     /// Publish the terminal state: `PROCESSING → FINISHED`. Must be called
     /// after [`Self::enter_finish_barrier`] and after the result has been
     /// written into the cache slot.
-    pub(super) fn publish_finished(self) {
+    pub fn publish_finished(self) {
         self.status.store(status::FINISHED, Ordering::Release);
         mem::forget(self);
     }
@@ -703,7 +489,7 @@ impl<'a> Drop for ProcessingGuard<'a> {
 }
 
 /// Result of attempting to handle a dependency.
-pub(super) enum DependencyHandlingResult {
+pub enum DependencyHandlingResult {
     /// Dependency already computed, result available in cache
     Ready,
     /// This thread successfully claimed the dependency for processing
@@ -724,7 +510,7 @@ pub(super) enum DependencyHandlingResult {
 /// use `Dep = Dependent` (a tagged enum that distinguishes a HashLife waiter
 /// from a binode waiter). The `ProcessingData<Dep>` allocated for `n` must
 /// be of the same flavor across a single run.
-pub(super) fn handle_dependency<Meta: Default + Sync, Dep: Copy>(
+pub fn handle_dependency<Meta: Default + Sync, Dep: Copy>(
     n: &QuadTreeNode<Meta>,
     dep: Dep,
 ) -> DependencyHandlingResult {

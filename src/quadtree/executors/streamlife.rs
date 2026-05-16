@@ -33,16 +33,18 @@
 //! engines.
 
 use super::{
-    LEAF_SIZE_LOG2, algorithm,
-    hashlife_executor::{
-        DependencyHandlingResult, ProcessingData, ProcessingGuard, Task, handle_dependency,
-        is_finished, update_node_async,
+    super::{
+        LEAF_SIZE_LOG2, algorithm,
+        hashtable::{BinodeCache, BinodeCacheRef, Idx, NodeStoreRef},
+        sharded_statistics::*,
+        spin::Spinner,
+        status,
+        streamlife::StreamLifeEngine,
     },
-    hashtable::{BinodeCache, BinodeCacheRef, Idx, NodeStoreRef},
-    sharded_statistics::*,
-    spin::Spinner,
-    status,
-    streamlife::StreamLifeEngine,
+    common::{
+        DependencyHandlingResult, ProcessingData, ProcessingGuard, Task, WAITING_BIAS,
+        handle_dependency, is_finished, update_node_async,
+    },
 };
 use crossbeam::deque::{Steal, Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
@@ -53,17 +55,13 @@ use std::{
     time::Duration,
 };
 
-/// Bias added to `waiting_cnt` while the owner is scanning children. See
-/// [`super::hashlife_executor`] for the full rationale.
-const WAITING_BIAS: u16 = 1 << 15;
-
 /// A unit of work representing a binode pair to be processed.
 #[derive(Clone, Copy)]
-pub(super) struct BiTask {
+pub struct BiTask {
     /// Index into the BinodeCache for this binode pair.
-    pub(super) entry_idx: Idx,
+    pub entry_idx: Idx,
     /// Size (log2) of the nodes in this pair.
-    pub(super) size_log2: u32,
+    pub size_log2: u32,
 }
 
 /// Tagged dependent for a HashLife `QuadTreeNode` processed during a
@@ -77,7 +75,7 @@ pub(super) struct BiTask {
 /// on a HashLife node at the *same* level, while a HashLife child is at one
 /// level below its parent.
 #[derive(Clone, Copy)]
-pub(super) enum Dependent {
+pub enum Dependent {
     Node { idx: Idx, size_log2: u32 },
     Binode { entry_idx: Idx, size_log2: u32 },
 }
@@ -152,14 +150,14 @@ impl Default for BiProcessingData {
 }
 
 /// Parallel executor for StreamLife's `update_binode` using work-stealing.
-pub(super) struct StreamLifeExecutor<'a> {
+pub struct StreamLifeExecutor<'a> {
     engine: &'a StreamLifeEngine,
     biroot: (Idx, Idx),
     size_log2: u32,
 }
 
 impl<'a> StreamLifeExecutor<'a> {
-    pub(super) fn new(engine: &'a StreamLifeEngine, biroot: (Idx, Idx), size_log2: u32) -> Self {
+    pub fn new(engine: &'a StreamLifeEngine, biroot: (Idx, Idx), size_log2: u32) -> Self {
         Self {
             engine,
             biroot,
@@ -167,7 +165,7 @@ impl<'a> StreamLifeExecutor<'a> {
         }
     }
 
-    pub(super) fn run(&self, num_threads: usize) -> Option<(Idx, Idx)> {
+    pub fn run(&self, num_threads: usize) -> Option<(Idx, Idx)> {
         let timer = std::time::Instant::now();
         let bicache = &self.engine.bicache;
 

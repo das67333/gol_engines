@@ -1,7 +1,7 @@
 use super::{
     LEAF_SIZE_LOG2,
     blank::BlankNodes,
-    hashlife_executor::HashLifeExecutor,
+    executors::HashLifeExecutor,
     hashtable::{Idx, NodeStore},
     node::QuadTreeNode,
 };
@@ -122,8 +122,9 @@ impl<Meta: Default + Sync> HashLifeEngine<Meta> {
                 let cells = u64::from_le_bytes(n.leaf_cells());
                 pattern.find_or_create_node(PatternNode::Leaf(cells))
             } else {
-                let [nw, ne, sw, se] =
-                    n.parts().map(|x| walk(x, size_log2 - 1, mem, pattern, cache));
+                let [nw, ne, sw, se] = n
+                    .parts()
+                    .map(|x| walk(x, size_log2 - 1, mem, pattern, cache));
                 pattern.find_or_create_node(PatternNode::Node { nw, ne, sw, se })
             };
             cache.insert(idx, result);
@@ -186,7 +187,10 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
     }
 
     fn update(&mut self, generations_log2: u32) -> Result<[BigInt; 2]> {
-        if self.generations_per_update_log2.is_some_and(|g| g != generations_log2) {
+        if self
+            .generations_per_update_log2
+            .is_some_and(|g| g != generations_log2)
+        {
             self.run_gc();
         }
         let backup = self.current_state();

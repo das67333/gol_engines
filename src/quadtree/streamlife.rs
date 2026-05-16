@@ -1,9 +1,9 @@
 use super::{
     algorithm,
+    executors::StreamLifeExecutor,
     hashlife::HashLifeEngine,
     hashtable::{BinodeCache, CacheEntry, Idx},
     node::QuadTreeNode,
-    streamlife_executor::StreamLifeExecutor,
 };
 use crate::{GoLEngine, Pattern, Topology};
 use anyhow::{Result, anyhow};

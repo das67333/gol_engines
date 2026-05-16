@@ -1,13 +1,12 @@
 mod algorithm;
 mod blank;
+mod executors;
 mod hashlife;
-mod hashlife_executor;
 mod hashtable;
 mod node;
 mod sharded_statistics;
 mod spin;
 mod streamlife;
-mod streamlife_executor;
 
 const LEAF_SIZE: u64 = 8;
 const LEAF_SIZE_LOG2: u32 = LEAF_SIZE.ilog2();
