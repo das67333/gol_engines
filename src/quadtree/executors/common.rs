@@ -96,20 +96,20 @@ pub const WAITING_BIAS: u16 = 1 << 15;
 /// because it does not increase the struct size vs. a capacity of 1.
 pub struct ProcessingData<Dep> {
     /// Intermediate child node results (up to 9 for overlapping, 4 for final stage).
-    pub arr: [Idx; 9],
+    arr: [Idx; 9],
     /// Bitmask: bit `i` set if `arr[i]` (among first 9) is not yet computed.
-    pub mask9_waiting: u32,
+    mask9_waiting: u32,
     /// Bitmask: bit `i` set if `arr[i]` (among first 4) is not yet computed.
-    pub mask4_waiting: u32,
+    mask4_waiting: u32,
     /// Count of dependencies still being computed. The node resumes when this
     /// reaches 0. Manipulated lock-free with the bias trick (see module docs).
-    pub waiting_cnt: AtomicU16,
+    waiting_cnt: AtomicU16,
     /// Nodes / binodes that registered as dependents of this node.
     /// Notified when this node finishes.
     ///
     /// Mutated by the owner exclusively during the init/finish barriers, and
     /// by pushers in parallel under [`status::DEPS_LOCK`].
-    pub dependents: SmallVec<[Dep; 2]>,
+    dependents: SmallVec<[Dep; 2]>,
 }
 
 impl<Dep> Default for ProcessingData<Dep> {
@@ -121,6 +121,16 @@ impl<Dep> Default for ProcessingData<Dep> {
             waiting_cnt: AtomicU16::new(0),
             dependents: SmallVec::new(),
         }
+    }
+}
+
+impl<Dep> ProcessingData<Dep> {
+    pub fn decrement_waiting_cnt(&self) -> u16 {
+        self.waiting_cnt.fetch_sub(1, Ordering::AcqRel)
+    }
+
+    pub fn take_dependents(&mut self) -> SmallVec<[Dep; 2]> {
+        mem::take(&mut self.dependents)
     }
 }
 

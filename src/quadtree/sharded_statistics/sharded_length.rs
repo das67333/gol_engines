@@ -56,8 +56,8 @@ impl ShardedLength {
 }
 
 pub struct LengthShard<'a> {
-    pub local: &'a AtomicUsize,
-    pub global: &'a AtomicUsize,
+    local: &'a AtomicUsize,
+    global: &'a AtomicUsize,
 }
 
 impl<'a> LengthShard<'a> {

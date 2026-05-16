@@ -237,7 +237,7 @@ impl<'a> StreamLifeExecutor<'a> {
         #[cfg(feature = "statistics")]
         println!("{total_stats}");
 
-        Some(bicache.get(root_idx).payload.get_value())
+        Some(bicache.get(root_idx).payload().get_value())
     }
 
     /// Drop orphaned `ProcessingData<Dependent>` (HashLife nodes) and
@@ -251,7 +251,7 @@ impl<'a> StreamLifeExecutor<'a> {
             let entry = bicache.get(idx);
             let status = entry.status().load(Ordering::Relaxed);
             if status == status::PENDING {
-                let pd: &mut BiProcessingData = entry.payload.get_ref();
+                let pd: &mut BiProcessingData = entry.payload().get_ref();
                 // SAFETY: produced by `Box::into_raw` in
                 // `start_processing_entry`; all workers have joined.
                 unsafe { drop(Box::from_raw(pd as *mut BiProcessingData)) };
@@ -433,14 +433,13 @@ impl<'a> BiExecutorThread<'a> {
         let entry = self.bicache_ref.get(task.entry_idx);
         let status = entry.status();
         let mut guard = ProcessingGuard::new(status, MetricKind::ProcessTask);
-        let data: &mut BiProcessingData = entry.payload.get_ref();
+        let data: &mut BiProcessingData = entry.payload().get_ref();
         let idx = entry.key();
 
         if let Some(result) = self.update_binode(task.entry_idx, idx, task.size_log2, data) {
             guard.enter_finish_barrier(MetricKind::NotifyDep);
-            let mut dependents = SmallVec::new();
-            mem::swap(&mut data.dependents, &mut dependents);
-            entry.payload.set_value(result);
+            let dependents = mem::take(&mut data.dependents);
+            entry.payload().set_value(result);
             guard.publish_finished();
             unsafe { drop(Box::from_raw(data as *mut BiProcessingData)) };
             self.notify_bi_dependents(dependents);
@@ -470,8 +469,7 @@ impl<'a> BiExecutorThread<'a> {
         );
         if let Some(result) = result {
             guard.enter_finish_barrier(MetricKind::NotifyDep);
-            let mut dependents: SmallVec<[Dependent; 2]> = SmallVec::new();
-            mem::swap(&mut data.dependents, &mut dependents);
+            let dependents = data.take_dependents();
             n.cache.set_value(result);
             guard.publish_finished();
             unsafe { drop(Box::from_raw(data as *mut ProcessingData<Dependent>)) };
@@ -728,7 +726,7 @@ impl<'a> BiExecutorThread<'a> {
                 {
                     BiDependencyResult::Ready => {
                         data.mask9_waiting &= !(1 << i);
-                        let val = self.bicache_ref.get(child_idx).payload.get_value();
+                        let val = self.bicache_ref.get(child_idx).payload().get_value();
                         data.arr0[i] = val.0;
                         data.arr1[i] = val.1;
                     }
@@ -777,7 +775,7 @@ impl<'a> BiExecutorThread<'a> {
             match handle_bi_dependency(&engine.bicache, child_idx, parent_entry_idx, size_log2) {
                 BiDependencyResult::Ready => {
                     data.mask4_waiting &= !(1 << i);
-                    let val = self.bicache_ref.get(child_idx).payload.get_value();
+                    let val = self.bicache_ref.get(child_idx).payload().get_value();
                     data.arr0[i] = val.0;
                     data.arr1[i] = val.1;
                 }
@@ -827,7 +825,7 @@ impl<'a> BiExecutorThread<'a> {
     fn notify_bi_dependents(&self, dependents: SmallVec<[BiTask; 2]>) {
         for dep in dependents {
             let entry = self.bicache_ref.get(dep.entry_idx);
-            let dep_data: &BiProcessingData = entry.payload.get_ref();
+            let dep_data: &BiProcessingData = entry.payload().get_ref();
             let prev = dep_data.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
             if prev == 1 {
                 self.bi_queue.push(BiTask {
@@ -850,7 +848,7 @@ impl<'a> BiExecutorThread<'a> {
                 Dependent::Node { idx, size_log2 } => {
                     let n = self.node_ref.get(idx);
                     let pd: &ProcessingData<Dependent> = n.cache.get_ref();
-                    let prev = pd.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
+                    let prev = pd.decrement_waiting_cnt();
                     if prev == 1 {
                         self.hash_queue.push(Task::new(idx, size_log2));
                     }
@@ -860,7 +858,7 @@ impl<'a> BiExecutorThread<'a> {
                     size_log2,
                 } => {
                     let entry = self.bicache_ref.get(entry_idx);
-                    let pd: &BiProcessingData = entry.payload.get_ref();
+                    let pd: &BiProcessingData = entry.payload().get_ref();
                     let prev = pd.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
                     if prev == 1 {
                         self.bi_queue.push(BiTask {
@@ -910,7 +908,7 @@ fn start_processing_entry(
         dependents,
         ..Default::default()
     };
-    entry.payload.set_ptr(Box::into_raw(Box::new(pd)));
+    entry.payload().set_ptr(Box::into_raw(Box::new(pd)));
     status.fetch_xor(status::PROCESSING | status::PENDING, Ordering::Release);
     true
 }
@@ -979,7 +977,7 @@ fn handle_bi_dependency(
             .compare_exchange_weak(cur, want, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            let child_data: &mut BiProcessingData = child_entry.payload.get_ref();
+            let child_data: &mut BiProcessingData = child_entry.payload().get_ref();
             child_data.dependents.push(BiTask {
                 entry_idx: parent_entry_idx,
                 size_log2: parent_size_log2,

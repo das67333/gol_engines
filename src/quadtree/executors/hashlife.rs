@@ -19,7 +19,7 @@ use super::{
 };
 use crossbeam::deque::{Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
-use std::{mem, sync::atomic::Ordering, thread};
+use std::{sync::atomic::Ordering, thread};
 
 /// Parallel executor for Hashlife algorithm using work-stealing.
 pub struct HashLifeExecutor<'a, Meta: Default + Sync> {
@@ -156,8 +156,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
             // cache slot, then drain dependents, publish the value, and mark
             // the node FINISHED.
             guard.enter_finish_barrier(MetricKind::NotifyDep);
-            let mut dependents = SmallVec::new();
-            mem::swap(&mut data.dependents, &mut dependents);
+            let dependents = data.take_dependents();
             n.cache.set_value(result);
             guard.publish_finished();
             unsafe { drop(Box::from_raw(data as *mut ProcessingData<Idx>)) };
@@ -198,7 +197,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
         for &dependent in dependents.iter() {
             let n = self.mem.get(dependent);
             let dep_data: &ProcessingData<Idx> = n.cache.get_ref();
-            let prev = dep_data.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
+            let prev = dep_data.decrement_waiting_cnt();
             if prev == 1 {
                 self.queue.push(Task::new(dependent, task.size_log2 + 1));
             }

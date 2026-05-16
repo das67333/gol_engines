@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicU8, AtomicU32};
 pub struct CacheEntry {
     key: (Idx, Idx),
     /// Dual-purpose field: computed binode result or processing data pointer.
-    pub payload: CacheField<(Idx, Idx)>,
+    payload: CacheField<(Idx, Idx)>,
     /// Chain pointer (also free-list link when freed).
-    pub next: AtomicU32,
-    pub status: AtomicU8,
+    next: AtomicU32,
+    status: AtomicU8,
 }
 
 impl Default for CacheEntry {
@@ -36,6 +36,10 @@ impl HashtableSlot for CacheEntry {
 impl CacheEntry {
     pub fn key(&self) -> (Idx, Idx) {
         self.key
+    }
+
+    pub fn payload(&self) -> &CacheField<(Idx, Idx)> {
+        &self.payload
     }
 
     pub fn status(&self) -> &AtomicU8 {

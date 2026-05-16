@@ -39,7 +39,6 @@
 use super::super::sharded_statistics::{LengthShard, ShardedLength};
 use std::{
     cell::UnsafeCell,
-    mem, ptr,
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
 
@@ -52,8 +51,8 @@ pub type Idx = u32;
 pub const NULL_IDX: Idx = 0;
 
 /// Log2 of the per-chunk node count. 16 → 64 K nodes per chunk.
-pub const CHUNK_LOG2: u32 = 16;
-pub const CHUNK_SIZE: u32 = 1 << CHUNK_LOG2;
+const CHUNK_LOG2: u32 = 16;
+const CHUNK_SIZE: u32 = 1 << CHUNK_LOG2;
 const OFFSET_MASK: u32 = CHUNK_SIZE - 1;
 
 /// Bound on the number of `find_or_create_*` allocations a worker may issue
@@ -66,7 +65,7 @@ const OFFSET_MASK: u32 = CHUNK_SIZE - 1;
 /// 64 is a generous upper bound — measured worst-case is ~14
 /// (`nine_children_disjoint` 9 + `four_children_overlapping` 4 + final result
 /// 1).
-pub const MAX_ALLOCS_PER_TASK: usize = 64;
+const MAX_ALLOCS_PER_TASK: usize = 64;
 
 #[inline(always)]
 pub(super) fn chunk_id(idx: Idx) -> u32 {
@@ -120,7 +119,7 @@ unsafe impl<V: Copy> Sync for CacheField<V> {}
 impl<V: Copy> Default for CacheField<V> {
     fn default() -> Self {
         CacheField(UnsafeCell::new(PtrOrValue {
-            ptr: ptr::null_mut(),
+            ptr: std::ptr::null_mut(),
         }))
     }
 }
@@ -162,7 +161,7 @@ pub(super) struct Chunk<E> {
 impl<E> Chunk<E> {
     pub(super) fn new() -> Self {
         Self {
-            storage: AtomicPtr::new(ptr::null_mut()),
+            storage: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -180,10 +179,10 @@ impl<E> Chunk<E> {
     /// (called from `clear()` and `Drop`).
     pub(super) fn release(&mut self) {
         let raw = *self.storage.get_mut();
-        *self.storage.get_mut() = ptr::null_mut();
+        *self.storage.get_mut() = std::ptr::null_mut();
         if !raw.is_null() {
             unsafe {
-                let slice = ptr::slice_from_raw_parts_mut(raw, CHUNK_SIZE as usize);
+                let slice = std::ptr::slice_from_raw_parts_mut(raw, CHUNK_SIZE as usize);
                 drop(Box::from_raw(slice));
             }
         }
@@ -283,7 +282,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     ///
     /// `threads_cnt` is the number of shards (one `ThreadState` per shard).
     pub(super) fn new(cap_log2: u32, threads_cnt: usize) -> Self {
-        let max_cap_log2 = mem::size_of::<Idx>() as u32 * 8;
+        let max_cap_log2 = std::mem::size_of::<Idx>() as u32 * 8;
         assert!(
             cap_log2 <= max_cap_log2,
             "Hashtables bigger than 2^{max_cap_log2} are not supported"
@@ -293,7 +292,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         // Hard ceiling from the `Idx` encoding: chunk id fits in
         // `32 - CHUNK_LOG2` bits, so there are `2^(32 - CHUNK_LOG2)` chunk
         // slots in total (chunk 0 reserved as the null sentinel).
-        let chunk_id_count = 1usize << (mem::size_of::<Idx>() as u32 * 8 - CHUNK_LOG2);
+        let chunk_id_count = 1usize << (std::mem::size_of::<Idx>() as u32 * 8 - CHUNK_LOG2);
         // Reserve one chunk per shard for partial-chunk in-flight allocations
         // (each thread can have its own current_chunk only partially filled).
         // Plus chunk 0 reserved.
@@ -398,7 +397,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         unsafe {
             // Reset all fields to default state (handles free-list reuse
             // where the previous occupant left arbitrary contents).
-            ptr::write(new_ptr, E::default());
+            std::ptr::write(new_ptr, E::default());
             // Run caller-supplied initializer for the key fields.
             init(new_ptr);
             // Set the chain link.
@@ -533,10 +532,11 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         let next = self.next_chunk_id.load(Ordering::Relaxed) as usize;
         // Chunks 1..next have been claimed and have allocated storage.
         // Chunk 0 is reserved (no storage).
-        let chunk_storage = next.saturating_sub(1) * CHUNK_SIZE as usize * mem::size_of::<E>();
-        let chunks_table = self.chunks.len() * mem::size_of::<Chunk<E>>();
-        let buckets = self.buckets.len() * mem::size_of::<AtomicU32>();
-        let thread_states = self.thread_states.len() * mem::size_of::<UnsafeCell<ThreadState>>();
+        let chunk_storage = next.saturating_sub(1) * CHUNK_SIZE as usize * std::mem::size_of::<E>();
+        let chunks_table = self.chunks.len() * std::mem::size_of::<Chunk<E>>();
+        let buckets = self.buckets.len() * std::mem::size_of::<AtomicU32>();
+        let thread_states =
+            self.thread_states.len() * std::mem::size_of::<UnsafeCell<ThreadState>>();
         chunk_storage + chunks_table + buckets + thread_states
     }
 
