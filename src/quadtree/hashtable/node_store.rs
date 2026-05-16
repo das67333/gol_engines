@@ -1,7 +1,9 @@
 use super::{
-    super::{node::QuadTreeNode, sharded_statistics::LengthShard},
+    super::{LEAF_SIZE_LOG2, node::QuadTreeNode, sharded_statistics::LengthShard, status},
     base::{ConcurrentHashTable, Idx, NULL_IDX, compute_hash},
 };
+use ahash::AHashSet;
+use std::sync::atomic::Ordering;
 
 /// Shared interface for accessing nodes.
 pub trait NodeAccess<Meta: Default + Sync> {
@@ -191,6 +193,47 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
 
     pub fn exceeds_load_factor(&self) -> bool {
         self.inner.exceeds_load_factor()
+    }
+
+    /// Single-threaded GC: marks all nodes reachable from `roots` (at level
+    /// `size_log2`), then removes every unreachable node from the table's
+    /// bucket chains and returns it to the free list.
+    pub fn gc(&mut self, roots: &[Idx], size_log2: u32) {
+        let mut live: AHashSet<Idx> = AHashSet::new();
+        for &root in roots {
+            self.collect_reachable(root, size_log2, &mut live);
+        }
+        // Reset computation state on surviving nodes. GC is called to
+        // invalidate old cached results (e.g. step-size change), so FINISHED
+        // status and cached Idxs are always stale here.
+        // We intentionally leave `status_extra` and `extra` (StreamLife lane
+        // data) untouched — they depend only on cell structure, which is
+        // immutable for a given Idx.
+        for &idx in &live {
+            let n = self.get(idx);
+            n.status.store(0, Ordering::Relaxed);
+            n.cache.set_value(Idx::default());
+        }
+        self.inner.gc(|idx| !live.contains(&idx));
+    }
+
+    fn collect_reachable(&self, idx: Idx, size_log2: u32, live: &mut AHashSet<Idx>) {
+        if !live.insert(idx) {
+            return;
+        }
+        if size_log2 > LEAF_SIZE_LOG2 {
+            let n = self.get(idx);
+            for child in n.parts() {
+                self.collect_reachable(child, size_log2 - 1, live);
+            }
+            // Also follow the cached result for FINISHED nodes. The result is
+            // a structural node at level size_log2-1 that will likely be
+            // looked up again in future computations, so keeping it alive
+            // avoids re-allocating and re-inserting it.
+            if n.status.load(Ordering::Relaxed) & status::FINISHED != 0 {
+                self.collect_reachable(n.cache.get_value(), size_log2 - 1, live);
+            }
+        }
     }
 }
 

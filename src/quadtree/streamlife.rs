@@ -77,7 +77,11 @@ impl GoLEngine for StreamLifeEngine {
     }
 
     fn update(&mut self, generations_log2: u32) -> Result<[BigInt; 2]> {
-        if self.base.generations_per_update_log2 != Some(generations_log2) {
+        if self
+            .base
+            .generations_per_update_log2
+            .is_some_and(|g| g != generations_log2)
+        {
             self.run_gc();
         }
         let backup = self.current_state();
@@ -136,9 +140,22 @@ impl GoLEngine for StreamLifeEngine {
     }
 
     fn run_gc(&mut self) {
+        let nodes_before = self.base.mem.len();
+        let bicache_before = self.bicache.len();
+        let t = std::time::Instant::now();
         self.bicache.clear();
         self.biroot = None;
         self.base.run_gc();
+        let elapsed = t.elapsed();
+        let nodes_after = self.base.mem.len();
+        println!(
+            "StreamLife GC: {:?}  nodes {} → {} (freed {:.2}%)  bicache {} → 0",
+            elapsed,
+            nodes_before,
+            nodes_after,
+            100. * (1. - nodes_after as f64 / nodes_before as f64),
+            bicache_before,
+        );
     }
 
     fn bytes_total(&self) -> usize {

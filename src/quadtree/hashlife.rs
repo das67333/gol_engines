@@ -105,6 +105,38 @@ impl<Meta: Default + Sync> HashLifeEngine<Meta> {
         result
     }
 
+    /// Serialize the subtree rooted at `idx` into a `Pattern`.
+    pub(super) fn serialize_subtree(&self, idx: Idx) -> Pattern {
+        fn walk<Meta: Default + Sync>(
+            idx: Idx,
+            size_log2: u32,
+            mem: &NodeStore<Meta>,
+            pattern: &mut Pattern,
+            cache: &mut HashMap<Idx, u32>,
+        ) -> u32 {
+            if let Some(&p) = cache.get(&idx) {
+                return p;
+            }
+            let n = mem.get(idx);
+            let result = if size_log2 == LEAF_SIZE_LOG2 {
+                let cells = u64::from_le_bytes(n.leaf_cells());
+                pattern.find_or_create_node(PatternNode::Leaf(cells))
+            } else {
+                let [nw, ne, sw, se] =
+                    n.parts().map(|x| walk(x, size_log2 - 1, mem, pattern, cache));
+                pattern.find_or_create_node(PatternNode::Node { nw, ne, sw, se })
+            };
+            cache.insert(idx, result);
+            result
+        }
+
+        let mut cache = HashMap::new();
+        let mut pattern = Pattern::new(Some(self.size_log2));
+        let root = walk(idx, self.size_log2, &self.mem, &mut pattern, &mut cache);
+        unsafe { pattern.change_root(root, self.size_log2) };
+        pattern
+    }
+
     pub(super) fn with_capacity(cap_log2: u32, threads_cnt: usize) -> Self {
         let mem = NodeStore::new(cap_log2, threads_cnt);
         Self {
@@ -150,45 +182,11 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
     }
 
     fn current_state(&self) -> Pattern {
-        fn inner<Meta: Default + Sync>(
-            idx: Idx,
-            size_log2: u32,
-            mem: &NodeStore<Meta>,
-            pattern: &mut Pattern,
-            cache: &mut HashMap<Idx, u32>,
-        ) -> u32 {
-            if let Some(&cached) = cache.get(&idx) {
-                return cached;
-            }
-            let n = mem.get(idx);
-            let result = if size_log2 == LEAF_SIZE_LOG2 {
-                let cells = u64::from_le_bytes(n.leaf_cells());
-                pattern.find_or_create_node(PatternNode::Leaf(cells))
-            } else {
-                let [nw, ne, sw, se] = n
-                    .parts()
-                    .map(|x| inner(x, size_log2 - 1, mem, pattern, cache));
-                pattern.find_or_create_node(PatternNode::Node { nw, ne, sw, se })
-            };
-            cache.insert(idx, result);
-            result
-        }
-
-        let mut cache = HashMap::new();
-        let mut pattern = Pattern::new(Some(self.size_log2));
-        let root = inner(
-            self.root,
-            self.size_log2,
-            &self.mem,
-            &mut pattern,
-            &mut cache,
-        );
-        unsafe { pattern.change_root(root, self.size_log2) };
-        pattern
+        self.serialize_subtree(self.root)
     }
 
     fn update(&mut self, generations_log2: u32) -> Result<[BigInt; 2]> {
-        if self.generations_per_update_log2 != Some(generations_log2) {
+        if self.generations_per_update_log2.is_some_and(|g| g != generations_log2) {
             self.run_gc();
         }
         let backup = self.current_state();
@@ -230,13 +228,19 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
     }
 
     fn run_gc(&mut self) {
-        let pattern = self.current_state();
-        self.mem.clear();
+        let len_before = self.mem.len();
+        let t = std::time::Instant::now();
+        self.mem.gc(&[self.root], self.size_log2);
         self.blank_nodes.clear();
-        let mut cache = HashMap::new();
-        self.root =
-            Self::init_pattern_recursive(pattern.get_root(), &pattern, &self.mem, &mut cache);
-        self.generations_per_update_log2 = None;
+        let elapsed = t.elapsed();
+        let len_after = self.mem.len();
+        println!(
+            "HashLife GC: {:?}  nodes {} → {} (freed {:.2}%)",
+            elapsed,
+            len_before,
+            len_after,
+            100. * (1. - len_after as f64 / len_before as f64),
+        );
     }
 
     fn bytes_total(&self) -> usize {

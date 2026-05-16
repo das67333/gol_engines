@@ -45,24 +45,24 @@ const LEAF_SIZE_LOG2: u32 = LEAF_SIZE.ilog2();
 /// the bit-flag encoding is fully compatible: they simply write/compare the
 /// same constants.
 mod status {
-    pub(super) const NOT_STARTED: u8 = 0;
+    pub const NOT_STARTED: u8 = 0;
     /// Brief, exclusive barrier. Used for both async init (between claim and
     /// publication of `ProcessingData`) and async finish (between draining the
     /// dependents list and publishing the cached value). Pushers spin while
     /// this bit is set. Also used by the synchronous code paths.
-    pub(super) const PROCESSING: u8 = 0b0000_0001;
+    pub const PROCESSING: u8 = 0b0000_0001;
     /// `ProcessingData` is installed and no thread is actively computing the
     /// node. Pushers may register dependents under [`DEPS_LOCK`].
-    pub(super) const PENDING: u8 = 0b0000_0010;
+    pub const PENDING: u8 = 0b0000_0010;
     /// A worker is actively computing the node (owner-mutex). Pushers may
     /// still register dependents under [`DEPS_LOCK`] in parallel.
-    pub(super) const ACTIVE: u8 = 0b0000_0100;
+    pub const ACTIVE: u8 = 0b0000_0100;
     /// Result is published in the cache and the dependents list has been
     /// drained. Terminal state.
-    pub(super) const FINISHED: u8 = 0b0000_1000;
+    pub const FINISHED: u8 = 0b0000_1000;
     /// Transient overlay bit: a thread is currently mutating the dependents
     /// list. Layered on top of `PENDING` or `ACTIVE`.
-    pub(super) const DEPS_LOCK: u8 = 0b0001_0000;
+    pub const DEPS_LOCK: u8 = 0b0001_0000;
 }
 
 pub use streamlife::StreamLifeEngine;

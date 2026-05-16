@@ -46,8 +46,9 @@ impl ShardedLength {
         self.global.load(Ordering::Relaxed) + self.max_underestimation
     }
 
-    pub fn clear(&mut self) {
-        self.global.store(0, Ordering::Relaxed);
+    /// Reset to a known count (zero all shards, set global to `n`).
+    pub fn set(&mut self, n: usize) {
+        self.global.store(n, Ordering::Relaxed);
         for shard in self.shards.iter() {
             shard.store(0, Ordering::Relaxed);
         }

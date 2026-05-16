@@ -526,7 +526,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         for ts in self.thread_states.iter_mut() {
             ts.get_mut().reset();
         }
-        self.length.clear();
+        self.length.set(0);
     }
 
     pub(super) fn bytes_total(&self) -> usize {
@@ -577,6 +577,51 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
                 f(encode_idx(cid, off));
             }
         }
+    }
+
+    /// Single-threaded GC: removes every entry where `is_dead(idx)` is true,
+    /// relinks the surviving entries into their bucket chains, and returns
+    /// removed entries to shard 0's free list. The length counter is updated
+    /// to reflect the survivor count.
+    ///
+    /// Must be called from a single-threaded context after `thread::scope` has
+    /// joined (no concurrent `find_or_create` / `allocate` in flight).
+    pub(super) fn gc(&mut self, is_dead: impl Fn(Idx) -> bool) {
+        // Phase 1: walk every bucket chain; rebuild the chain with only live
+        // entries. Collect dead Idxs for free-list linking in phase 2.
+        let mut live_count: usize = 0;
+        let mut dead: Vec<Idx> = Vec::new();
+
+        for i in 0..self.buckets.len() {
+            let mut new_head = NULL_IDX;
+            let mut cur = self.buckets[i].load(Ordering::Relaxed);
+            while cur != NULL_IDX {
+                let entry = self.get(cur);
+                let next = entry.next().load(Ordering::Relaxed);
+                if is_dead(cur) {
+                    dead.push(cur);
+                } else {
+                    live_count += 1;
+                    entry.next().store(new_head, Ordering::Relaxed);
+                    new_head = cur;
+                }
+                cur = next;
+            }
+            self.buckets[i].store(new_head, Ordering::Relaxed);
+        }
+
+        // Phase 2: link dead entries into shard 0's free list. Use a raw
+        // pointer to thread_states[0] to avoid a simultaneous `&self`
+        // (from `get()`) and `&mut ThreadState` (from `thread_state_mut()`)
+        // borrow conflict; correctness is guaranteed by single-threaded use.
+        let ts_ptr: *mut ThreadState = self.thread_states[0].get();
+        for dead_idx in dead {
+            let old_head = unsafe { (*ts_ptr).free_list_head };
+            self.get(dead_idx).next().store(old_head, Ordering::Relaxed);
+            unsafe { (*ts_ptr).free_list_head = dead_idx };
+        }
+
+        self.length.set(live_count);
     }
 }
 
