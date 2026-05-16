@@ -579,49 +579,65 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         }
     }
 
-    /// Single-threaded GC: removes every entry where `is_dead(idx)` is true,
-    /// relinks the surviving entries into their bucket chains, and returns
-    /// removed entries to shard 0's free list. The length counter is updated
-    /// to reflect the survivor count.
+    /// Parallel GC sweep: walks every bucket chain, calls `process(entry)`
+    /// for each entry. `process` returns `true` for dead entries (to be
+    /// freed) and may reset live entries as a side effect.
     ///
-    /// Must be called from a single-threaded context after `thread::scope` has
-    /// joined (no concurrent `find_or_create` / `allocate` in flight).
-    pub(super) fn gc(&mut self, is_dead: impl Fn(Idx) -> bool) {
-        // Phase 1: walk every bucket chain; rebuild the chain with only live
-        // entries. Collect dead Idxs for free-list linking in phase 2.
-        let mut live_count: usize = 0;
-        let mut dead: Vec<Idx> = Vec::new();
+    /// Dead entries are returned to per-thread free lists (one range of
+    /// buckets per thread), distributing freed slots evenly across shards.
+    /// The length counter is updated to the exact survivor count.
+    ///
+    /// Must be called after all executor threads have joined.
+    pub(super) fn gc(&mut self, process: impl Fn(&E) -> bool + Sync) {
+        let threads_cnt = self.thread_states.len();
+        let bucket_count = self.buckets.len();
+        let buckets_per_thread = bucket_count.div_ceil(threads_cnt);
 
-        for i in 0..self.buckets.len() {
-            let mut new_head = NULL_IDX;
-            let mut cur = self.buckets[i].load(Ordering::Relaxed);
-            while cur != NULL_IDX {
-                let entry = self.get(cur);
-                let next = entry.next().load(Ordering::Relaxed);
-                if is_dead(cur) {
-                    dead.push(cur);
-                } else {
-                    live_count += 1;
-                    entry.next().store(new_head, Ordering::Relaxed);
-                    new_head = cur;
-                }
-                cur = next;
+        // SAFETY: reborrow as shared. `ConcurrentHashTable` is `Sync`
+        // (`unsafe impl Sync`), so `&self` is `Send` across threads.
+        // Each thread accesses disjoint bucket ranges and its own
+        // `ThreadState`; no concurrent allocation is in flight.
+        let this = &*self;
+
+        let per_thread_live: Vec<usize> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads_cnt);
+            for tid in 0..threads_cnt {
+                let start = tid * buckets_per_thread;
+                let end = (start + buckets_per_thread).min(bucket_count);
+                let process = &process;
+                handles.push(scope.spawn(move || {
+                    let ts_ptr: *mut ThreadState = this.thread_states[tid].get();
+                    let mut live_count = 0usize;
+
+                    for i in start..end {
+                        let mut new_head = NULL_IDX;
+                        let mut cur = this.buckets[i].load(Ordering::Relaxed);
+                        while cur != NULL_IDX {
+                            let entry = this.get(cur);
+                            let next = entry.next().load(Ordering::Relaxed);
+                            if process(entry) {
+                                // Dead: push to this thread's free list.
+                                let old_head = unsafe { (*ts_ptr).free_list_head };
+                                entry.next().store(old_head, Ordering::Relaxed);
+                                unsafe { (*ts_ptr).free_list_head = cur };
+                            } else {
+                                // Live: keep in chain.
+                                live_count += 1;
+                                entry.next().store(new_head, Ordering::Relaxed);
+                                new_head = cur;
+                            }
+                            cur = next;
+                        }
+                        this.buckets[i].store(new_head, Ordering::Relaxed);
+                    }
+                    live_count
+                }));
             }
-            self.buckets[i].store(new_head, Ordering::Relaxed);
-        }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
-        // Phase 2: link dead entries into shard 0's free list. Use a raw
-        // pointer to thread_states[0] to avoid a simultaneous `&self`
-        // (from `get()`) and `&mut ThreadState` (from `thread_state_mut()`)
-        // borrow conflict; correctness is guaranteed by single-threaded use.
-        let ts_ptr: *mut ThreadState = self.thread_states[0].get();
-        for dead_idx in dead {
-            let old_head = unsafe { (*ts_ptr).free_list_head };
-            self.get(dead_idx).next().store(old_head, Ordering::Relaxed);
-            unsafe { (*ts_ptr).free_list_head = dead_idx };
-        }
-
-        self.length.set(live_count);
+        let total_live: usize = per_thread_live.iter().sum();
+        self.length.set(total_live);
     }
 }
 

@@ -2,8 +2,8 @@ use super::{
     super::{LEAF_SIZE_LOG2, node::QuadTreeNode, sharded_statistics::LengthShard, status},
     base::{ConcurrentHashTable, Idx, NULL_IDX, compute_hash},
 };
-use ahash::AHashSet;
-use std::sync::atomic::Ordering;
+use crossbeam::deque::{Steal, Stealer, Worker};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Shared interface for accessing nodes.
 pub trait NodeAccess<Meta: Default + Sync> {
@@ -195,45 +195,86 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
         self.inner.exceeds_load_factor()
     }
 
-    /// Single-threaded GC: marks all nodes reachable from `roots` (at level
-    /// `size_log2`), then removes every unreachable node from the table's
-    /// bucket chains and returns it to the free list.
+    /// Parallel mark-and-sweep GC. Marks all nodes reachable from `roots`
+    /// using a status bit (`GC_MARK`), then sweeps the bucket chains in
+    /// parallel — removing dead entries to per-thread free lists and
+    /// resetting computation state on survivors.
     pub fn gc(&mut self, roots: &[Idx], size_log2: u32) {
-        let mut live: AHashSet<Idx> = AHashSet::new();
-        for &root in roots {
-            self.collect_reachable(root, size_log2, &mut live);
-        }
-        // Reset computation state on surviving nodes. GC is called to
-        // invalidate old cached results (e.g. step-size change), so FINISHED
-        // status and cached Idxs are always stale here.
-        // We intentionally leave `status_extra` and `extra` (StreamLife lane
-        // data) untouched — they depend only on cell structure, which is
-        // immutable for a given Idx.
-        for &idx in &live {
-            let n = self.get(idx);
-            n.status.store(0, Ordering::Relaxed);
-            n.cache.set_value(Idx::default());
-        }
-        self.inner.gc(|idx| !live.contains(&idx));
+        // Phase 1: parallel mark — set GC_MARK bit on all reachable nodes.
+        self.mark_reachable_parallel(roots, size_log2);
+
+        // Phase 2: parallel sweep — walk bucket chains, remove unmarked
+        // entries, reset survivors (clears GC_MARK along with all other
+        // status bits). We intentionally leave `status_extra` and `extra`
+        // (StreamLife lane data) untouched — they depend only on cell
+        // structure, which is immutable for a given Idx.
+        self.inner.gc(|entry| {
+            if entry.status.load(Ordering::Relaxed) & status::GC_MARK == 0 {
+                true // dead
+            } else {
+                entry.status.store(0, Ordering::Relaxed);
+                entry.cache.set_value(Idx::default());
+                false // live, now reset
+            }
+        });
     }
 
-    fn collect_reachable(&self, idx: Idx, size_log2: u32, live: &mut AHashSet<Idx>) {
-        if !live.insert(idx) {
-            return;
+    /// Parallel mark phase using work-stealing. Each thread does DFS;
+    /// `fetch_or(GC_MARK)` serves as both the atomic mark and the
+    /// already-visited check.
+    fn mark_reachable_parallel(&self, roots: &[Idx], size_log2: u32) {
+        let threads_cnt = self.inner.thread_states.len();
+
+        let mut queues: Vec<Worker<(Idx, u32)>> = Vec::with_capacity(threads_cnt);
+        let mut stealers: Vec<Stealer<(Idx, u32)>> = Vec::with_capacity(threads_cnt);
+        for _ in 0..threads_cnt {
+            let q = Worker::new_lifo();
+            stealers.push(q.stealer());
+            queues.push(q);
         }
-        if size_log2 > LEAF_SIZE_LOG2 {
-            let n = self.get(idx);
-            for child in n.parts() {
-                self.collect_reachable(child, size_log2 - 1, live);
-            }
-            // Also follow the cached result for FINISHED nodes. The result is
-            // a structural node at level size_log2-1 that will likely be
-            // looked up again in future computations, so keeping it alive
-            // avoids re-allocating and re-inserting it.
-            if n.status.load(Ordering::Relaxed) & status::FINISHED != 0 {
-                self.collect_reachable(n.cache.get_value(), size_log2 - 1, live);
-            }
+
+        let pending = AtomicUsize::new(roots.len());
+        for &root in roots {
+            queues[0].push((root, size_log2));
         }
+
+        std::thread::scope(|scope| {
+            for queue in queues {
+                let stealers = &stealers;
+                let pending = &pending;
+                scope.spawn(move || {
+                    loop {
+                        // Pop from local queue, or steal.
+                        let item = queue.pop().or_else(|| {
+                            stealers.iter().find_map(|s| match s.steal() {
+                                Steal::Success(item) => Some(item),
+                                _ => None,
+                            })
+                        });
+
+                        if let Some((idx, sl2)) = item {
+                            let n = self.get(idx);
+                            let prev = n.status.fetch_or(status::GC_MARK, Ordering::Relaxed);
+                            if prev & status::GC_MARK == 0 && sl2 > LEAF_SIZE_LOG2 {
+                                for child in n.parts() {
+                                    pending.fetch_add(1, Ordering::Relaxed);
+                                    queue.push((child, sl2 - 1));
+                                }
+                                if prev & status::FINISHED != 0 {
+                                    pending.fetch_add(1, Ordering::Relaxed);
+                                    queue.push((n.cache.get_value(), sl2 - 1));
+                                }
+                            }
+                            pending.fetch_sub(1, Ordering::Relaxed);
+                        } else if pending.load(Ordering::Relaxed) == 0 {
+                            break;
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                });
+            }
+        });
     }
 }
 

@@ -62,6 +62,9 @@ mod status {
     /// Transient overlay bit: a thread is currently mutating the dependents
     /// list. Layered on top of `PENDING` or `ACTIVE`.
     pub const DEPS_LOCK: u8 = 0b0001_0000;
+    /// GC mark bit. Set during the mark phase of garbage collection to
+    /// identify reachable nodes. Cleared during sweep.
+    pub const GC_MARK: u8 = 0b0010_0000;
 }
 
 pub use streamlife::StreamLifeEngine;
