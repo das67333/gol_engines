@@ -62,7 +62,7 @@ type SizeLog2 = u32;
 ///
 /// If you encounter issues loading patterns that work in Golly and should work here,
 /// the file might not conform to the format specifications detailed at
-/// https://golly.sourceforge.io/Help/formats.html.
+/// <https://golly.sourceforge.io/Help/formats.html>.
 /// Try opening the problematic pattern in a modern version of Golly and saving it again
 /// to ensure it meets the expected format requirements.
 ///
@@ -97,10 +97,10 @@ impl Pattern {
     /// Creates a new empty pattern. It initializes an 8x8 empty grid.
     ///
     /// # Arguments
-    /// * `approx_size_log2`:
-    /// An optional hint for the approximate size of the pattern.  
-    /// If provided, the internal [`KIVMap`] pre-allocates blank nodes
-    /// up to that size to speed up future access.
+    /// * `approx_size_log2` - An optional hint for the approximate size of the
+    ///   pattern. If provided, the internal [`KIVMap`] pre-allocates blank nodes
+    ///   up to that size to speed up future access.
+    #[must_use] 
     pub fn new(approx_size_log2: Option<SizeLog2>) -> Self {
         let mut kiv = KIVMap::new();
         // fill cache of blank nodes
@@ -118,6 +118,7 @@ impl Pattern {
     /// Returns the root node index of the pattern.
     ///
     /// The root node represents the top-level quadtree node covering the entire pattern.
+    #[must_use] 
     pub fn get_root(&self) -> NodeIdx {
         self.root
     }
@@ -127,7 +128,7 @@ impl Pattern {
     /// # Safety
     ///
     /// This function is unsafe because it requires the caller to ensure:
-    /// - `root` is a valid node index that exists in the pattern's KIVMap
+    /// - `root` is a valid node index that exists in the pattern's `KIVMap`
     /// - `size_log2` correctly represents the size of the new root node
     ///
     /// # Arguments
@@ -141,7 +142,7 @@ impl Pattern {
 
     /// Finds an existing node with the given content or creates a new one.
     ///
-    /// This method delegates to the internal KIVMap to find or create a node,
+    /// This method delegates to the internal `KIVMap` to find or create a node,
     /// maintaining the pattern's node deduplication property.
     ///
     /// # Arguments
@@ -159,6 +160,7 @@ impl Pattern {
     ///
     /// The pattern is always square with side length of `2^size_log2`.
     /// For example, a pattern with `size_log2 = 3` is 8x8 cells.
+    #[must_use] 
     pub fn get_size_log2(&self) -> SizeLog2 {
         self.size_log2
     }
@@ -172,6 +174,7 @@ impl Pattern {
     /// # Returns
     ///
     /// A reference to the requested `PatternNode`.
+    #[must_use] 
     pub fn get_node(&self, idx: NodeIdx) -> &PatternNode {
         self.kiv.get_node(idx)
     }
@@ -187,6 +190,7 @@ impl Pattern {
     /// # Returns
     ///
     /// A 64-bit hash value for the pattern.
+    #[must_use] 
     pub fn hash(&self) -> u64 {
         fn inner(idx: NodeIdx, cache: &mut HashMap<NodeIdx, u64>, kiv: &KIVMap) -> u64 {
             if let Some(&val) = cache.get(&idx) {
@@ -226,6 +230,7 @@ impl Pattern {
     ///
     /// A `BigInt` representing the total number of alive cells, which can
     /// be arbitrarily large for very large patterns.
+    #[must_use] 
     pub fn population(&self) -> BigInt {
         fn inner<'a>(idx: NodeIdx, cache: &'a mut HashMap<NodeIdx, BigInt>, kiv: &'a KIVMap) {
             let result = match kiv.get_node(idx) {
@@ -326,7 +331,7 @@ impl Pattern {
         .fill(&mut cells[..]);
         if size_log2 < 3 {
             // clear the upper bits
-            for x in cells.iter_mut() {
+            for x in &mut cells {
                 *x &= ((1u32 << n) - 1) as u8;
             }
         }
@@ -367,24 +372,6 @@ impl Pattern {
     /// - `metacells[0].size_log2` does not equal `metacells[1].size_log2`
     /// - metacells are smaller than 8x8
     pub fn metafy(&self, metacells: [&Pattern; 2], level: u32) -> Result<Self> {
-        if metacells[0].size_log2 != metacells[1].size_log2 {
-            return Err(anyhow!(
-                "Metacells must have the same size_log2: {} != {}",
-                metacells[0].size_log2,
-                metacells[1].size_log2
-            ));
-        }
-        if metacells[0].size_log2 < 3 {
-            return Err(anyhow!(
-                "Metacell size_log2 must be at least 3: {}",
-                metacells[0].size_log2
-            ));
-        }
-
-        if level == 0 {
-            return Ok(self.clone());
-        }
-
         fn copy_from_pattern(
             idx: NodeIdx,
             pattern: &Pattern,
@@ -406,14 +393,6 @@ impl Pattern {
             };
             cache.insert(idx, result);
             result
-        }
-
-        let mut kiv = KIVMap::new();
-        let mut cache = HashMap::new();
-        let mut metacell_idx = [0; 2];
-        for (src, dst) in metacells.iter().zip(metacell_idx.iter_mut()) {
-            *dst = copy_from_pattern(src.root, src, &mut kiv, &mut cache);
-            cache.clear();
         }
 
         fn build_pattern_from_metacells(
@@ -482,6 +461,32 @@ impl Pattern {
             };
             cache.insert(idx, result);
             result
+        }
+
+        if metacells[0].size_log2 != metacells[1].size_log2 {
+            return Err(anyhow!(
+                "Metacells must have the same size_log2: {} != {}",
+                metacells[0].size_log2,
+                metacells[1].size_log2
+            ));
+        }
+        if metacells[0].size_log2 < 3 {
+            return Err(anyhow!(
+                "Metacell size_log2 must be at least 3: {}",
+                metacells[0].size_log2
+            ));
+        }
+
+        if level == 0 {
+            return Ok(self.clone());
+        }
+
+        let mut kiv = KIVMap::new();
+        let mut cache = HashMap::new();
+        let mut metacell_idx = [0; 2];
+        for (src, dst) in metacells.iter().zip(metacell_idx.iter_mut()) {
+            *dst = copy_from_pattern(src.root, src, &mut kiv, &mut cache);
+            cache.clear();
         }
 
         for _ in 0..level - 1 {
@@ -588,7 +593,7 @@ impl Pattern {
     /// - Format-specific errors occur from `from_format`
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let data = fs::read(path).with_context(|| format!("Failed to read file: {path:?}"))?;
+        let data = fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
 
         if path.extension() == Some("mc".as_ref()) {
             return Self::from_format(PatternFormat::Macrocell, &data);
@@ -642,7 +647,7 @@ impl Pattern {
         };
 
         let data = self.to_format(format)?;
-        fs::write(path, data).with_context(|| format!("Failed to write file: {path:?}"))
+        fs::write(path, data).with_context(|| format!("Failed to write file: {}", path.display()))
     }
 
     /// Creates a pattern from packed cell data. See [`PatternFormat::PackedCells`].
@@ -662,7 +667,7 @@ impl Pattern {
         if data.is_empty() {
             return Err(anyhow!("Packed cells are empty"));
         }
-        let size_log2 = data.len().ilog2().min((data.len().ilog2() + 3) / 2);
+        let size_log2 = data.len().ilog2().min(u32::midpoint(data.len().ilog2(), 3));
         let n = 1usize << size_log2;
         if data.len() != (n * n).div_ceil(8).max(n) {
             return Err(anyhow!(
@@ -1294,7 +1299,7 @@ pub enum PatternNode {
 
 impl PatternNode {
     /// Fast yet effective hash function.
-    /// It is used for indexing nodes in the KIVMap.
+    /// It is used for indexing nodes in the `KIVMap`.
     fn hash(&self) -> u32 {
         let h = match self {
             PatternNode::Leaf(cells) => (cells ^ (cells >> 32)) as u32,
@@ -1315,7 +1320,7 @@ impl PatternNode {
 /// 2. By content: find a node with specific content orcreate a new one if
 ///    it doesn't exist
 ///
-/// KIVMap is an essential component of the Pattern's quadtree implementation,
+/// `KIVMap` is an essential component of the Pattern's quadtree implementation,
 /// providing node deduplication to reduce memory usage in large patterns.
 ///
 /// # Implementation Details
@@ -1329,7 +1334,7 @@ impl PatternNode {
 /// # Panics
 ///
 /// Panics on running out of indexes (when the number of nodes exceeds
-/// the maximum value of NodeIdx).
+/// the maximum value of `NodeIdx`).
 #[derive(Clone)]
 struct KIVMap {
     hashmap_chains: Vec<NodeIdx>,

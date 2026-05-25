@@ -9,7 +9,7 @@ use super::{
         hashlife::HashLifeEngine,
         hashtable::{Idx, NodeStore, NodeStoreRef},
         node::QuadTreeNode,
-        sharded_statistics::*,
+        sharded_statistics::{ExecutionStatistics, set_current_execution_stats, Ticks, record_task_duration, take_current_execution_stats, MetricKind},
         status,
     },
     common::{
@@ -116,7 +116,7 @@ struct ExecutorThread<'a, Meta: Default + Sync> {
     stealers: &'a [Stealer<Task>],
 }
 
-impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
+impl<Meta: Default + Sync> ExecutorThread<'_, Meta> {
     fn run(&self) -> ExecutionStatistics {
         let mut fetcher = TaskFetcher::new(
             self.thread_idx,
@@ -159,7 +159,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
             let dependents = data.take_dependents();
             n.cache.set_value(result);
             guard.publish_finished();
-            unsafe { drop(Box::from_raw(data as *mut ProcessingData<Idx>)) };
+            unsafe { drop(Box::from_raw(std::ptr::from_mut::<ProcessingData<Idx>>(data))) };
             self.notify_dependents(&task, &dependents);
         }
     }

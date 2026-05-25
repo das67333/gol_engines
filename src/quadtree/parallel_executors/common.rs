@@ -59,7 +59,7 @@ use super::super::{
     LEAF_SIZE, LEAF_SIZE_LOG2, algorithm,
     hashtable::{Idx, NodeAccess},
     node::QuadTreeNode,
-    sharded_statistics::*,
+    sharded_statistics::{record_last_victim_steal, record_steal, record_status_claim_fail, record_status_claim_success, MetricKind, record_metric},
     spin::Spinner,
     status,
 };
@@ -83,8 +83,8 @@ pub const WAITING_BIAS: u16 = 1 << 15;
 /// Heap-allocated when processing starts, freed when node reaches FINISHED state.
 /// Stored via pointer in the node's `cache` field.
 ///
-/// Generic over `Dep`, the dependent type. Pure HashLife runs use
-/// `ProcessingData<Idx>`. StreamLife runs that drive HashLife nodes
+/// Generic over `Dep`, the dependent type. Pure `HashLife` runs use
+/// `ProcessingData<Idx>`. `StreamLife` runs that drive `HashLife` nodes
 /// asynchronously use `ProcessingData<Dependent>` so a binode task can
 /// register itself as a waiter. The `cache` field on
 /// [`QuadTreeNode`] is type-erased, so per-run instantiation is
@@ -245,7 +245,7 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
             match result {
                 Steal::Success(task) => return Some(task),
                 Steal::Empty => return None,
-                Steal::Retry => continue,
+                Steal::Retry => {}
             }
         }
     }
@@ -299,7 +299,7 @@ pub fn start_processing_node<Meta: Default + Sync, Dep>(
     true
 }
 
-/// Async work body for a HashLife node: drive the node's `ProcessingData`
+/// Async work body for a `HashLife` node: drive the node's `ProcessingData`
 /// state machine through Stage 1 (9 overlapping children, if `both_stages`)
 /// and Stage 2 (4 final children), registering dependencies and pushing
 /// child tasks via `queue` as needed.
@@ -309,10 +309,10 @@ pub fn start_processing_node<Meta: Default + Sync, Dep>(
 /// which case wake-up duty is transferred via the `waiting_cnt` bias trick
 /// (see module docs).
 ///
-/// Generic over `Dep`. Pure HashLife runs pass `Dep = Idx` and `dep =
-/// task.idx`. StreamLife runs that descend through HashLife nodes pass
+/// Generic over `Dep`. Pure `HashLife` runs pass `Dep = Idx` and `dep =
+/// task.idx`. `StreamLife` runs that descend through `HashLife` nodes pass
 /// `Dep = Dependent` and a tagged-enum value identifying the parent task.
-/// HashLife runtime path is unchanged: monomorphization with `Dep = Idx`
+/// `HashLife` runtime path is unchanged: monomorphization with `Dep = Idx`
 /// emits today's exact code.
 pub fn update_node_async<Meta, Dep>(
     mem: &impl NodeAccess<Meta>,
@@ -341,9 +341,7 @@ where
 
     if data.mask4_waiting == 0 {
         // Stage 2 not yet initialized
-        if !both_stages {
-            data.arr = algorithm::nine_children_disjoint(mem, nw, ne, sw, se, task.size_log2 - 1);
-        } else {
+        if both_stages {
             if data.mask9_waiting == 0 {
                 data.arr = algorithm::nine_children_overlapping(mem, nw, ne, sw, se);
                 data.mask9_waiting = 0b1_1111_1111;
@@ -382,6 +380,8 @@ where
                 }
                 return None;
             }
+        } else {
+            data.arr = algorithm::nine_children_disjoint(mem, nw, ne, sw, se, task.size_log2 - 1);
         }
 
         let arr4 = algorithm::four_children_overlapping(mem, &data.arr);
@@ -515,9 +515,9 @@ pub enum DependencyHandlingResult {
 /// for the owner's compute burst — only for the brief init / finish
 /// barriers (encoded as `PROCESSING`) or for another concurrent pusher.
 ///
-/// Generic over `Dep`. Pure HashLife runs use `Dep = Idx` (registering the
-/// parent task's index). StreamLife runs that descend through HashLife nodes
-/// use `Dep = Dependent` (a tagged enum that distinguishes a HashLife waiter
+/// Generic over `Dep`. Pure `HashLife` runs use `Dep = Idx` (registering the
+/// parent task's index). `StreamLife` runs that descend through `HashLife` nodes
+/// use `Dep = Dependent` (a tagged enum that distinguishes a `HashLife` waiter
 /// from a binode waiter). The `ProcessingData<Dep>` allocated for `n` must
 /// be of the same flavor across a single run.
 pub fn handle_dependency<Meta: Default + Sync, Dep: Copy>(

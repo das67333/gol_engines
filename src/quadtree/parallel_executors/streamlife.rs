@@ -1,7 +1,7 @@
-//! # Parallel StreamLife Executor
+//! # Parallel `StreamLife` Executor
 //!
-//! Work-stealing parallel executor for the StreamLife algorithm's
-//! `update_binode` operation, with cross-engine async cooperation: HashLife
+//! Work-stealing parallel executor for the `StreamLife` algorithm's
+//! `update_binode` operation, with cross-engine async cooperation: `HashLife`
 //! sub-results required by `update_binode`'s solitonic / base fast-paths are
 //! computed asynchronously rather than via a synchronous recursive call.
 //!
@@ -9,25 +9,25 @@
 //!
 //! Each worker holds two crossbeam deques:
 //! - `bi_queue: Worker<BiTask>` — binode tasks (the existing work item).
-//! - `hash_queue: Worker<Task>` — HashLife tasks descended from binode
+//! - `hash_queue: Worker<Task>` — `HashLife` tasks descended from binode
 //!   Phases Solitonic / Base.
 //!
 //! Pop policy: local LIFO bi first (keep recursion stack-warm), then local
 //! LIFO hash, then steal — bi first, then hash, from a random victim.
-//! HashLife's pure-engine path is unchanged: it still uses a single
+//! `HashLife`'s pure-engine path is unchanged: it still uses a single
 //! `Worker<Task>`.
 //!
 //! ## Cross-engine dependents
 //!
 //! A binode task in Phase Solitonic or Base waits on the result of one or
-//! two HashLife nodes. It registers itself on the HashLife node's
-//! dependents list as `Dependent::Binode { entry_idx, size_log2 }`. HashLife
-//! sub-children registered during async descent of a HashLife node use
-//! `Dependent::Node { idx, size_log2 }`. The HashLife `notify_dependents`
+//! two `HashLife` nodes. It registers itself on the `HashLife` node's
+//! dependents list as `Dependent::Binode { entry_idx, size_log2 }`. `HashLife`
+//! sub-children registered during async descent of a `HashLife` node use
+//! `Dependent::Node { idx, size_log2 }`. The `HashLife` `notify_dependents`
 //! dispatches by variant, pushing to `bi_queue` or `hash_queue`
 //! appropriately.
 //!
-//! Dependents-list and `waiting_cnt` synchronization mirror the HashLife
+//! Dependents-list and `waiting_cnt` synchronization mirror the `HashLife`
 //! executor — see [`super::hashlife_executor`] module docs for the full state
 //! machine. The bit-flag state machine on `n.status` is shared across both
 //! engines.
@@ -36,7 +36,7 @@ use super::{
     super::{
         LEAF_SIZE_LOG2, algorithm,
         hashtable::{BinodeCache, BinodeCacheRef, Idx, NodeStoreRef},
-        sharded_statistics::*,
+        sharded_statistics::{ExecutionStatistics, set_current_execution_stats, record_last_victim_steal, take_current_execution_stats, Ticks, record_task_duration, record_steal, MetricKind, record_status_claim_fail, record_status_claim_success, record_metric},
         spin::Spinner,
         status,
         streamlife::StreamLifeEngine,
@@ -58,21 +58,21 @@ use std::{
 /// A unit of work representing a binode pair to be processed.
 #[derive(Clone, Copy)]
 pub struct BiTask {
-    /// Index into the BinodeCache for this binode pair.
+    /// Index into the `BinodeCache` for this binode pair.
     pub entry_idx: Idx,
     /// Size (log2) of the nodes in this pair.
     pub size_log2: u32,
 }
 
-/// Tagged dependent for a HashLife `QuadTreeNode` processed during a
-/// StreamLife run. A HashLife node's dependents list (under `Dep =
+/// Tagged dependent for a `HashLife` `QuadTreeNode` processed during a
+/// `StreamLife` run. A `HashLife` node's dependents list (under `Dep =
 /// Dependent`) can hold either kind of waiter:
-/// - `Node`: another HashLife node (descended from a binode task) is waiting.
+/// - `Node`: another `HashLife` node (descended from a binode task) is waiting.
 /// - `Binode`: a binode task is waiting (Phases Solitonic / Base).
 ///
 /// The `size_log2` is stored on the variant because the dependent's level is
 /// not always derivable from the dependency's: a binode in Phase S/B depends
-/// on a HashLife node at the *same* level, while a HashLife child is at one
+/// on a `HashLife` node at the *same* level, while a `HashLife` child is at one
 /// level below its parent.
 #[derive(Clone, Copy)]
 pub enum Dependent {
@@ -118,10 +118,10 @@ struct BiProcessingData {
     /// Used in Phase Recursive only.
     mask4_waiting: u32,
     /// Hash-result scratch for Phases Solitonic / Base.
-    ///   Phase Solitonic: hash_results[0] = i1 (for idx.0), hash_results[1] = i2 (for idx.1).
-    ///   Phase Base: hash_results[0] = i3 (for the merged node stored in arr0[0]).
+    ///   Phase Solitonic: `hash_results`[0] = i1 (for idx.0), `hash_results`[1] = i2 (for idx.1).
+    ///   Phase Base: `hash_results`[0] = i3 (for the merged node stored in arr0[0]).
     hash_results: [Idx; 2],
-    /// Bitmask of pending HashLife results for Phases Solitonic / Base.
+    /// Bitmask of pending `HashLife` results for Phases Solitonic / Base.
     /// Solitonic uses bits 0,1; Base uses bit 0 only.
     hash_mask: u8,
     /// Count of dependencies still being computed. The entry resumes when
@@ -149,7 +149,7 @@ impl Default for BiProcessingData {
     }
 }
 
-/// Parallel executor for StreamLife's `update_binode` using work-stealing.
+/// Parallel executor for `StreamLife`'s `update_binode` using work-stealing.
 pub struct StreamLifeExecutor<'a> {
     engine: &'a StreamLifeEngine,
     biroot: (Idx, Idx),
@@ -240,7 +240,7 @@ impl<'a> StreamLifeExecutor<'a> {
         Some(bicache.get(root_idx).payload().get_value())
     }
 
-    /// Drop orphaned `ProcessingData<Dependent>` (HashLife nodes) and
+    /// Drop orphaned `ProcessingData<Dependent>` (`HashLife` nodes) and
     /// `BiProcessingData` (binode entries) on cancellation. Must be called
     /// from a single-threaded context after `thread::scope` has joined; only
     /// PENDING slots own a live box at that point.
@@ -254,7 +254,7 @@ impl<'a> StreamLifeExecutor<'a> {
                 let pd: &mut BiProcessingData = entry.payload().get_ref();
                 // SAFETY: produced by `Box::into_raw` in
                 // `start_processing_entry`; all workers have joined.
-                unsafe { drop(Box::from_raw(pd as *mut BiProcessingData)) };
+                unsafe { drop(Box::from_raw(std::ptr::from_mut::<BiProcessingData>(pd))) };
             }
         });
         // HashLife nodes processed asynchronously during this StreamLife run
@@ -268,15 +268,15 @@ impl<'a> StreamLifeExecutor<'a> {
                 let pd: &mut ProcessingData<Dependent> = n.cache.get_ref();
                 // SAFETY: produced by `Box::into_raw` in
                 // `start_processing_node`; all workers have joined.
-                unsafe { drop(Box::from_raw(pd as *mut ProcessingData<Dependent>)) };
+                unsafe { drop(Box::from_raw(std::ptr::from_mut::<ProcessingData<Dependent>>(pd))) };
             }
         });
     }
 }
 
-/// Per-thread worker for the StreamLife parallel executor.
+/// Per-thread worker for the `StreamLife` parallel executor.
 ///
-/// Holds two deques (binode and HashLife) and processes work from either
+/// Holds two deques (binode and `HashLife`) and processes work from either
 /// kind, with a custom dual-queue fetch loop in [`Self::run`].
 struct BiExecutorThread<'a> {
     engine: &'a StreamLifeEngine,
@@ -290,7 +290,7 @@ struct BiExecutorThread<'a> {
     hash_stealers: &'a [Stealer<Task>],
 }
 
-impl<'a> BiExecutorThread<'a> {
+impl BiExecutorThread<'_> {
     /// Initial backoff for the steal-then-sleep loop.
     const INITIAL_WAIT: Duration = Duration::from_micros(100);
     /// Maximum backoff.
@@ -410,7 +410,7 @@ impl<'a> BiExecutorThread<'a> {
             match result {
                 Steal::Success(task) => return Some(task),
                 Steal::Empty => return None,
-                Steal::Retry => continue,
+                Steal::Retry => {}
             }
         }
     }
@@ -441,13 +441,13 @@ impl<'a> BiExecutorThread<'a> {
             let dependents = mem::take(&mut data.dependents);
             entry.payload().set_value(result);
             guard.publish_finished();
-            unsafe { drop(Box::from_raw(data as *mut BiProcessingData)) };
+            unsafe { drop(Box::from_raw(std::ptr::from_mut::<BiProcessingData>(data))) };
             self.notify_bi_dependents(dependents);
         }
     }
 
-    /// Process a single HashLife task descended from a binode Phase S/B.
-    /// Mirror of HashLife's `process_task` but uses
+    /// Process a single `HashLife` task descended from a binode Phase S/B.
+    /// Mirror of `HashLife`'s `process_task` but uses
     /// `ProcessingData<Dependent>` so cross-engine waiters can register.
     fn process_hash_task(&self, task: Task) {
         let n = self.node_ref.get(task.idx);
@@ -472,7 +472,7 @@ impl<'a> BiExecutorThread<'a> {
             let dependents = data.take_dependents();
             n.cache.set_value(result);
             guard.publish_finished();
-            unsafe { drop(Box::from_raw(data as *mut ProcessingData<Dependent>)) };
+            unsafe { drop(Box::from_raw(std::ptr::from_mut::<ProcessingData<Dependent>>(data))) };
             self.notify_node_dependents(dependents);
         }
     }
@@ -689,7 +689,9 @@ impl<'a> BiExecutorThread<'a> {
 
         let i3 = data.hash_results[0];
         let blank_child = engine.base.blank_nodes.get(size_log2 - 1);
-        let result = if i3 != blank_child {
+        let result = if i3 == blank_child {
+            (blank_child, blank_child)
+        } else {
             // Sync: lane query on the merged node.
             let lanes =
                 algorithm::node2lanes(&self.node_ref, &engine.base.blank_nodes, merged, size_log2);
@@ -698,8 +700,6 @@ impl<'a> BiExecutorThread<'a> {
             } else {
                 (i3, blank_child)
             }
-        } else {
-            (blank_child, blank_child)
         };
         Some(result)
     }
@@ -821,7 +821,7 @@ impl<'a> BiExecutorThread<'a> {
     /// Notify dependents of a finished binode entry.
     ///
     /// Atomically decrements each dependent's `waiting_cnt`. The thread
-    /// that drives the counter to zero re-queues the parent BiTask.
+    /// that drives the counter to zero re-queues the parent `BiTask`.
     fn notify_bi_dependents(&self, dependents: SmallVec<[BiTask; 2]>) {
         for dep in dependents {
             let entry = self.bicache_ref.get(dep.entry_idx);
@@ -836,7 +836,7 @@ impl<'a> BiExecutorThread<'a> {
         }
     }
 
-    /// Notify dependents of a finished HashLife node, dispatching by
+    /// Notify dependents of a finished `HashLife` node, dispatching by
     /// `Dependent` variant.
     ///
     /// Each variant's `size_log2` field carries the dependent's level

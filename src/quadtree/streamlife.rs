@@ -51,7 +51,7 @@ impl GoLEngine for StreamLifeEngine {
         // Memory accounting: NodeStore<u64> and BinodeCache share the same
         // `bucket_count`. Per-bucket cost = (bucket_head + node body) +
         // (bucket_head + cache entry).
-        let mem_bytes = (mem_limit_mib as u64) << 20;
+        let mem_bytes = u64::from(mem_limit_mib) << 20;
         let per_bucket = std::mem::size_of::<std::sync::atomic::AtomicU32>()
             + std::mem::size_of::<QuadTreeNode<u64>>()
             + std::mem::size_of::<std::sync::atomic::AtomicU32>()

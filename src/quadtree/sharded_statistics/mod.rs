@@ -14,7 +14,7 @@ cfg_select! {
 
 /// Metric kind for log2 histogram distributions.
 /// Spin-count metrics store raw spin iterations.
-/// TaskDuration stores raw timer ticks.
+/// `TaskDuration` stores raw timer ticks.
 #[derive(Clone, Copy)]
 pub(super) enum MetricKind {
     // PENDING -> PROCESSING status acquire (spin count)

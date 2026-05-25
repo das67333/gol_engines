@@ -25,7 +25,7 @@ pub struct ShardedRef<'a, S> {
     pub length_shard: LengthShard<'a>,
 }
 
-/// Type alias for per-thread NodeStore references.
+/// Type alias for per-thread `NodeStore` references.
 pub type NodeStoreRef<'a, Meta> = ShardedRef<'a, NodeStore<Meta>>;
 
 /// Stores the nodes of the quadtree.
@@ -79,7 +79,7 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
         se: u16,
     ) -> (Idx, bool) {
         // See Morton order: https://en.wikipedia.org/wiki/Z-order_curve
-        let (mut nw, mut ne) = (nw as u64, ne as u64);
+        let (mut nw, mut ne) = (u64::from(nw), u64::from(ne));
         let mut cells = 0;
         let mut shift = 0;
         for _ in 0..4 {
@@ -90,7 +90,7 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
             ne >>= 4;
             shift += 4;
         }
-        let (mut sw, mut se) = (sw as u64, se as u64);
+        let (mut sw, mut se) = (u64::from(sw), u64::from(se));
         for _ in 0..4 {
             cells |= (sw & 0xF) << shift;
             sw >>= 4;
@@ -224,7 +224,7 @@ fn is_dead_after_mark<Meta: Default + Sync>(entry: &QuadTreeNode<Meta>) -> bool 
     false
 }
 
-impl<'a, Meta: Default + Sync> NodeStoreRef<'a, Meta> {
+impl<Meta: Default + Sync> NodeStoreRef<'_, Meta> {
     pub fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
         self.base.get(idx)
     }
@@ -264,7 +264,7 @@ impl<'a, Meta: Default + Sync> NodeStoreRef<'a, Meta> {
     }
 }
 
-impl<'a, Meta: Default + Sync> NodeAccess<Meta> for NodeStoreRef<'a, Meta> {
+impl<Meta: Default + Sync> NodeAccess<Meta> for NodeStoreRef<'_, Meta> {
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
         self.get(idx)
     }

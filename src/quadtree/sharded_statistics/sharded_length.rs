@@ -49,7 +49,7 @@ impl ShardedLength {
     /// Reset to a known count (zero all shards, set global to `n`).
     pub fn set(&mut self, n: usize) {
         self.global.store(n, Ordering::Relaxed);
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             shard.store(0, Ordering::Relaxed);
         }
     }
@@ -60,7 +60,7 @@ pub struct LengthShard<'a> {
     global: &'a AtomicUsize,
 }
 
-impl<'a> LengthShard<'a> {
+impl LengthShard<'_> {
     pub fn increment(&self) {
         let new_value = self.local.fetch_add(1, Ordering::Relaxed) + 1;
         if new_value == FLUSH_THRESHOLD {

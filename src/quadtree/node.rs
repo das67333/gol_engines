@@ -1,4 +1,4 @@
-//! # QuadTree Node Data Structures
+//! # `QuadTree` Node Data Structures
 //!
 //! Core data structures for representing nodes in the parallel Hashlife quadtree.
 //!
@@ -52,8 +52,8 @@ use std::{
 ///
 /// ## Field order
 ///
-/// Carefully arranged to keep `QuadTreeNode<()>` (HashLife) at exactly 32 B
-/// and `QuadTreeNode<u64>` (StreamLife) at 40 B; see the static asserts at
+/// Carefully arranged to keep `QuadTreeNode<()>` (`HashLife`) at exactly 32 B
+/// and `QuadTreeNode<u64>` (`StreamLife`) at 40 B; see the static asserts at
 /// the end of this module.
 ///
 /// ## Thread Safety
@@ -66,8 +66,8 @@ use std::{
 ///   freed.
 /// - `status`: atomic bit-set encoding the async state machine
 ///   (see `super::status`).
-/// - `extra`/`status_extra`: StreamLife lane descriptor + status; unused
-///   for HashLife (`Meta = ()`).
+/// - `extra`/`status_extra`: `StreamLife` lane descriptor + status; unused
+///   for `HashLife` (`Meta = ()`).
 #[derive(Default)]
 pub(super) struct QuadTreeNode<Meta> {
     /// Northwest child or lower 32 bits of leaf cells.
@@ -82,11 +82,11 @@ pub(super) struct QuadTreeNode<Meta> {
     pub(super) cache: CacheField<Idx>,
     /// Chain pointer for the hashtable bucket; doubles as free-list link.
     pub(super) next: AtomicU32,
-    /// Processing status (see hashlife_executor for state machine).
+    /// Processing status (see `hashlife_executor` for state machine).
     pub(super) status: AtomicU8,
-    /// Lane-descriptor status (StreamLife only).
+    /// Lane-descriptor status (`StreamLife` only).
     pub(super) status_extra: AtomicU8,
-    /// Lane descriptor metadata (StreamLife only; zero-sized for HashLife).
+    /// Lane descriptor metadata (`StreamLife` only; zero-sized for `HashLife`).
     ///
     /// When `Meta = u64` the encoding is:
     /// - bits 0–7: `adml` — admissible-lane mask (which lane types are active).
@@ -124,7 +124,7 @@ impl<Meta> QuadTreeNode<Meta> {
     ///
     /// Layout: `nw` = rows 0-3, `ne` = rows 4-7.
     pub(super) fn leaf_cells(&self) -> [u8; 8] {
-        (self.nw as u64 | ((self.ne as u64) << 32)).to_le_bytes()
+        (u64::from(self.nw) | (u64::from(self.ne) << 32)).to_le_bytes()
     }
 
     /// Extract northwest 4×4 quadrant from 8×8 leaf.

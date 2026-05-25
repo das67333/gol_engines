@@ -22,7 +22,7 @@
 //! └────────────────────────┴────────────────────────┘
 //! ```
 //!
-//! `Idx = 0` (chunk_id=0, offset=0) means null.
+//! `Idx = 0` (`chunk_id=0`, offset=0) means null.
 //!
 //! ## Lock-free `find_or_create`
 //!
@@ -140,11 +140,11 @@ impl<V: Copy> CacheField<V> {
     /// The status state machine guarantees only one thread accesses this at a time.
     #[allow(clippy::mut_from_ref)]
     pub fn get_ref<T>(&self) -> &mut T {
-        unsafe { &mut *((*self.0.get()).ptr as *mut T) }
+        unsafe { &mut *(*self.0.get()).ptr.cast::<T>() }
     }
 
     pub fn set_ptr<T>(&self, ptr: *mut T) {
-        unsafe { (*self.0.get()).ptr = ptr as *mut u8 }
+        unsafe { (*self.0.get()).ptr = ptr.cast::<u8>() }
     }
 }
 
@@ -474,7 +474,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         let storage: Box<[UnsafeCell<E>]> = (0..CHUNK_SIZE as usize)
             .map(|_| UnsafeCell::new(E::default()))
             .collect();
-        let raw = Box::into_raw(storage) as *mut UnsafeCell<E>;
+        let raw = Box::into_raw(storage).cast::<UnsafeCell<E>>();
         // Publish: any subsequent observation of an Idx in this chunk
         // (via a Release-CAS on a bucket head) synchronizes with this
         // Release.
@@ -511,14 +511,14 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     /// per-thread states, and reset the chunk-id counter. Single-threaded
     /// (called between updates).
     pub(super) fn clear(&mut self) {
-        for b in self.buckets.iter() {
+        for b in &self.buckets {
             b.store(NULL_IDX, Ordering::Relaxed);
         }
-        for chunk in self.chunks.iter_mut() {
+        for chunk in &mut self.chunks {
             chunk.release();
         }
         self.next_chunk_id.store(1, Ordering::Relaxed);
-        for ts in self.thread_states.iter_mut() {
+        for ts in &mut self.thread_states {
             ts.get_mut().reset();
         }
         self.length.set(0);
@@ -553,8 +553,8 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     }
 
     /// Invoke `f` once per `Idx` whose backing storage has been allocated
-    /// (i.e. every offset of every claimed chunk: chunk_id ∈ [1,
-    /// next_chunk_id), offset ∈ [0, CHUNK_SIZE)).
+    /// (i.e. every offset of every claimed chunk: `chunk_id` ∈ [1,
+    /// `next_chunk_id`), offset ∈ [0, `CHUNK_SIZE`)).
     ///
     /// `0..capacity()` is **not** a valid Idx range — `Idx` is encoded
     /// `(chunk_id << CHUNK_LOG2) | offset`, so iteration must walk the

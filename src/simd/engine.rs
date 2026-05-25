@@ -115,7 +115,7 @@ impl SIMDEngine {
         let (w, h) = (self.n >> Self::CELLS_IN_CHUNK.ilog2(), self.n);
         let mut row_prev = self.data[(h - 1) * w..].to_vec();
         let mut row_curr = self.data[..w].to_vec();
-        let row_preserved = row_curr.to_vec();
+        let row_preserved = row_curr.clone();
         let mut row_next = self.data[w..2 * w].to_vec();
         let dst = &mut self.data[..w];
         Self::update_row(&row_prev, &row_curr, &row_next, dst);

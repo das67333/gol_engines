@@ -243,7 +243,7 @@ fn determine_direction<Meta: Default + Sync>(
     let z64_centre_to_u64 = |x, y| {
         let xs = (4 + x) as u64;
         let ys = ((4 + y) << 3) as u64;
-        let bitmask = (0x0101010101010101 << xs) - 0x0101010101010101;
+        let bitmask = (0x0101_0101_0101_0101 << xs) - 0x0101_0101_0101_0101;
         let left = (nw >> ys) | (sw << (64 - ys));
         let right = (ne >> ys) | (se << (64 - ys));
         ((right & bitmask) << (8 - xs)) | ((left & (!bitmask)) >> xs)
@@ -251,36 +251,36 @@ fn determine_direction<Meta: Default + Sync>(
 
     let mut dmap = 0;
     if centre == z64_centre_to_u64(-1, -1) {
-        dmap |= 1
+        dmap |= 1;
     } // SE
     if centre == z64_centre_to_u64(0, -2) {
-        dmap |= 2
+        dmap |= 2;
     } // S
     if centre == z64_centre_to_u64(1, -1) {
-        dmap |= 4
+        dmap |= 4;
     } // SW
     if centre == z64_centre_to_u64(2, 0) {
-        dmap |= 8
+        dmap |= 8;
     } // W
     if centre == z64_centre_to_u64(1, 1) {
-        dmap |= 16
+        dmap |= 16;
     } // NW
     if centre == z64_centre_to_u64(0, 2) {
-        dmap |= 32
+        dmap |= 32;
     } // N
     if centre == z64_centre_to_u64(-1, 1) {
-        dmap |= 64
+        dmap |= 64;
     } // NE
     if centre == z64_centre_to_u64(-2, 0) {
-        dmap |= 128
+        dmap |= 128;
     } // E
 
     let mut lmask = 0;
     if centre != 0 {
-        if dmap & 170 != 0 {
+        if dmap & 0b1010_1010 != 0 {
             lmask |= 3;
         }
-        if dmap & 85 != 0 {
+        if dmap & 0b0101_0101 != 0 {
             lmask |= 7;
         }
     }
@@ -292,8 +292,8 @@ fn determine_direction<Meta: Default + Sync>(
 /// Compute lane descriptors for a node. Thread-safe (uses CAS on `status_extra`).
 ///
 /// Kept synchronous: `node2lanes` is idempotent and cheap to spin on (it only
-/// needs the already-present cell data, not async HashLife results), so a
-/// simple CAS + spinner avoids the cost of adding a BiTask phase for it.
+/// needs the already-present cell data, not async `HashLife` results), so a
+/// simple CAS + spinner avoids the cost of adding a `BiTask` phase for it.
 /// Called from both `is_solitonic` (the solitonic check inside the binode
 /// phase machine) and from the finalization steps of Phases Solitonic / Base.
 pub(super) fn node2lanes(
@@ -489,11 +489,11 @@ pub(super) fn is_solitonic(
     size_log2: u32,
 ) -> bool {
     let lanes1 = node2lanes(mem, blank_nodes, idx.0, size_log2);
-    if lanes1 & 255 == 0 {
+    if lanes1.trailing_zeros() >= 8 {
         return false;
     }
     let lanes2 = node2lanes(mem, blank_nodes, idx.1, size_log2);
-    if lanes2 & 255 == 0 {
+    if lanes2.trailing_zeros() >= 8 {
         return false;
     }
     let commonlanes = (lanes1 & lanes2) >> 32;

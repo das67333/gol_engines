@@ -47,7 +47,7 @@ impl CacheEntry {
     }
 }
 
-/// Caches results of StreamLife's `update_binode` operation.
+/// Caches results of `StreamLife`'s `update_binode` operation.
 pub struct BinodeCache {
     inner: ConcurrentHashTable<CacheEntry>,
     hasher: ahash::AHasher,
@@ -126,10 +126,10 @@ impl BinodeCache {
     }
 }
 
-/// Type alias for per-thread BinodeCache references.
+/// Type alias for per-thread `BinodeCache` references.
 pub type BinodeCacheRef<'a> = ShardedRef<'a, BinodeCache>;
 
-impl<'a> BinodeCacheRef<'a> {
+impl BinodeCacheRef<'_> {
     /// Find or create a cache entry. Uses the per-thread sharded length counter.
     pub fn entry(&self, key: (Idx, Idx)) -> Idx {
         let (idx, inserted) = self.base.entry_inner(self.shard_idx, key);
