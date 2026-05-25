@@ -1,9 +1,13 @@
 use super::{
-    super::{LEAF_SIZE_LOG2, node::QuadTreeNode, sharded_statistics::LengthShard, status},
+    super::{
+        node::QuadTreeNode,
+        parallel_executors::{GcMarkExecutor, GcSweepExecutor},
+        sharded_statistics::LengthShard,
+        status,
+    },
     base::{ConcurrentHashTable, Idx, NULL_IDX, compute_hash},
 };
-use crossbeam::deque::{Steal, Stealer, Worker};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 /// Shared interface for accessing nodes.
 pub trait NodeAccess<Meta: Default + Sync> {
@@ -200,82 +204,24 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
     /// parallel — removing dead entries to per-thread free lists and
     /// resetting computation state on survivors.
     pub fn gc(&mut self, roots: &[Idx], size_log2: u32) {
-        // Phase 1: parallel mark — set GC_MARK bit on all reachable nodes.
-        self.mark_reachable_parallel(roots, size_log2);
-
-        // Phase 2: parallel sweep — walk bucket chains, remove unmarked
-        // entries, reset survivors (clears GC_MARK along with all other
-        // status bits). We intentionally leave `status_extra` and `extra`
-        // (StreamLife lane data) untouched — they depend only on cell
-        // structure, which is immutable for a given Idx.
-        self.inner.gc(|entry| {
-            if entry.status.load(Ordering::Relaxed) & status::GC_MARK == 0 {
-                true // dead
-            } else {
-                entry.status.store(0, Ordering::Relaxed);
-                entry.cache.set_value(Idx::default());
-                false // live, now reset
-            }
-        });
-    }
-
-    /// Parallel mark phase using work-stealing. Each thread does DFS;
-    /// `fetch_or(GC_MARK)` serves as both the atomic mark and the
-    /// already-visited check.
-    fn mark_reachable_parallel(&self, roots: &[Idx], size_log2: u32) {
         let threads_cnt = self.inner.thread_states.len();
+        GcMarkExecutor::new(self, roots, size_log2, threads_cnt).run();
 
-        let mut queues: Vec<Worker<(Idx, u32)>> = Vec::with_capacity(threads_cnt);
-        let mut stealers: Vec<Stealer<(Idx, u32)>> = Vec::with_capacity(threads_cnt);
-        for _ in 0..threads_cnt {
-            let q = Worker::new_lifo();
-            stealers.push(q.stealer());
-            queues.push(q);
-        }
-
-        let pending = AtomicUsize::new(roots.len());
-        for &root in roots {
-            queues[0].push((root, size_log2));
-        }
-
-        std::thread::scope(|scope| {
-            for queue in queues {
-                let stealers = &stealers;
-                let pending = &pending;
-                scope.spawn(move || {
-                    loop {
-                        // Pop from local queue, or steal.
-                        let item = queue.pop().or_else(|| {
-                            stealers.iter().find_map(|s| match s.steal() {
-                                Steal::Success(item) => Some(item),
-                                _ => None,
-                            })
-                        });
-
-                        if let Some((idx, sl2)) = item {
-                            let n = self.get(idx);
-                            let prev = n.status.fetch_or(status::GC_MARK, Ordering::Relaxed);
-                            if prev & status::GC_MARK == 0 && sl2 > LEAF_SIZE_LOG2 {
-                                for child in n.parts() {
-                                    pending.fetch_add(1, Ordering::Relaxed);
-                                    queue.push((child, sl2 - 1));
-                                }
-                                if prev & status::FINISHED != 0 {
-                                    pending.fetch_add(1, Ordering::Relaxed);
-                                    queue.push((n.cache.get_value(), sl2 - 1));
-                                }
-                            }
-                            pending.fetch_sub(1, Ordering::Relaxed);
-                        } else if pending.load(Ordering::Relaxed) == 0 {
-                            break;
-                        } else {
-                            std::thread::yield_now();
-                        }
-                    }
-                });
-            }
-        });
+        // Sweep: remove unmarked entries, reset survivors (clears GC_MARK
+        // along with all other status bits). We intentionally leave
+        // `status_extra` and `extra` (StreamLife lane data) untouched —
+        // they depend only on cell structure, which is immutable for a given Idx.
+        GcSweepExecutor::new(&mut self.inner).run(is_dead_after_mark);
     }
+}
+
+/// Returns `true` if the node was not marked reachable and should be removed.
+fn is_dead_after_mark<Meta: Default + Sync>(entry: &QuadTreeNode<Meta>) -> bool {
+    if entry.status.load(Ordering::Relaxed) & status::GC_MARK == 0 {
+        return true;
+    }
+    entry.status.store(status::NOT_STARTED, Ordering::Relaxed);
+    false
 }
 
 impl<'a, Meta: Default + Sync> NodeStoreRef<'a, Meta> {

@@ -98,9 +98,9 @@ impl Pattern {
     ///
     /// # Arguments
     /// * `approx_size_log2`:
-    ///   An optional hint for the approximate size of the pattern.  
-    ///   If provided, the internal [`KIVMap`] pre-allocates blank nodes
-    ///   up to that size to speed up future access.
+    /// An optional hint for the approximate size of the pattern.  
+    /// If provided, the internal [`KIVMap`] pre-allocates blank nodes
+    /// up to that size to speed up future access.
     pub fn new(approx_size_log2: Option<SizeLog2>) -> Self {
         let mut kiv = KIVMap::new();
         // fill cache of blank nodes
@@ -195,7 +195,7 @@ impl Pattern {
 
             let combine = |x: u64, y: u64| -> u64 {
                 x ^ y
-                    .wrapping_add(0x9e3779b9)
+                    .wrapping_add(0x9e37_79b9)
                     .wrapping_add(x << 6)
                     .wrapping_add(x >> 2)
             };
@@ -588,17 +588,13 @@ impl Pattern {
     /// - Format-specific errors occur from `from_format`
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let data = fs::read(path).with_context(|| format!("Failed to read file: {:?}", path))?;
+        let data = fs::read(path).with_context(|| format!("Failed to read file: {path:?}"))?;
 
         if path.extension() == Some("mc".as_ref()) {
             return Self::from_format(PatternFormat::Macrocell, &data);
         }
 
-        if path
-            .to_str()
-            .map(|s| s.ends_with(".mc.gz"))
-            .unwrap_or(false)
-        {
+        if path.to_str().is_some_and(|s| s.ends_with(".mc.gz")) {
             return Self::from_format(PatternFormat::CompressedMacrocell, &data);
         }
 
@@ -637,11 +633,7 @@ impl Pattern {
 
         let format = if path.extension() == Some("mc".as_ref()) {
             PatternFormat::Macrocell
-        } else if path
-            .to_str()
-            .map(|s| s.ends_with(".mc.gz"))
-            .unwrap_or(false)
-        {
+        } else if path.to_str().is_some_and(|s| s.ends_with(".mc.gz")) {
             PatternFormat::CompressedMacrocell
         } else if path.extension() == Some("rle".as_ref()) {
             PatternFormat::RLE
@@ -650,7 +642,7 @@ impl Pattern {
         };
 
         let data = self.to_format(format)?;
-        fs::write(path, data).with_context(|| format!("Failed to write file: {:?}", path))
+        fs::write(path, data).with_context(|| format!("Failed to write file: {path:?}"))
     }
 
     /// Creates a pattern from packed cell data. See [`PatternFormat::PackedCells`].
@@ -679,7 +671,7 @@ impl Pattern {
         }
 
         if size_log2 < 3 {
-            for x in data.iter() {
+            for x in data {
                 if *x & !((1u32 << n) - 1) as u8 != 0 {
                     return Err(anyhow!("Found cells out of bounds"));
                 }
@@ -1071,7 +1063,7 @@ impl Pattern {
         // Parse header
         if let Some(line) = lines.next() {
             // Parse x, y and rule
-            let mut parts = line.split(|&b| b == b',').map(|x| x.trim_ascii());
+            let mut parts = line.split(|&b| b == b',').map(<[u8]>::trim_ascii);
 
             let extract_value = |part: &[u8], expected_key: &[u8]| {
                 let mut items = part.split(|&b| b == b'=');

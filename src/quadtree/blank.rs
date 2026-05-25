@@ -31,7 +31,7 @@ impl BlankNodes {
                 v.push(mem.find_or_create_node(b, b, b, b));
             } else {
                 v.push(mem.find_or_create_leaf_from_u64(0));
-            };
+            }
         }
         v[i]
     }

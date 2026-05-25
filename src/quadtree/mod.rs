@@ -1,9 +1,9 @@
 mod algorithm;
 mod blank;
-mod executors;
 mod hashlife;
 mod hashtable;
 mod node;
+mod parallel_executors;
 mod sharded_statistics;
 mod spin;
 mod streamlife;

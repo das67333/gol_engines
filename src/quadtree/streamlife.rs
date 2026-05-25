@@ -1,9 +1,9 @@
 use super::{
     algorithm,
-    executors::StreamLifeExecutor,
     hashlife::HashLifeEngine,
     hashtable::{BinodeCache, CacheEntry, Idx},
     node::QuadTreeNode,
+    parallel_executors::StreamLifeExecutor,
 };
 use crate::{GoLEngine, Pattern, Topology};
 use anyhow::{Result, anyhow};
@@ -101,11 +101,9 @@ impl GoLEngine for StreamLifeEngine {
                 .get_mut(self.base.size_log2, &self.base.mem),
         ));
 
-        let biroot = if let Some(x) =
+        let Some(biroot) =
             StreamLifeExecutor::new(self, biroot, self.base.size_log2).run(self.base.threads_cnt)
-        {
-            x
-        } else {
+        else {
             self.load_pattern(&backup, self.base.topology)?;
             return Err(anyhow!(
                 "StreamLife: overfilled NodeStore or BinodeCache, try smaller step"

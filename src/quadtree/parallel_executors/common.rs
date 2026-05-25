@@ -488,7 +488,7 @@ impl<'a> ProcessingGuard<'a> {
     }
 }
 
-impl<'a> Drop for ProcessingGuard<'a> {
+impl Drop for ProcessingGuard<'_> {
     fn drop(&mut self) {
         if !self.released {
             // `ACTIVE → PENDING` while preserving `DEPS_LOCK`.

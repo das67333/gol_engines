@@ -423,7 +423,7 @@ impl<'a> BiExecutorThread<'a> {
             match result {
                 Steal::Success(task) => return Some(task),
                 Steal::Empty => return None,
-                Steal::Retry => continue,
+                Steal::Retry => {},
             }
         }
     }

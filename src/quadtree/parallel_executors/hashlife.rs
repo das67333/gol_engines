@@ -101,7 +101,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
                 let pd: &mut ProcessingData<Idx> = n.cache.get_ref();
                 // SAFETY: produced by `Box::into_raw` in
                 // `start_processing_node`; all workers have joined.
-                unsafe { drop(Box::from_raw(pd as *mut ProcessingData<Idx>)) };
+                unsafe { drop(Box::from_raw(std::ptr::from_mut::<ProcessingData<Idx>>(pd))) };
             }
         });
     }
@@ -160,7 +160,7 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
             n.cache.set_value(result);
             guard.publish_finished();
             unsafe { drop(Box::from_raw(data as *mut ProcessingData<Idx>)) };
-            self.notify_dependents(&task, dependents);
+            self.notify_dependents(&task, &dependents);
         }
     }
 
@@ -193,8 +193,8 @@ impl<'a, Meta: Default + Sync> ExecutorThread<'a, Meta> {
     /// dependent node: `waiting_cnt` is atomic, and `ProcessingData` stays
     /// alive until `FINISHED` (which only the owner can publish, after the
     /// counter has dropped to zero).
-    fn notify_dependents(&self, task: &Task, dependents: SmallVec<[Idx; 2]>) {
-        for &dependent in dependents.iter() {
+    fn notify_dependents(&self, task: &Task, dependents: &SmallVec<[Idx; 2]>) {
+        for &dependent in dependents {
             let n = self.mem.get(dependent);
             let dep_data: &ProcessingData<Idx> = n.cache.get_ref();
             let prev = dep_data.decrement_waiting_cnt();

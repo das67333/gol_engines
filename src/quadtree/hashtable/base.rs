@@ -67,17 +67,14 @@ const OFFSET_MASK: u32 = CHUNK_SIZE - 1;
 /// 1).
 const MAX_ALLOCS_PER_TASK: usize = 64;
 
-#[inline(always)]
 pub(super) fn chunk_id(idx: Idx) -> u32 {
     idx >> CHUNK_LOG2
 }
 
-#[inline(always)]
 pub(super) fn offset_in_chunk(idx: Idx) -> u32 {
     idx & OFFSET_MASK
 }
 
-#[inline(always)]
 pub(super) fn encode_idx(chunk_id: u32, offset: u32) -> Idx {
     assert!(offset < CHUNK_SIZE);
     (chunk_id << CHUNK_LOG2) | offset
@@ -168,7 +165,6 @@ impl<E> Chunk<E> {
     /// Get a raw pointer to a slot inside this chunk. Caller must have
     /// observed (e.g. via Acquire load through bucket head) that the
     /// chunk has been claimed.
-    #[inline(always)]
     pub(super) fn slot(&self, offset: u32) -> *mut UnsafeCell<E> {
         let base = self.storage.load(Ordering::Acquire);
         assert!(!base.is_null(), "lookup of Idx in unclaimed chunk");
@@ -198,13 +194,13 @@ impl<E> Drop for Chunk<E> {
 /// Per-thread allocator state. Owner-only mutation; other threads only
 /// read via `Idx` lookups (which go through the chunks table, not the
 /// thread state).
-pub(super) struct ThreadState {
+pub(crate) struct ThreadState {
     /// Chunk this thread is currently allocating from. `0` = none yet.
     pub(super) current_chunk_id: u32,
     /// Bump-pointer offset within `current_chunk_id`.
     pub(super) next_offset_in_chunk: u32,
     /// Head of this thread's free list (or `NULL_IDX` if empty).
-    pub(super) free_list_head: Idx,
+    pub(crate) free_list_head: Idx,
 }
 
 impl ThreadState {
@@ -224,18 +220,18 @@ impl ThreadState {
 /// Concurrent chained hashtable backed by per-thread node chunks.
 ///
 /// See module docs for the full design.
-pub(super) struct ConcurrentHashTable<E> {
+pub(crate) struct ConcurrentHashTable<E> {
     /// Bucket array. Each entry is the head Idx of a chain.
-    pub(super) buckets: Box<[AtomicU32]>,
+    pub(crate) buckets: Box<[AtomicU32]>,
     /// Chunks table. `chunks[0]` is reserved as null; chunks[1..] are
     /// claimed lazily by threads via `next_chunk_id.fetch_add`.
     pub(super) chunks: Box<[Chunk<E>]>,
     /// Bump pointer for chunk claims. Starts at 1 (chunk 0 reserved).
     pub(super) next_chunk_id: AtomicU32,
     /// Per-thread allocator state (one entry per shard).
-    pub(super) thread_states: Box<[UnsafeCell<ThreadState>]>,
+    pub(crate) thread_states: Box<[UnsafeCell<ThreadState>]>,
     /// Length tracking (existing sharded mechanism).
-    pub(super) length: ShardedLength,
+    pub(crate) length: ShardedLength,
     /// Cancellation threshold: when `len_upper_bound > length_limit`, callers
     /// stop fetching new tasks. Set below `capacity` by [`MAX_ALLOCS_PER_TASK`]
     /// × `threads_cnt` so that the post-cancel allocation burst can complete
@@ -341,8 +337,8 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     ///
     /// # Panics (debug)
     /// If `idx == NULL_IDX` or its chunk is not yet claimed.
-    pub(super) fn get(&self, idx: Idx) -> &E {
-        assert!(idx != NULL_IDX, "get(NULL_IDX)");
+    pub(crate) fn get(&self, idx: Idx) -> &E {
+        // TODO: assert_ne!(idx, NULL_IDX, "get(NULL_IDX)");
         let cid = chunk_id(idx);
         let off = offset_in_chunk(idx);
         let slot_ptr = self.chunks[cid as usize].slot(off);
@@ -577,67 +573,6 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
                 f(encode_idx(cid, off));
             }
         }
-    }
-
-    /// Parallel GC sweep: walks every bucket chain, calls `process(entry)`
-    /// for each entry. `process` returns `true` for dead entries (to be
-    /// freed) and may reset live entries as a side effect.
-    ///
-    /// Dead entries are returned to per-thread free lists (one range of
-    /// buckets per thread), distributing freed slots evenly across shards.
-    /// The length counter is updated to the exact survivor count.
-    ///
-    /// Must be called after all executor threads have joined.
-    pub(super) fn gc(&mut self, process: impl Fn(&E) -> bool + Sync) {
-        let threads_cnt = self.thread_states.len();
-        let bucket_count = self.buckets.len();
-        let buckets_per_thread = bucket_count.div_ceil(threads_cnt);
-
-        // SAFETY: reborrow as shared. `ConcurrentHashTable` is `Sync`
-        // (`unsafe impl Sync`), so `&self` is `Send` across threads.
-        // Each thread accesses disjoint bucket ranges and its own
-        // `ThreadState`; no concurrent allocation is in flight.
-        let this = &*self;
-
-        let per_thread_live: Vec<usize> = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(threads_cnt);
-            for tid in 0..threads_cnt {
-                let start = tid * buckets_per_thread;
-                let end = (start + buckets_per_thread).min(bucket_count);
-                let process = &process;
-                handles.push(scope.spawn(move || {
-                    let ts_ptr: *mut ThreadState = this.thread_states[tid].get();
-                    let mut live_count = 0usize;
-
-                    for i in start..end {
-                        let mut new_head = NULL_IDX;
-                        let mut cur = this.buckets[i].load(Ordering::Relaxed);
-                        while cur != NULL_IDX {
-                            let entry = this.get(cur);
-                            let next = entry.next().load(Ordering::Relaxed);
-                            if process(entry) {
-                                // Dead: push to this thread's free list.
-                                let old_head = unsafe { (*ts_ptr).free_list_head };
-                                entry.next().store(old_head, Ordering::Relaxed);
-                                unsafe { (*ts_ptr).free_list_head = cur };
-                            } else {
-                                // Live: keep in chain.
-                                live_count += 1;
-                                entry.next().store(new_head, Ordering::Relaxed);
-                                new_head = cur;
-                            }
-                            cur = next;
-                        }
-                        this.buckets[i].store(new_head, Ordering::Relaxed);
-                    }
-                    live_count
-                }));
-            }
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        let total_live: usize = per_thread_live.iter().sum();
-        self.length.set(total_live);
     }
 }
 

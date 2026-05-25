@@ -8,12 +8,10 @@ use std::cell::RefCell;
 pub struct Ticks(u64);
 
 impl Ticks {
-    #[inline(always)]
     pub fn now() -> Self {
         Self(Self::read_timestamp())
     }
 
-    #[inline(always)]
     pub fn elapsed_since(self, start: Ticks) -> Self {
         Self(self.0.wrapping_sub(start.0))
     }
@@ -23,7 +21,6 @@ impl Ticks {
     }
 
     #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
     fn read_timestamp() -> u64 {
         let value: u64;
         unsafe {
@@ -33,7 +30,6 @@ impl Ticks {
     }
 
     #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
     fn read_timestamp() -> u64 {
         unsafe {
             core::arch::x86_64::_rdtsc()

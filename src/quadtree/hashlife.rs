@@ -1,9 +1,9 @@
 use super::{
     LEAF_SIZE_LOG2,
     blank::BlankNodes,
-    executors::HashLifeExecutor,
     hashtable::{Idx, NodeStore},
     node::QuadTreeNode,
+    parallel_executors::HashLifeExecutor,
 };
 use crate::{GoLEngine, Pattern, PatternNode, Topology};
 use ahash::AHashMap as HashMap;
@@ -158,7 +158,7 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
         // `bucket_count` nodes plus a `bucket_count`-sized array of bucket
         // heads. Per-bucket cost: one `AtomicU32` (4 B) plus one node body.
         // We pick the largest power-of-2 `bucket_count` fitting the budget.
-        let mem_bytes = (mem_limit_mib as u64) << 20;
+        let mem_bytes = u64::from(mem_limit_mib) << 20;
         let per_bucket = std::mem::size_of::<std::sync::atomic::AtomicU32>()
             + std::mem::size_of::<QuadTreeNode<Meta>>();
         let max_buckets = (mem_bytes / per_bucket as u64).max(1);

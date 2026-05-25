@@ -1,4 +1,5 @@
 #![warn(clippy::all)]
+#![warn(clippy::pedantic)]
 
 mod pattern;
 mod quadtree;
