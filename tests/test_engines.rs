@@ -67,6 +67,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_repeated_same_step_on_stationary_pattern() {
+        const STATIONARY_RLE: &[u8] =
+            b"x = 16, y = 16, rule = B3/S23\n2o12b2o$2o12b2o$12$2o12b2o$2o12b2o!";
+        let pattern = Pattern::from_format(PatternFormat::RLE, STATIONARY_RLE).unwrap();
+        let expected_hash = pattern.hash();
+
+        for &threads_cnt in &[1usize, 2, 4] {
+            for engine_kind in ["hashlife", "streamlife"] {
+                let mut engine: Box<dyn GoLEngine> = match engine_kind {
+                    "hashlife" => Box::new(HashLifeEngine::new(64, threads_cnt)),
+                    "streamlife" => Box::new(StreamLifeEngine::new(64, threads_cnt)),
+                    _ => unreachable!(),
+                };
+                engine.load_pattern(&pattern, Topology::Unbounded).unwrap();
+
+                for update_idx in 0..3 {
+                    engine.update(4).unwrap();
+                    assert_eq!(
+                        engine.current_state().hash(),
+                        expected_hash,
+                        "{engine_kind} threads={threads_cnt} update={update_idx} changed a stationary pattern"
+                    );
+                }
+            }
+        }
+    }
+
     /// Multi-threaded consistency: the parallel executors must produce the
     /// same result regardless of thread count. Exercises the StreamLife
     /// async cross-engine work-stealing path (the binode → HashLife task

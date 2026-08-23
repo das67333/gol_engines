@@ -171,7 +171,26 @@ impl<'a> StreamLifeExecutor<'a> {
 
         // Look up root entry
         let root_idx = bicache.entry(self.biroot);
-        let root_status = &bicache.get(root_idx).status();
+        let root_status = bicache.get(root_idx).status();
+
+        // Reuse an already-computed root instead of queueing a task that can
+        // never acquire the PENDING -> ACTIVE processing guard.
+        if !start_processing_entry(bicache, root_idx, smallvec![]) {
+            let status_value = root_status.load(Ordering::Acquire);
+            assert!(
+                status_value & status::FINISHED != 0,
+                "root binode has nonterminal status {status_value:#010b} before executor start"
+            );
+            println!("Time spent on streamlife executor: {:?}", timer.elapsed());
+            println!(
+                "Nodes count: {} / {}, BiCache count: {} / {}",
+                self.engine.base.mem.len(),
+                self.engine.base.mem.capacity(),
+                bicache.len(),
+                bicache.capacity()
+            );
+            return Some(bicache.get(root_idx).payload().get_value());
+        }
 
         // Create worker queues and stealers for both task kinds.
         let mut bi_queues = Vec::with_capacity(num_threads);
@@ -188,8 +207,7 @@ impl<'a> StreamLifeExecutor<'a> {
             hash_queues.push(hash_queue);
         }
 
-        // Claim root entry and push initial task
-        start_processing_entry(bicache, root_idx, smallvec![]);
+        // The root was claimed above; queue its initial task.
         bi_queues[0].push(BiTask {
             entry_idx: root_idx,
             size_log2: self.size_log2,

@@ -41,6 +41,21 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
 
     pub fn run(&self, num_threads: usize) -> Option<Idx> {
         let timer = std::time::Instant::now();
+        let root_node = self.mem.get(self.root);
+
+        // Reuse an already-computed root instead of queueing a task that can
+        // never acquire the PENDING -> ACTIVE processing guard.
+        if !start_processing_node::<Meta, Idx>(root_node, smallvec![]) {
+            let root_status = root_node.status.load(Ordering::Acquire);
+            assert!(
+                root_status & status::FINISHED != 0,
+                "root node has nonterminal status {root_status:#010b} before executor start"
+            );
+            println!("Time spent on hashlife executor: {:?}", timer.elapsed());
+            println!("Nodes count: {} / {}", self.mem.len(), self.mem.capacity());
+            return Some(root_node.cache.get_value());
+        }
+
         // Create worker queues and stealers
         let mut queues = Vec::with_capacity(num_threads);
         let mut stealers = Vec::with_capacity(num_threads);
@@ -52,8 +67,6 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
             stealers.push(stealer);
         }
 
-        let root_node = self.mem.get(self.root);
-        start_processing_node::<Meta, Idx>(root_node, smallvec![]);
         queues[0].push(Task::new(self.root, self.size_log2));
 
         let mut total_stats = ExecutionStatistics::new();
