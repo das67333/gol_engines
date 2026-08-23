@@ -1,9 +1,6 @@
 use crate::util::{local_time, print_population};
 use clap::{Args, ValueEnum};
-use gol_engines::{
-    GoLEngine, HashLifeEngineAsync, HashLifeEngineSync, Pattern, StreamLifeEngineAsync,
-    StreamLifeEngineSync,
-};
+use gol_engines::{GoLEngine, HashLifeEngine, Pattern, StreamLifeEngine};
 use num_bigint::BigInt;
 
 #[derive(Args, Debug)]
@@ -50,12 +47,8 @@ pub(super) struct UpdateArgs {
 enum Engine {
     /// Parallel implementation of HashLife
     Hashlife,
-    /// Single-threaded implementation of HashLife
-    HashlifeSt,
     /// Parallel implementation of StreamLife
     Streamlife,
-    /// Single-threaded implementation of StreamLife
-    StreamlifeSt,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -86,10 +79,8 @@ pub(super) fn run_update(args: UpdateArgs) {
 
     let timer = std::time::Instant::now();
     let mut engine: Box<dyn GoLEngine> = match args.engine {
-        Engine::Hashlife => Box::new(HashLifeEngineAsync::new(mem_limit_mib, args.workers)),
-        Engine::HashlifeSt => Box::new(HashLifeEngineSync::new(mem_limit_mib, args.workers)),
-        Engine::Streamlife => Box::new(StreamLifeEngineAsync::new(mem_limit_mib, args.workers)),
-        Engine::StreamlifeSt => Box::new(StreamLifeEngineSync::new(mem_limit_mib, args.workers)),
+        Engine::Hashlife => Box::new(HashLifeEngine::new(mem_limit_mib, args.workers)),
+        Engine::Streamlife => Box::new(StreamLifeEngine::new(mem_limit_mib, args.workers)),
     };
     println!(
         "Initialized engine in {:.1} secs",
