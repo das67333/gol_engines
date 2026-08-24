@@ -27,7 +27,7 @@ impl<Extra: Clone + Default> PrefetchedNode<Extra> {
         unsafe {
             use std::arch::x86_64::*;
             let idx = hash & ((*mem.base.get()).hashtable.len() - 1);
-            _mm_prefetch::<_MM_HINT_T0>((*mem.base.get()).hashtable.get_unchecked(idx)
+            _mm_prefetch::<_MM_HINT_T0>((&(*mem.base.get()).hashtable).get_unchecked(idx)
                 as *const QuadTreeNode<Extra> as *const i8);
         }
         Self {
