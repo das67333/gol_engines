@@ -237,11 +237,8 @@ pub(crate) struct ConcurrentHashTable<E> {
     /// × `threads_cnt` so that the post-cancel allocation burst can complete
     /// without exceeding `capacity` or exhausting the chunks table.
     pub(super) length_limit: usize,
-    /// Hard cap: maximum number of nodes the table can hold. Equal to
-    /// `bucket_count` (load factor 1) when the chunks table can address that
-    /// many; capped tighter at the boundary `cap_log2 ≈ 32` where the chunk
-    /// table cannot host both the storage chunks and one partial chunk per
-    /// thread without exceeding the 16-bit chunk-id space.
+    /// Maximum live entries, independent of bucket count. Capped to leave
+    /// address space for the reserved chunk and one partial chunk per thread.
     pub(super) capacity: usize,
 }
 
@@ -254,9 +251,8 @@ pub(crate) struct ConcurrentHashTable<E> {
 unsafe impl<E: Sync> Sync for ConcurrentHashTable<E> {}
 
 impl<E: HashtableSlot> ConcurrentHashTable<E> {
-    /// Create a new table with `2^cap_log2` buckets and node capacity equal
-    /// to `bucket_count` (load factor 1), capped by what the chunks table
-    /// can address.
+    /// Create a table with `2^cap_log2` buckets and a separate entry capacity,
+    /// capped by what the chunks table can address.
     ///
     /// ## Cancellation budget
     ///
@@ -274,10 +270,10 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     /// thread (each thread can be mid-fill on its own chunk), plus the
     /// reserved chunk 0. The maximum chunk id is `2^(32 - CHUNK_LOG2)`
     /// (the `Idx = (chunk_id, offset)` encoding); when that limit binds
-    /// (`cap_log2 ≈ 32`), `capacity` is reduced accordingly.
+    /// (`entry_capacity ≈ 2^32`), `capacity` is reduced accordingly.
     ///
     /// `threads_cnt` is the number of shards (one `ThreadState` per shard).
-    pub(super) fn new(cap_log2: u32, threads_cnt: usize) -> Self {
+    pub(super) fn new(cap_log2: u32, entry_capacity: usize, threads_cnt: usize) -> Self {
         let max_cap_log2 = std::mem::size_of::<Idx>() as u32 * 8;
         assert!(
             cap_log2 <= max_cap_log2,
@@ -295,8 +291,8 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         let max_storage_chunks = chunk_id_count.saturating_sub(1).saturating_sub(threads_cnt);
         let max_storage_nodes = max_storage_chunks * CHUNK_SIZE as usize;
 
-        // Load factor 1 capped by chunk-table addressability.
-        let capacity = bucket_count.min(max_storage_nodes);
+        // Bucket count controls lookup cost; entry capacity controls cancellation.
+        let capacity = entry_capacity.min(max_storage_nodes);
 
         // Cancellation threshold: leaves room for in-flight post-cancel
         // allocations.
@@ -540,10 +536,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         self.length.len_exact()
     }
 
-    /// Hard cap on the number of nodes this table can hold without
-    /// exceeding the chunk-table addressability bound. Equals `bucket_count`
-    /// (load factor 1) except at the `cap_log2 ≈ 32` boundary, where the
-    /// 16-bit chunk-id space forces a tighter cap.
+    /// Entry capacity after applying the chunk-table addressability bound.
     pub(super) fn capacity(&self) -> usize {
         self.capacity
     }

@@ -54,9 +54,9 @@ pub struct BinodeCache {
 }
 
 impl BinodeCache {
-    pub fn new(cap_log2: u32, threads_cnt: usize) -> Self {
+    pub fn new(cap_log2: u32, entry_capacity: usize, threads_cnt: usize) -> Self {
         Self {
-            inner: ConcurrentHashTable::new(cap_log2, threads_cnt),
+            inner: ConcurrentHashTable::new(cap_log2, entry_capacity, threads_cnt),
             hasher: ahash::AHasher::default(),
         }
     }

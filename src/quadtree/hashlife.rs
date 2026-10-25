@@ -138,8 +138,8 @@ impl<Meta: Default + Sync> HashLifeEngine<Meta> {
         pattern
     }
 
-    pub(super) fn with_capacity(cap_log2: u32, threads_cnt: usize) -> Self {
-        let mem = NodeStore::new(cap_log2, threads_cnt);
+    pub(super) fn with_capacity(cap_log2: u32, entry_capacity: usize, threads_cnt: usize) -> Self {
+        let mem = NodeStore::new(cap_log2, entry_capacity, threads_cnt);
         Self {
             size_log2: LEAF_SIZE_LOG2,
             root: mem.find_or_create_leaf_from_u64(0),
@@ -163,7 +163,7 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
             + std::mem::size_of::<QuadTreeNode<Meta>>();
         let max_buckets = (mem_bytes / per_bucket as u64).max(1);
         let cap_log2 = max_buckets.ilog2();
-        Self::with_capacity(cap_log2, threads_cnt)
+        Self::with_capacity(cap_log2, 1usize << cap_log2, threads_cnt)
     }
 
     fn load_pattern(&mut self, pattern: &Pattern, topology: Topology) -> Result<()> {

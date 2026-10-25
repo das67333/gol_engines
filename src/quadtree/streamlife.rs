@@ -21,6 +21,45 @@ pub struct StreamLifeEngine {
 }
 
 impl StreamLifeEngine {
+    // Balance the stores by bytes. Buckets are powers of two; entry storage uses the remainder.
+    // This accounts for buckets and live entries, excluding allocator chunk slack and metadata.
+    fn capacity_plan(mem_limit_mib: u32) -> (u32, usize, u32, usize) {
+        let budget = u64::from(mem_limit_mib) << 20;
+        let bucket_bytes = std::mem::size_of::<std::sync::atomic::AtomicU32>() as u64;
+        let node_entry_bytes = std::mem::size_of::<QuadTreeNode<u64>>() as u64;
+        let cache_entry_bytes = std::mem::size_of::<CacheEntry>() as u64;
+        let node_bytes = bucket_bytes + node_entry_bytes;
+        let cache_bytes = bucket_bytes + cache_entry_bytes;
+        let mut best = (0, 0);
+        let mut score = (0, 0);
+        for node_log in 0..=32 {
+            for cache_log in 0..=32 {
+                let nodes = node_bytes << node_log;
+                let cache = cache_bytes << cache_log;
+                let candidate = (nodes.min(cache), nodes + cache);
+                if nodes + cache <= budget && candidate > score {
+                    best = (node_log, cache_log);
+                    score = candidate;
+                }
+            }
+        }
+        let node_buckets = 1u64 << best.0;
+        let cache_buckets = 1u64 << best.1;
+        let minimum_nodes = node_bytes * node_buckets;
+        let minimum_cache = cache_bytes * cache_buckets;
+        let budget = budget.max(minimum_nodes + minimum_cache);
+        let node_budget = (budget / 2).clamp(minimum_nodes, budget - minimum_cache);
+        let node_capacity = (node_budget - bucket_bytes * node_buckets) / node_entry_bytes;
+        let cache_capacity =
+            (budget - node_budget - bucket_bytes * cache_buckets) / cache_entry_bytes;
+        (
+            best.0,
+            node_capacity as usize,
+            best.1,
+            cache_capacity as usize,
+        )
+    }
+
     fn add_frame(&mut self, dx: &mut BigInt, dy: &mut BigInt) {
         self.biroot = if let Some(biroot) = self.biroot {
             Some((
@@ -48,20 +87,12 @@ impl StreamLifeEngine {
 
 impl GoLEngine for StreamLifeEngine {
     fn new(mem_limit_mib: u32, threads_cnt: usize) -> Self {
-        // Memory accounting: NodeStore<u64> and BinodeCache share the same
-        // `bucket_count`. Per-bucket cost = (bucket_head + node body) +
-        // (bucket_head + cache entry).
-        let mem_bytes = u64::from(mem_limit_mib) << 20;
-        let per_bucket = std::mem::size_of::<std::sync::atomic::AtomicU32>()
-            + std::mem::size_of::<QuadTreeNode<u64>>()
-            + std::mem::size_of::<std::sync::atomic::AtomicU32>()
-            + std::mem::size_of::<CacheEntry>();
-        let max_buckets = (mem_bytes / per_bucket as u64).max(1);
-        let cap_log2 = max_buckets.ilog2();
+        let (node_log, node_capacity, cache_log, cache_capacity) =
+            Self::capacity_plan(mem_limit_mib);
         Self {
-            base: HashLifeEngine::<u64>::with_capacity(cap_log2, threads_cnt),
+            base: HashLifeEngine::<u64>::with_capacity(node_log, node_capacity, threads_cnt),
             biroot: None,
-            bicache: BinodeCache::new(cap_log2, threads_cnt),
+            bicache: BinodeCache::new(cache_log, cache_capacity, threads_cnt),
         }
     }
 
@@ -165,6 +196,28 @@ impl GoLEngine for StreamLifeEngine {
 mod tests {
     use super::*;
     const SEED: u64 = 42;
+
+    #[test]
+    fn test_capacity_plan() {
+        for (gib, expected) in [
+            (20, (28, 28)),
+            (32, (28, 29)),
+            (48, (29, 29)),
+            (64, (29, 30)),
+            (128, (30, 31)),
+        ] {
+            let (node_log, node_capacity, cache_log, cache_capacity) =
+                StreamLifeEngine::capacity_plan(gib * 1024);
+            assert_eq!((node_log, cache_log), expected);
+            assert!(node_capacity >= 1usize << node_log);
+            assert!(cache_capacity >= 1usize << cache_log);
+            let bytes = 4 * ((1u64 << node_log) + (1u64 << cache_log))
+                + node_capacity as u64 * std::mem::size_of::<QuadTreeNode<u64>>() as u64
+                + cache_capacity as u64 * std::mem::size_of::<CacheEntry>() as u64;
+            assert!(bytes <= u64::from(gib) << 30);
+            assert!((u64::from(gib) << 30) - bytes < 64);
+        }
+    }
 
     #[test]
     fn test_pattern_roundtrip() {
