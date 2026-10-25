@@ -37,6 +37,7 @@
 //! others find their key on retry. No spinlock; no per-slot lock.
 
 use super::super::sharded_statistics::{LengthShard, ShardedLength};
+use crossbeam::utils::CachePadded;
 use std::{
     cell::UnsafeCell,
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
@@ -228,8 +229,8 @@ pub(crate) struct ConcurrentHashTable<E> {
     pub(super) chunks: Box<[Chunk<E>]>,
     /// Bump pointer for chunk claims. Starts at 1 (chunk 0 reserved).
     pub(super) next_chunk_id: AtomicU32,
-    /// Per-thread allocator state (one entry per shard).
-    pub(crate) thread_states: Box<[UnsafeCell<ThreadState>]>,
+    /// Per-thread allocator state, padded to keep independent writers off the same cache line.
+    pub(crate) thread_states: Box<[CachePadded<UnsafeCell<ThreadState>>]>,
     /// Length tracking (existing sharded mechanism).
     pub(crate) length: ShardedLength,
     /// Cancellation threshold: when `len_upper_bound > length_limit`, callers
@@ -313,8 +314,8 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
             .map(|_| AtomicU32::new(NULL_IDX))
             .collect();
 
-        let thread_states: Box<[UnsafeCell<ThreadState>]> = (0..threads_cnt)
-            .map(|_| UnsafeCell::new(ThreadState::new()))
+        let thread_states: Box<[CachePadded<UnsafeCell<ThreadState>>]> = (0..threads_cnt)
+            .map(|_| CachePadded::new(UnsafeCell::new(ThreadState::new())))
             .collect();
 
         Self {
@@ -528,7 +529,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         let chunks_table = self.chunks.len() * std::mem::size_of::<Chunk<E>>();
         let buckets = self.buckets.len() * std::mem::size_of::<AtomicU32>();
         let thread_states =
-            self.thread_states.len() * std::mem::size_of::<UnsafeCell<ThreadState>>();
+            self.thread_states.len() * std::mem::size_of::<CachePadded<UnsafeCell<ThreadState>>>();
         chunk_storage + chunks_table + buckets + thread_states
     }
 

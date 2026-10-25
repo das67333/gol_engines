@@ -12,8 +12,8 @@
 //! - `hash_queue: Worker<Task>` — `HashLife` tasks descended from binode
 //!   Phases Solitonic / Base.
 //!
-//! Pop policy: local LIFO bi first (keep recursion stack-warm), then local
-//! LIFO hash, then steal — bi first, then hash, from a random victim.
+//! Pop policy: local LIFO hash first to finish dependencies, then local bi.
+//! Stealing prefers bi, then hash, from a random victim.
 //! `HashLife`'s pure-engine path is unchanged: it still uses a single
 //! `Worker<Task>`.
 //!
@@ -309,12 +309,12 @@ struct BiExecutorThread<'a> {
 }
 
 impl BiExecutorThread<'_> {
-    /// Initial backoff for the steal-then-sleep loop.
+    /// First idle wait after processing a task.
     const INITIAL_WAIT: Duration = Duration::from_micros(100);
-    /// Maximum backoff.
-    const MAX_WAIT: Duration = Duration::from_millis(100);
+    /// Poll more frequently after the first unsuccessful search for work.
+    const RETRY_WAIT: Duration = Duration::from_micros(10);
     /// Number of random victims to attempt per outer iteration before sleeping.
-    const STEAL_ATTEMPTS: usize = 2;
+    const STEAL_ATTEMPTS: usize = 8;
 
     fn run(&self) -> ExecutionStatistics {
         set_current_execution_stats();
@@ -331,15 +331,14 @@ impl BiExecutorThread<'_> {
                 break;
             }
 
-            // Local LIFO: prefer binode work to keep the recursion stack warm,
-            // then HashLife work.
-            if let Some(task) = self.bi_queue.pop() {
-                self.timed_process_bi_task(task);
+            // Complete local HashLife dependencies before expanding binodes.
+            if let Some(task) = self.hash_queue.pop() {
+                self.timed_process_hash_task(task);
                 wait_duration = Self::INITIAL_WAIT;
                 continue;
             }
-            if let Some(task) = self.hash_queue.pop() {
-                self.timed_process_hash_task(task);
+            if let Some(task) = self.bi_queue.pop() {
+                self.timed_process_bi_task(task);
                 wait_duration = Self::INITIAL_WAIT;
                 continue;
             }
@@ -393,7 +392,7 @@ impl BiExecutorThread<'_> {
             }
 
             thread::sleep(wait_duration);
-            wait_duration = Self::MAX_WAIT.min(wait_duration * 2);
+            wait_duration = Self::RETRY_WAIT;
         }
 
         take_current_execution_stats().unwrap()
