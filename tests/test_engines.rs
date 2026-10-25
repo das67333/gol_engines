@@ -128,4 +128,36 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_streamlife_overfill_preserves_pattern_and_can_retry() {
+        let pattern = Pattern::random(8, Some(42)).unwrap();
+        let mut reference = HashLifeEngine::new(64, 1);
+        reference
+            .load_pattern(&pattern, Topology::Unbounded)
+            .unwrap();
+        reference.update(0).unwrap();
+        let expected = reference.current_state().hash();
+
+        for workers in [1, 2, 4, 8, 45] {
+            let mut engine = StreamLifeEngine::new(4, workers);
+            engine.load_pattern(&pattern, Topology::Unbounded).unwrap();
+            let before = engine.current_state().hash();
+            assert!(
+                engine.update(10).is_err(),
+                "workers={workers} did not overfill"
+            );
+            assert_eq!(
+                engine.current_state().hash(),
+                before,
+                "workers={workers} changed the saved pattern"
+            );
+            engine.update(0).unwrap();
+            assert_eq!(
+                engine.current_state().hash(),
+                expected,
+                "workers={workers} retry differs from HashLife"
+            );
+        }
+    }
 }
