@@ -278,3 +278,34 @@ impl<Meta: Default + Sync> NodeAccess<Meta> for NodeStoreRef<'_, Meta> {
         self.find_or_create_leaf_from_parts(nw, ne, sw, se)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_drops_invalidated_results_but_keeps_structural_children() {
+        let mut store = NodeStore::<u64>::new(8, 1);
+        let children = [1, 2, 3, 4].map(|value| store.find_or_create_leaf_from_u64(value));
+        let root = store.find_or_create_node(children[0], children[1], children[2], children[3]);
+        let result = store.find_or_create_leaf_from_u64(99);
+        store.get(root).cache.set_value(result);
+        store
+            .get(root)
+            .status
+            .store(status::FINISHED, Ordering::Relaxed);
+
+        store.gc(&[root], crate::quadtree::LEAF_SIZE_LOG2 + 1);
+
+        assert_eq!(store.len(), 5);
+        assert_eq!(
+            store.get(root).status.load(Ordering::Relaxed),
+            status::NOT_STARTED
+        );
+        for (value, idx) in (1..=4).zip(children) {
+            assert_eq!(store.find_or_create_leaf_from_u64(value), idx);
+        }
+        store.find_or_create_leaf_from_u64(99);
+        assert_eq!(store.len(), 6);
+    }
+}
