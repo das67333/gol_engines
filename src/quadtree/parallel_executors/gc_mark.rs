@@ -105,20 +105,17 @@ impl<Meta: Default + Sync> MarkWorker<'_, '_, Meta> {
         let n = self.mem.get(idx);
         let prev = n.status.fetch_or(status::GC_MARK, Ordering::Relaxed);
         if prev & status::GC_MARK == 0 && sl2 > LEAF_SIZE_LOG2 {
-            self.enqueue_children(n, prev, sl2);
+            self.enqueue_children(n, sl2);
         }
         self.pending.fetch_sub(1, Ordering::Relaxed);
     }
 
-    fn enqueue_children(&self, n: &QuadTreeNode<Meta>, prev: u8, sl2: u32) {
+    fn enqueue_children(&self, n: &QuadTreeNode<Meta>, sl2: u32) {
+        // Sweep invalidates every memoized result, so its output is not a GC root.
         let child_sl2 = sl2 - 1;
         for child in n.parts() {
             self.pending.fetch_add(1, Ordering::Relaxed);
             self.queue.push((child, child_sl2));
-        }
-        if prev & status::FINISHED != 0 {
-            self.pending.fetch_add(1, Ordering::Relaxed);
-            self.queue.push((n.cache.get_value(), child_sl2));
         }
     }
 }
