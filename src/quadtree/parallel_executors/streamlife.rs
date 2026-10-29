@@ -330,7 +330,16 @@ impl BiExecutorThread<'_> {
         set_current_execution_stats();
         let mut last_bi_victim = 0usize;
         let mut last_hash_victim = 0usize;
-        let mut probe_victim = (self.thread_idx + 1) % self.bi_stealers.len();
+        // Precompute a worker-specific full scan; no random generation occurs while stealing.
+        let mut probe_order: Vec<_> = (0..self.bi_stealers.len()).filter(|&i| i != self.thread_idx).collect();
+        let mut shuffle_state = (self.thread_idx as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15);
+        for i in (1..probe_order.len()).rev() {
+            shuffle_state ^= shuffle_state << 13;
+            shuffle_state ^= shuffle_state >> 7;
+            shuffle_state ^= shuffle_state << 17;
+            probe_order.swap(i, (shuffle_state % (i as u64 + 1)) as usize);
+        }
+        let mut probe_position = 0;
 
         loop {
             if self.cancelled() {
@@ -354,11 +363,11 @@ impl BiExecutorThread<'_> {
                         return Some(ReadyTask::Hash(task));
                     }
                 }
-                for _ in 0..self.bi_stealers.len() - 1 {
-                    let victim = probe_victim;
-                    probe_victim = (probe_victim + 1) % self.bi_stealers.len();
-                    if probe_victim == self.thread_idx {
-                        probe_victim = (probe_victim + 1) % self.bi_stealers.len();
+                for _ in 0..probe_order.len() {
+                    let victim = probe_order[probe_position];
+                    probe_position += 1;
+                    if probe_position == probe_order.len() {
+                        probe_position = 0;
                     }
                     if let Some(task) = self.try_steal_bi(victim) {
                         last_bi_victim = victim;
