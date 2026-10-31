@@ -12,8 +12,8 @@
 //! - `hash_queue: Worker<Task>` — `HashLife` tasks descended from binode
 //!   Phases Solitonic / Base.
 //!
-//! Pop policy: local LIFO bi first (keep recursion stack-warm), then local
-//! LIFO hash, then steal — bi first, then hash, from a random victim.
+//! Pop policy: local LIFO hash first to finish dependencies, then local bi.
+//! Stealing prefers bi, then hash, with a complete scan before idle workers park.
 //! `HashLife`'s pure-engine path is unchanged: it still uses a single
 //! `Worker<Task>`.
 //!
@@ -45,14 +45,17 @@ use super::{
         DependencyHandlingResult, ProcessingData, ProcessingGuard, Task, WAITING_BIAS,
         handle_dependency, is_finished, update_node_async,
     },
+    parking::{Parking, Search},
 };
-use crossbeam::deque::{Steal, Stealer, Worker};
+use crossbeam::{
+    deque::{Steal, Stealer, Worker},
+    sync::Parker,
+};
 use smallvec::{SmallVec, smallvec};
 use std::{
     mem,
     sync::atomic::{AtomicU8, AtomicU16, Ordering},
     thread,
-    time::Duration,
 };
 
 /// A unit of work representing a binode pair to be processed.
@@ -213,13 +216,19 @@ impl<'a> StreamLifeExecutor<'a> {
             size_log2: self.size_log2,
         });
 
+        let (parking, parkers) = Parking::new(num_threads);
         let mut total_stats = ExecutionStatistics::new();
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(num_threads);
-            for (thread_idx, (bi_queue, hash_queue)) in
-                bi_queues.into_iter().zip(hash_queues).enumerate()
+            for (thread_idx, ((bi_queue, hash_queue), parker)) in bi_queues
+                .into_iter()
+                .zip(hash_queues)
+                .zip(parkers)
+                .enumerate()
             {
                 let executor_thread = BiExecutorThread {
+                    parking: &parking,
+                    parker,
                     engine: self.engine,
                     bicache_ref: bicache.create_ref(thread_idx),
                     node_ref: self.engine.base.mem.create_ref(thread_idx),
@@ -292,11 +301,18 @@ impl<'a> StreamLifeExecutor<'a> {
     }
 }
 
+enum ReadyTask {
+    Bi(BiTask),
+    Hash(Task),
+}
+
 /// Per-thread worker for the `StreamLife` parallel executor.
 ///
 /// Holds two deques (binode and `HashLife`) and processes work from either
 /// kind, with a custom dual-queue fetch loop in [`Self::run`].
 struct BiExecutorThread<'a> {
+    parking: &'a Parking,
+    parker: Parker,
     engine: &'a StreamLifeEngine,
     bicache_ref: BinodeCacheRef<'a>,
     node_ref: NodeStoreRef<'a, u64>,
@@ -309,94 +325,107 @@ struct BiExecutorThread<'a> {
 }
 
 impl BiExecutorThread<'_> {
-    /// Initial backoff for the steal-then-sleep loop.
-    const INITIAL_WAIT: Duration = Duration::from_micros(100);
-    /// Maximum backoff.
-    const MAX_WAIT: Duration = Duration::from_millis(100);
-    /// Number of random victims to attempt per outer iteration before sleeping.
-    const STEAL_ATTEMPTS: usize = 2;
-
     fn run(&self) -> ExecutionStatistics {
+        let _stop_on_exit = self.parking.stop_on_exit();
         set_current_execution_stats();
-
-        let mut rng = <rand_chacha::ChaCha8Rng as rand::SeedableRng>::from_os_rng();
-        let mut wait_duration = Self::INITIAL_WAIT;
         let mut last_bi_victim = 0usize;
         let mut last_hash_victim = 0usize;
+        let mut probe_victim = (self.thread_idx + 1) % self.bi_stealers.len();
 
-        'outer: loop {
-            // Cancellation: load factor exceeded on either store.
-            if self.engine.base.mem.exceeds_load_factor() || self.bicache_ref.exceeds_load_factor()
-            {
+        loop {
+            if self.cancelled() {
                 break;
             }
-
-            // Local LIFO: prefer binode work to keep the recursion stack warm,
-            // then HashLife work.
-            if let Some(task) = self.bi_queue.pop() {
-                self.timed_process_bi_task(task);
-                wait_duration = Self::INITIAL_WAIT;
-                continue;
+            let task = self.pop_local_task();
+            // One bounded pass by an active worker before joining the sleep protocol.
+            // Registered sleepers only search after receiving the captain reservation.
+            let task = task.or_else(|| {
+                if last_bi_victim != self.thread_idx {
+                    let bi = self.try_steal_bi(last_bi_victim);
+                    record_last_victim_steal(&bi);
+                    if let Some(task) = bi {
+                        return Some(ReadyTask::Bi(task));
+                    }
+                }
+                if last_hash_victim != self.thread_idx {
+                    let hash = self.try_steal_hash(last_hash_victim);
+                    record_last_victim_steal(&hash);
+                    if let Some(task) = hash {
+                        return Some(ReadyTask::Hash(task));
+                    }
+                }
+                for _ in 0..self.bi_stealers.len() - 1 {
+                    let victim = probe_victim;
+                    probe_victim = (probe_victim + 1) % self.bi_stealers.len();
+                    if probe_victim == self.thread_idx {
+                        probe_victim = (probe_victim + 1) % self.bi_stealers.len();
+                    }
+                    if let Some(task) = self.try_steal_bi(victim) {
+                        last_bi_victim = victim;
+                        return Some(ReadyTask::Bi(task));
+                    }
+                    if let Some(task) = self.try_steal_hash(victim) {
+                        last_hash_victim = victim;
+                        return Some(ReadyTask::Hash(task));
+                    }
+                }
+                None
+            });
+            let task = task.or_else(|| {
+                self.parking.search(self.thread_idx, &self.parker, || {
+                    if self.cancelled() || is_finished(self.root_status) {
+                        return Search::Stop;
+                    }
+                    if let Some(task) = self.pop_local_task() {
+                        return Search::Work(task);
+                    }
+                    let bi = self.try_steal_bi(last_bi_victim);
+                    record_last_victim_steal(&bi);
+                    if let Some(task) = bi {
+                        return Search::Work(ReadyTask::Bi(task));
+                    }
+                    let hash = self.try_steal_hash(last_hash_victim);
+                    record_last_victim_steal(&hash);
+                    if let Some(task) = hash {
+                        return Search::Work(ReadyTask::Hash(task));
+                    }
+                    // The captain keeps searching while other idle workers are parked.
+                    // Start after this worker to spread first-victim probes across captains.
+                    for offset in 1..self.bi_stealers.len() {
+                        let victim = (self.thread_idx + offset) % self.bi_stealers.len();
+                        if let Some(task) = self.try_steal_bi(victim) {
+                            last_bi_victim = victim;
+                            return Search::Work(ReadyTask::Bi(task));
+                        }
+                        if let Some(task) = self.try_steal_hash(victim) {
+                            last_hash_victim = victim;
+                            return Search::Work(ReadyTask::Hash(task));
+                        }
+                    }
+                    Search::Empty
+                })
+            });
+            match task {
+                Some(ReadyTask::Bi(task)) => self.timed_process_bi_task(task),
+                Some(ReadyTask::Hash(task)) => self.timed_process_hash_task(task),
+                None => break,
             }
-            if let Some(task) = self.hash_queue.pop() {
-                self.timed_process_hash_task(task);
-                wait_duration = Self::INITIAL_WAIT;
-                continue;
-            }
-
-            // Termination condition checked after local pops fail (so we
-            // drain any remaining local work).
             if is_finished(self.root_status) {
                 break;
             }
-
-            let n = self.bi_stealers.len();
-            if n > 1 {
-                // Try last successful victim first (locality / hot cache).
-                let bi_lv = self.try_steal_bi(last_bi_victim);
-                record_last_victim_steal(&bi_lv);
-                if let Some(task) = bi_lv {
-                    self.timed_process_bi_task(task);
-                    wait_duration = Self::INITIAL_WAIT;
-                    continue;
-                }
-                let hash_lv = self.try_steal_hash(last_hash_victim);
-                record_last_victim_steal(&hash_lv);
-                if let Some(task) = hash_lv {
-                    self.timed_process_hash_task(task);
-                    wait_duration = Self::INITIAL_WAIT;
-                    continue;
-                }
-
-                // Random victim selection. Prefer bi over hash from the same
-                // victim (binodes drive the work; HashLife tasks are
-                // descended from them).
-                for _ in 0..Self::STEAL_ATTEMPTS {
-                    let victim = self.random_victim(&mut rng, n);
-                    if !self.bi_stealers[victim].is_empty()
-                        && let Some(task) = self.try_steal_bi(victim)
-                    {
-                        last_bi_victim = victim;
-                        self.timed_process_bi_task(task);
-                        wait_duration = Self::INITIAL_WAIT;
-                        continue 'outer;
-                    }
-                    if !self.hash_stealers[victim].is_empty()
-                        && let Some(task) = self.try_steal_hash(victim)
-                    {
-                        last_hash_victim = victim;
-                        self.timed_process_hash_task(task);
-                        wait_duration = Self::INITIAL_WAIT;
-                        continue 'outer;
-                    }
-                }
-            }
-
-            thread::sleep(wait_duration);
-            wait_duration = Self::MAX_WAIT.min(wait_duration * 2);
         }
-
         take_current_execution_stats().unwrap()
+    }
+
+    fn cancelled(&self) -> bool {
+        self.engine.base.mem.exceeds_load_factor() || self.bicache_ref.exceeds_load_factor()
+    }
+
+    fn pop_local_task(&self) -> Option<ReadyTask> {
+        self.hash_queue
+            .pop()
+            .map(ReadyTask::Hash)
+            .or_else(|| self.bi_queue.pop().map(ReadyTask::Bi))
     }
 
     fn timed_process_bi_task(&self, task: BiTask) {
@@ -409,16 +438,6 @@ impl BiExecutorThread<'_> {
         let start = Ticks::now();
         self.process_hash_task(task);
         record_task_duration(Ticks::now().elapsed_since(start));
-    }
-
-    fn random_victim(&self, rng: &mut rand_chacha::ChaCha8Rng, n: usize) -> usize {
-        use rand::Rng;
-        // Don't steal from yourself.
-        let mut i = rng.random_range(0..n - 1);
-        if i >= self.thread_idx {
-            i += 1;
-        }
-        i
     }
 
     fn try_steal_bi(&self, victim: usize) -> Option<BiTask> {

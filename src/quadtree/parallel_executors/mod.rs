@@ -2,6 +2,7 @@ mod common;
 mod gc_mark;
 mod gc_sweep;
 mod hashlife;
+mod parking;
 mod streamlife;
 
 pub(super) use gc_mark::GcMarkExecutor;
