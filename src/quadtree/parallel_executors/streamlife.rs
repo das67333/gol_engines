@@ -324,6 +324,18 @@ struct BiExecutorThread<'a> {
     hash_stealers: &'a [Stealer<Task>],
 }
 
+fn victim_probe_order(worker_count: usize, thread_idx: usize) -> Vec<usize> {
+    let mut probe_order: Vec<_> = (0..worker_count).filter(|&i| i != thread_idx).collect();
+    let mut shuffle_state = (thread_idx as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15);
+    for i in (1..probe_order.len()).rev() {
+        shuffle_state ^= shuffle_state << 13;
+        shuffle_state ^= shuffle_state >> 7;
+        shuffle_state ^= shuffle_state << 17;
+        probe_order.swap(i, (shuffle_state % (i as u64 + 1)) as usize);
+    }
+    probe_order
+}
+
 impl BiExecutorThread<'_> {
     fn run(&self) -> ExecutionStatistics {
         let _stop_on_exit = self.parking.stop_on_exit();
@@ -331,14 +343,7 @@ impl BiExecutorThread<'_> {
         let mut last_bi_victim = 0usize;
         let mut last_hash_victim = 0usize;
         // Precompute a worker-specific full scan; no random generation occurs while stealing.
-        let mut probe_order: Vec<_> = (0..self.bi_stealers.len()).filter(|&i| i != self.thread_idx).collect();
-        let mut shuffle_state = (self.thread_idx as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15);
-        for i in (1..probe_order.len()).rev() {
-            shuffle_state ^= shuffle_state << 13;
-            shuffle_state ^= shuffle_state >> 7;
-            shuffle_state ^= shuffle_state << 17;
-            probe_order.swap(i, (shuffle_state % (i as u64 + 1)) as usize);
-        }
+        let probe_order = victim_probe_order(self.bi_stealers.len(), self.thread_idx);
         let mut probe_position = 0;
 
         loop {
@@ -1031,6 +1036,23 @@ fn handle_bi_dependency(
             status.fetch_and(!status::DEPS_LOCK, Ordering::Release);
             record_metric(spinner.count(), MetricKind::HandleBiDep);
             return BiDependencyResult::StartedByOtherThread;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::victim_probe_order;
+
+    #[test]
+    fn victim_probe_order_covers_other_workers_once() {
+        for worker_count in [1, 2, 3, 4, 8, 16, 31, 64] {
+            for thread_idx in 0..worker_count {
+                let mut probe_order = victim_probe_order(worker_count, thread_idx);
+                probe_order.sort_unstable();
+                let other_workers: Vec<_> = (0..worker_count).filter(|&i| i != thread_idx).collect();
+                assert_eq!(probe_order, other_workers);
+            }
         }
     }
 }
