@@ -137,11 +137,12 @@ impl<V: Copy> CacheField<V> {
         unsafe { (*self.0.get()).value = v }
     }
 
-    /// # Safety (interior mutability)
-    /// The status state machine guarantees only one thread accesses this at a time.
-    #[allow(clippy::mut_from_ref)]
-    pub fn get_ref<T>(&self) -> &mut T {
-        unsafe { &mut *(*self.0.get()).ptr.cast::<T>() }
+    /// # Safety
+    /// The slot must contain a live pointer of type T, published by the init
+    /// barrier. The caller must prevent the finish barrier from replacing it.
+    /// Access to the pointee must obey its own field-level synchronization.
+    pub unsafe fn get_ptr<T>(&self) -> *mut T {
+        unsafe { (*self.0.get()).ptr.cast::<T>() }
     }
 
     pub fn set_ptr<T>(&self, ptr: *mut T) {

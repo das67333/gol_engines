@@ -13,7 +13,7 @@ use super::{
         status,
     },
     common::{
-        ProcessingData, ProcessingGuard, Task, TaskFetcher, is_finished, start_processing_node,
+        HashProcessingData, ProcessingGuard, Task, TaskFetcher, is_finished, start_processing_node,
         update_node_async,
     },
 };
@@ -103,7 +103,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
         Some(root_node.cache.get_value())
     }
 
-    /// Drop `ProcessingData` boxes orphaned by cancellation. Must be called
+    /// Drop `HashProcessingData` boxes orphaned by cancellation. Must be called
     /// from a single-threaded context after `thread::scope` has joined; only
     /// PENDING slots own a live box at that point.
     fn free_orphaned_processing_data(&self) {
@@ -111,10 +111,9 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
             let n = self.mem.get(idx);
             let status = n.status.load(Ordering::Relaxed);
             if status == status::PENDING {
-                let pd: &mut ProcessingData<Idx> = n.cache.get_ref();
-                // SAFETY: produced by `Box::into_raw` in
-                // `start_processing_node`; all workers have joined.
-                unsafe { drop(Box::from_raw(std::ptr::from_mut::<ProcessingData<Idx>>(pd))) };
+                // SAFETY: PENDING contains the original Box pointer installed by
+                // start_processing_node; all workers have joined.
+                unsafe { drop(Box::from_raw(n.cache.get_ptr::<HashProcessingData<Idx>>())) };
             }
         });
     }
@@ -163,38 +162,31 @@ impl<Meta: Default + Sync> ExecutorThread<'_, Meta> {
     fn process_task(&self, task: Task) {
         let n = self.mem.get(task.idx);
         let mut guard = ProcessingGuard::new(&n.status, MetricKind::ProcessTask);
-        let data: &mut ProcessingData<Idx> = n.cache.get_ref();
-        if let Some(result) = self.update_node(&task, n.parts(), data) {
+        // SAFETY: ACTIVE keeps the published payload alive and exclusively owns
+        // its work state. Pushers and notifiers access different fields.
+        let data_ptr = unsafe { n.cache.get_ptr::<HashProcessingData<Idx>>() };
+        let data = unsafe { &*data_ptr };
+        let result = update_node_async(
+            &self.mem,
+            &self.queue,
+            self.generations_log2,
+            &task,
+            n.parts(),
+            unsafe { data.active_work() },
+            task.idx,
+        );
+        if let Some(result) = result {
             // Cross the finish barrier so pushers stop touching `data` and the
             // cache slot, then drain dependents, publish the value, and mark
             // the node FINISHED.
             guard.enter_finish_barrier(MetricKind::NotifyDep);
-            let dependents = data.take_dependents();
+            let dependents = unsafe { data.take_dependents() };
             n.cache.set_value(result);
             guard.publish_finished();
-            unsafe { drop(Box::from_raw(std::ptr::from_mut::<ProcessingData<Idx>>(data))) };
+            // SAFETY: the finish barrier ended every payload access; retain the original Box pointer.
+            unsafe { drop(Box::from_raw(data_ptr)) };
             self.notify_dependents(&task, &dependents);
         }
-    }
-
-    /// Compute node result by processing its children/dependencies.
-    ///
-    /// Returns `Some(result)` if computation completes, `None` if waiting for dependencies.
-    fn update_node(
-        &self,
-        task: &Task,
-        parts: [Idx; 4],
-        data: &mut ProcessingData<Idx>,
-    ) -> Option<Idx> {
-        update_node_async(
-            &self.mem,
-            &self.queue,
-            self.generations_log2,
-            task,
-            parts,
-            data,
-            task.idx,
-        )
     }
 
     /// Notify dependent nodes that this dependency has completed.
@@ -203,14 +195,17 @@ impl<Meta: Default + Sync> ExecutorThread<'_, Meta> {
     /// thread that drives the counter to zero (this notifier or the owner's
     /// own `fetch_sub(WAITING_BIAS)` at the end of its scan) is responsible
     /// for re-queuing the parent. Notifiers do not take any lock on the
-    /// dependent node: `waiting_cnt` is atomic, and `ProcessingData` stays
+    /// dependent node: `waiting_cnt` is atomic, and `HashProcessingData` stays
     /// alive until `FINISHED` (which only the owner can publish, after the
     /// counter has dropped to zero).
     fn notify_dependents(&self, task: &Task, dependents: &SmallVec<[Idx; 2]>) {
         for &dependent in dependents {
             let n = self.mem.get(dependent);
-            let dep_data: &ProcessingData<Idx> = n.cache.get_ref();
-            let prev = dep_data.decrement_waiting_cnt();
+            // SAFETY: this outstanding notification keeps the payload alive.
+            // Borrow only the counter and never access the payload after decrement:
+            // another worker can then finish and free it.
+            let data = unsafe { n.cache.get_ptr::<HashProcessingData<Idx>>() };
+            let prev = unsafe { &(*data).waiting_cnt }.fetch_sub(1, Ordering::AcqRel);
             if prev == 1 {
                 self.queue.push(Task::new(dependent, task.size_log2 + 1));
             }

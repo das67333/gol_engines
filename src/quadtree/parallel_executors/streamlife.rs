@@ -42,10 +42,11 @@ use super::{
         streamlife::StreamLifeEngine,
     },
     common::{
-        DependencyHandlingResult, ProcessingData, ProcessingGuard, Task, WAITING_BIAS,
+        DependencyHandlingResult, HashProcessingData, ProcessingGuard, Task, WAITING_BIAS,
         handle_dependency, is_finished, update_node_async,
     },
     parking::{Parking, Search},
+    processing::{ActiveWork, ProcessingData},
 };
 use crossbeam::{
     deque::{Steal, Stealer, Worker},
@@ -53,8 +54,7 @@ use crossbeam::{
 };
 use smallvec::{SmallVec, smallvec};
 use std::{
-    mem,
-    sync::atomic::{AtomicU8, AtomicU16, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
     thread,
 };
 
@@ -102,11 +102,9 @@ enum BiPhase {
     Recursive,
 }
 
-/// Temporary data allocated during binode processing.
-///
-/// Heap-allocated when processing starts, freed when entry reaches FINISHED state.
-/// Stored via pointer in the cache entry's payload field.
-struct BiProcessingData {
+/// Owner-only state for the binode phase machine.
+#[derive(Default)]
+struct BiWork {
     /// Phase the task is currently in (see [`BiPhase`]).
     phase: BiPhase,
     /// Intermediate child node results for universe 0 (BESZEL).
@@ -127,30 +125,9 @@ struct BiProcessingData {
     /// Bitmask of pending `HashLife` results for Phases Solitonic / Base.
     /// Solitonic uses bits 0,1; Base uses bit 0 only.
     hash_mask: u8,
-    /// Count of dependencies still being computed. The entry resumes when
-    /// this reaches 0. Manipulated lock-free with the bias trick.
-    waiting_cnt: AtomicU16,
-    /// Entries that registered as dependents of this entry. Mutated by the
-    /// owner exclusively during the init / finish barriers, and by pushers
-    /// in parallel under [`status::DEPS_LOCK`].
-    dependents: SmallVec<[BiTask; 2]>,
 }
 
-impl Default for BiProcessingData {
-    fn default() -> Self {
-        Self {
-            phase: BiPhase::default(),
-            arr0: [Idx::default(); 9],
-            arr1: [Idx::default(); 9],
-            mask9_waiting: 0,
-            mask4_waiting: 0,
-            hash_results: [Idx::default(); 2],
-            hash_mask: 0,
-            waiting_cnt: AtomicU16::new(0),
-            dependents: SmallVec::new(),
-        }
-    }
-}
+type BiProcessingData = ProcessingData<BiWork, BiTask>;
 
 /// Parallel executor for `StreamLife`'s `update_binode` using work-stealing.
 pub struct StreamLifeExecutor<'a> {
@@ -267,7 +244,7 @@ impl<'a> StreamLifeExecutor<'a> {
         Some(bicache.get(root_idx).payload().get_value())
     }
 
-    /// Drop orphaned `ProcessingData<Dependent>` (`HashLife` nodes) and
+    /// Drop orphaned `HashProcessingData<Dependent>` (`HashLife` nodes) and
     /// `BiProcessingData` (binode entries) on cancellation. Must be called
     /// from a single-threaded context after `thread::scope` has joined; only
     /// PENDING slots own a live box at that point.
@@ -278,24 +255,20 @@ impl<'a> StreamLifeExecutor<'a> {
             let entry = bicache.get(idx);
             let status = entry.status().load(Ordering::Relaxed);
             if status == status::PENDING {
-                let pd: &mut BiProcessingData = entry.payload().get_ref();
-                // SAFETY: produced by `Box::into_raw` in
-                // `start_processing_entry`; all workers have joined.
-                unsafe { drop(Box::from_raw(std::ptr::from_mut::<BiProcessingData>(pd))) };
+                // SAFETY: PENDING owns the original Box pointer; all workers have joined.
+                unsafe { drop(Box::from_raw(entry.payload().get_ptr::<BiProcessingData>())) };
             }
         });
         // HashLife nodes processed asynchronously during this StreamLife run
         // can also be orphaned in PENDING state. Free their
-        // `ProcessingData<Dependent>` boxes.
+        // `HashProcessingData<Dependent>` boxes.
         let mem = &self.engine.base.mem;
         mem.for_each_idx(|idx| {
             let n = mem.get(idx);
             let status = n.status.load(Ordering::Relaxed);
             if status == status::PENDING {
-                let pd: &mut ProcessingData<Dependent> = n.cache.get_ref();
-                // SAFETY: produced by `Box::into_raw` in
-                // `start_processing_node`; all workers have joined.
-                unsafe { drop(Box::from_raw(std::ptr::from_mut::<ProcessingData<Dependent>>(pd))) };
+                // SAFETY: PENDING owns the original Box pointer; all workers have joined.
+                unsafe { drop(Box::from_raw(n.cache.get_ptr::<HashProcessingData<Dependent>>())) };
             }
         });
     }
@@ -500,26 +473,31 @@ impl BiExecutorThread<'_> {
         let entry = self.bicache_ref.get(task.entry_idx);
         let status = entry.status();
         let mut guard = ProcessingGuard::new(status, MetricKind::ProcessTask);
-        let data: &mut BiProcessingData = entry.payload().get_ref();
+        // SAFETY: ACTIVE keeps the payload alive and exclusively owns its work state.
+        let data_ptr = unsafe { entry.payload().get_ptr::<BiProcessingData>() };
+        let data = unsafe { &*data_ptr };
         let idx = entry.key();
 
-        if let Some(result) = self.update_binode(task.entry_idx, idx, task.size_log2, data) {
+        if let Some(result) = self.update_binode(task.entry_idx, idx, task.size_log2, unsafe { data.active_work() }) {
             guard.enter_finish_barrier(MetricKind::NotifyDep);
-            let dependents = mem::take(&mut data.dependents);
+            let dependents = unsafe { data.take_dependents() };
             entry.payload().set_value(result);
             guard.publish_finished();
-            unsafe { drop(Box::from_raw(std::ptr::from_mut::<BiProcessingData>(data))) };
+            // SAFETY: no payload access remains; retain the original Box pointer.
+            unsafe { drop(Box::from_raw(data_ptr)) };
             self.notify_bi_dependents(dependents);
         }
     }
 
     /// Process a single `HashLife` task descended from a binode Phase S/B.
     /// Mirror of `HashLife`'s `process_task` but uses
-    /// `ProcessingData<Dependent>` so cross-engine waiters can register.
+    /// `HashProcessingData<Dependent>` so cross-engine waiters can register.
     fn process_hash_task(&self, task: Task) {
         let n = self.node_ref.get(task.idx);
         let mut guard = ProcessingGuard::new(&n.status, MetricKind::ProcessTask);
-        let data: &mut ProcessingData<Dependent> = n.cache.get_ref();
+        // SAFETY: ACTIVE keeps the payload alive and exclusively owns its work state.
+        let data_ptr = unsafe { n.cache.get_ptr::<HashProcessingData<Dependent>>() };
+        let data = unsafe { &*data_ptr };
         let dep = Dependent::Node {
             idx: task.idx,
             size_log2: task.size_log2,
@@ -531,15 +509,16 @@ impl BiExecutorThread<'_> {
             self.engine.base.generations_per_update_log2.unwrap(),
             &task,
             parts,
-            data,
+            unsafe { data.active_work() },
             dep,
         );
         if let Some(result) = result {
             guard.enter_finish_barrier(MetricKind::NotifyDep);
-            let dependents = data.take_dependents();
+            let dependents = unsafe { data.take_dependents() };
             n.cache.set_value(result);
             guard.publish_finished();
-            unsafe { drop(Box::from_raw(std::ptr::from_mut::<ProcessingData<Dependent>>(data))) };
+            // SAFETY: no payload access remains; retain the original Box pointer.
+            unsafe { drop(Box::from_raw(data_ptr)) };
             self.notify_node_dependents(dependents);
         }
     }
@@ -558,8 +537,9 @@ impl BiExecutorThread<'_> {
         parent_entry_idx: Idx,
         idx: (Idx, Idx),
         size_log2: u32,
-        data: &mut BiProcessingData,
+        active: ActiveWork<'_, BiWork>,
     ) -> Option<(Idx, Idx)> {
+        let data = &mut *active.work;
         let engine = self.engine;
         let gens_log2 = engine.base.generations_per_update_log2.unwrap();
 
@@ -633,9 +613,9 @@ impl BiExecutorThread<'_> {
         // Dispatch by phase.
         match data.phase {
             BiPhase::Entry => unreachable!("Entry should have been transitioned"),
-            BiPhase::Solitonic => self.solitonic_phase(parent_entry_idx, idx, size_log2, data),
-            BiPhase::Base => self.base_phase(parent_entry_idx, size_log2, data),
-            BiPhase::Recursive => self.recursive_phase(parent_entry_idx, size_log2, data),
+            BiPhase::Solitonic => self.solitonic_phase(parent_entry_idx, idx, size_log2, active),
+            BiPhase::Base => self.base_phase(parent_entry_idx, size_log2, active),
+            BiPhase::Recursive => self.recursive_phase(parent_entry_idx, size_log2, active),
         }
     }
 
@@ -646,8 +626,9 @@ impl BiExecutorThread<'_> {
         parent_entry_idx: Idx,
         idx: (Idx, Idx),
         size_log2: u32,
-        data: &mut BiProcessingData,
+        active: ActiveWork<'_, BiWork>,
     ) -> Option<(Idx, Idx)> {
+        let ActiveWork { work: data, waiting_cnt } = active;
         let engine = self.engine;
         let targets = [idx.0, idx.1];
         let dep = Dependent::Binode {
@@ -656,7 +637,7 @@ impl BiExecutorThread<'_> {
         };
 
         if data.hash_mask != 0 {
-            data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
             for (b, target) in targets.iter().enumerate() {
                 if data.hash_mask & (1 << b) == 0 {
                     continue;
@@ -668,15 +649,15 @@ impl BiExecutorThread<'_> {
                         data.hash_results[b] = target_node.cache.get_value();
                     }
                     DependencyHandlingResult::StartedByThisThread => {
-                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
                         self.hash_queue.push(Task::new(*target, size_log2));
                     }
                     DependencyHandlingResult::StartedByOtherThread => {
-                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
-            let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+            let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
             if data.hash_mask != 0 {
                 if prev == WAITING_BIAS {
                     self.bi_queue.push(BiTask {
@@ -716,8 +697,9 @@ impl BiExecutorThread<'_> {
         &self,
         parent_entry_idx: Idx,
         size_log2: u32,
-        data: &mut BiProcessingData,
+        active: ActiveWork<'_, BiWork>,
     ) -> Option<(Idx, Idx)> {
+        let ActiveWork { work: data, waiting_cnt } = active;
         let engine = self.engine;
         let merged = data.arr0[0];
         let dep = Dependent::Binode {
@@ -726,7 +708,7 @@ impl BiExecutorThread<'_> {
         };
 
         if data.hash_mask != 0 {
-            data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
             // Only bit 0 is used for Phase Base.
             let target_node = self.node_ref.get(merged);
             match handle_dependency(target_node, dep) {
@@ -735,14 +717,14 @@ impl BiExecutorThread<'_> {
                     data.hash_results[0] = target_node.cache.get_value();
                 }
                 DependencyHandlingResult::StartedByThisThread => {
-                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                    waiting_cnt.fetch_add(1, Ordering::Relaxed);
                     self.hash_queue.push(Task::new(merged, size_log2));
                 }
                 DependencyHandlingResult::StartedByOtherThread => {
-                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                    waiting_cnt.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+            let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
             if data.hash_mask != 0 {
                 if prev == WAITING_BIAS {
                     self.bi_queue.push(BiTask {
@@ -776,13 +758,14 @@ impl BiExecutorThread<'_> {
         &self,
         parent_entry_idx: Idx,
         size_log2: u32,
-        data: &mut BiProcessingData,
+        active: ActiveWork<'_, BiWork>,
     ) -> Option<(Idx, Idx)> {
+        let ActiveWork { work: data, waiting_cnt } = active;
         let engine = self.engine;
 
         // Stage 1: Wait for 9 overlapping children (if both_stages).
         if data.mask4_waiting == 0 && data.mask9_waiting != 0 {
-            data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
             for i in 0..9 {
                 if data.mask9_waiting & (1 << i) == 0 {
                     continue;
@@ -798,18 +781,18 @@ impl BiExecutorThread<'_> {
                         data.arr1[i] = val.1;
                     }
                     BiDependencyResult::StartedByThisThread => {
-                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
                         self.bi_queue.push(BiTask {
                             entry_idx: child_idx,
                             size_log2: size_log2 - 1,
                         });
                     }
                     BiDependencyResult::StartedByOtherThread => {
-                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
-            let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+            let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
             if data.mask9_waiting != 0 {
                 if prev == WAITING_BIAS {
                     self.bi_queue.push(BiTask {
@@ -832,7 +815,7 @@ impl BiExecutorThread<'_> {
         }
 
         // Stage 2: Wait for 4 final children.
-        data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+        waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
         for i in 0..4 {
             if data.mask4_waiting & (1 << i) == 0 {
                 continue;
@@ -847,18 +830,18 @@ impl BiExecutorThread<'_> {
                     data.arr1[i] = val.1;
                 }
                 BiDependencyResult::StartedByThisThread => {
-                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                    waiting_cnt.fetch_add(1, Ordering::Relaxed);
                     self.bi_queue.push(BiTask {
                         entry_idx: child_idx,
                         size_log2: size_log2 - 1,
                     });
                 }
                 BiDependencyResult::StartedByOtherThread => {
-                    data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                    waiting_cnt.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
-        let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+        let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
         if data.mask4_waiting != 0 {
             if prev == WAITING_BIAS {
                 self.bi_queue.push(BiTask {
@@ -892,8 +875,10 @@ impl BiExecutorThread<'_> {
     fn notify_bi_dependents(&self, dependents: SmallVec<[BiTask; 2]>) {
         for dep in dependents {
             let entry = self.bicache_ref.get(dep.entry_idx);
-            let dep_data: &BiProcessingData = entry.payload().get_ref();
-            let prev = dep_data.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
+            // SAFETY: an outstanding notification keeps the payload alive until
+            // this decrement. Do not access it afterwards; another owner may free it.
+            let data = unsafe { entry.payload().get_ptr::<BiProcessingData>() };
+            let prev = unsafe { &(*data).waiting_cnt }.fetch_sub(1, Ordering::AcqRel);
             if prev == 1 {
                 self.bi_queue.push(BiTask {
                     entry_idx: dep.entry_idx,
@@ -914,8 +899,9 @@ impl BiExecutorThread<'_> {
             match dep {
                 Dependent::Node { idx, size_log2 } => {
                     let n = self.node_ref.get(idx);
-                    let pd: &ProcessingData<Dependent> = n.cache.get_ref();
-                    let prev = pd.decrement_waiting_cnt();
+                    // SAFETY: this notification keeps the payload alive until decrement.
+                    let data = unsafe { n.cache.get_ptr::<HashProcessingData<Dependent>>() };
+                    let prev = unsafe { &(*data).waiting_cnt }.fetch_sub(1, Ordering::AcqRel);
                     if prev == 1 {
                         self.hash_queue.push(Task::new(idx, size_log2));
                     }
@@ -925,8 +911,9 @@ impl BiExecutorThread<'_> {
                     size_log2,
                 } => {
                     let entry = self.bicache_ref.get(entry_idx);
-                    let pd: &BiProcessingData = entry.payload().get_ref();
-                    let prev = pd.waiting_cnt.fetch_sub(1, Ordering::AcqRel);
+                    // SAFETY: this notification keeps the payload alive until decrement.
+                    let data = unsafe { entry.payload().get_ptr::<BiProcessingData>() };
+                    let prev = unsafe { &(*data).waiting_cnt }.fetch_sub(1, Ordering::AcqRel);
                     if prev == 1 {
                         self.bi_queue.push(BiTask {
                             entry_idx,
@@ -971,10 +958,7 @@ fn start_processing_entry(
     }
 
     record_status_claim_success();
-    let pd = BiProcessingData {
-        dependents,
-        ..Default::default()
-    };
+    let pd = BiProcessingData::new(dependents);
     entry.payload().set_ptr(Box::into_raw(Box::new(pd)));
     status.fetch_xor(status::PROCESSING | status::PENDING, Ordering::Release);
     true
@@ -1044,11 +1028,13 @@ fn handle_bi_dependency(
             .compare_exchange_weak(cur, want, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            let child_data: &mut BiProcessingData = child_entry.payload().get_ref();
-            child_data.dependents.push(BiTask {
-                entry_idx: parent_entry_idx,
-                size_log2: parent_size_log2,
-            });
+            // SAFETY: DEPS_LOCK keeps the payload alive and exclusively protects its list.
+            unsafe {
+                (&*child_entry.payload().get_ptr::<BiProcessingData>()).push_dependent(BiTask {
+                    entry_idx: parent_entry_idx,
+                    size_log2: parent_size_log2,
+                });
+            }
             status.fetch_and(!status::DEPS_LOCK, Ordering::Release);
             record_metric(spinner.count(), MetricKind::HandleBiDep);
             return BiDependencyResult::StartedByOtherThread;

@@ -24,7 +24,7 @@
 //!
 //! Key transitions:
 //! - `NOT_STARTED → PROCESSING`: A thread claims the node and is about to
-//!   install its [`ProcessingData`].
+//!   install its [`HashProcessingData`].
 //! - `PROCESSING → PENDING`: Init barrier ends; pushers may now register
 //!   dependents under `DEPS_LOCK`.
 //! - `PENDING → ACTIVE`: A worker dequeues the task and starts computing
@@ -37,7 +37,7 @@
 //!
 //! ## Dependents-list synchronization
 //!
-//! [`ProcessingData::dependents`] is mutated by two parties:
+//! The payload's dependents list is mutated by two parties:
 //! - The owner during [`start_processing_node`] (exclusive: status is
 //!   `PROCESSING`, pushers spin) and during the finish barrier (exclusive:
 //!   status is `PROCESSING`, no `DEPS_LOCK` is held).
@@ -47,7 +47,7 @@
 //!
 //! ## `waiting_cnt` synchronization
 //!
-//! [`ProcessingData::waiting_cnt`] is an [`AtomicU16`] manipulated lock-free
+//! The payload's waiting counter is an atomic u16 manipulated lock-free
 //! with a bias trick: the owner adds [`WAITING_BIAS`] before scanning its
 //! children, increments by one for every dependency it registers, and
 //! subtracts the bias after the scan. Notifiers do `fetch_sub(1)`. The bias
@@ -63,11 +63,12 @@ use super::super::{
     spin::Spinner,
     status,
 };
+use super::processing::{ActiveWork, ProcessingData};
 use crossbeam::deque::{Steal, Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
 use std::{
     mem,
-    sync::atomic::{AtomicU8, AtomicU16, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
     thread,
     time::Duration,
 };
@@ -78,61 +79,18 @@ use std::{
 /// never collides with a real outstanding-dependency count.
 pub const WAITING_BIAS: u16 = 1 << 15;
 
-/// Temporary data allocated during node processing.
-///
-/// Heap-allocated when processing starts, freed when node reaches FINISHED state.
-/// Stored via pointer in the node's `cache` field.
-///
-/// Generic over `Dep`, the dependent type. Pure `HashLife` runs use
-/// `ProcessingData<Idx>`. `StreamLife` runs that drive `HashLife` nodes
-/// asynchronously use `ProcessingData<Dependent>` so a binode task can
-/// register itself as a waiter. The `cache` field on
-/// [`QuadTreeNode`] is type-erased, so per-run instantiation is
-/// safe as long as a single run is consistent (cleared via `run_gc` /
-/// `load_pattern` between runs).
-///
-/// `dependents` uses `SmallVec<[_; 2]>` to avoid heap allocation in the
-/// common case (>>99.99% of nodes have 1 dependent). A capacity of 2 is used
-/// because it does not increase the struct size vs. a capacity of 1.
-pub struct ProcessingData<Dep> {
-    /// Intermediate child node results (up to 9 for overlapping, 4 for final stage).
+/// Owner-only intermediate state for a HashLife node. The surrounding payload
+/// keeps dependency registration and notification separate from this state.
+#[derive(Default)]
+pub(super) struct HashWork {
     arr: [Idx; 9],
-    /// Bitmask: bit `i` set if `arr[i]` (among first 9) is not yet computed.
     mask9_waiting: u32,
-    /// Bitmask: bit `i` set if `arr[i]` (among first 4) is not yet computed.
     mask4_waiting: u32,
-    /// Count of dependencies still being computed. The node resumes when this
-    /// reaches 0. Manipulated lock-free with the bias trick (see module docs).
-    waiting_cnt: AtomicU16,
-    /// Nodes / binodes that registered as dependents of this node.
-    /// Notified when this node finishes.
-    ///
-    /// Mutated by the owner exclusively during the init/finish barriers, and
-    /// by pushers in parallel under [`status::DEPS_LOCK`].
-    dependents: SmallVec<[Dep; 2]>,
 }
 
-impl<Dep> Default for ProcessingData<Dep> {
-    fn default() -> Self {
-        Self {
-            arr: [Idx::default(); 9],
-            mask9_waiting: 0,
-            mask4_waiting: 0,
-            waiting_cnt: AtomicU16::new(0),
-            dependents: SmallVec::new(),
-        }
-    }
-}
-
-impl<Dep> ProcessingData<Dep> {
-    pub fn decrement_waiting_cnt(&self) -> u16 {
-        self.waiting_cnt.fetch_sub(1, Ordering::AcqRel)
-    }
-
-    pub fn take_dependents(&mut self) -> SmallVec<[Dep; 2]> {
-        mem::take(&mut self.dependents)
-    }
-}
+/// Pure HashLife uses Idx dependents; StreamLife uses its tagged Dependent.
+/// The type-erased node cache must use one instantiation throughout a run.
+pub(super) type HashProcessingData<Dep> = ProcessingData<HashWork, Dep>;
 
 /// A unit of work representing a node to be processed.
 pub struct Task {
@@ -263,7 +221,7 @@ pub fn is_finished(status: &AtomicU8) -> bool {
 /// Steps:
 /// 1. CAS `NOT_STARTED → PROCESSING` claims the node and erects an init
 ///    barrier (pushers spin while `PROCESSING` is observed).
-/// 2. Allocate and install [`ProcessingData`].
+/// 2. Allocate and install [`HashProcessingData`].
 /// 3. `fetch_xor` flips `PROCESSING → PENDING`, releasing the barrier with
 ///    Release semantics so subsequent pushers observe the freshly-installed
 ///    `ProcessingData`.
@@ -285,10 +243,7 @@ pub fn start_processing_node<Meta: Default + Sync, Dep>(
         return false;
     }
 
-    let pd = ProcessingData::<Dep> {
-        dependents,
-        ..Default::default()
-    };
+    let pd = HashProcessingData::<Dep>::new(dependents);
     node.cache.set_ptr(Box::into_raw(Box::new(pd)));
     // Atomically swap the `PROCESSING` bit for `PENDING` while preserving any
     // other bits (none should be set during init, but `fetch_xor` makes the
@@ -312,21 +267,20 @@ pub fn start_processing_node<Meta: Default + Sync, Dep>(
 /// Generic over `Dep`. Pure `HashLife` runs pass `Dep = Idx` and `dep =
 /// task.idx`. `StreamLife` runs that descend through `HashLife` nodes pass
 /// `Dep = Dependent` and a tagged-enum value identifying the parent task.
-/// `HashLife` runtime path is unchanged: monomorphization with `Dep = Idx`
-/// emits today's exact code.
 pub fn update_node_async<Meta, Dep>(
     mem: &impl NodeAccess<Meta>,
     queue: &Worker<Task>,
     generations_log2: u32,
     task: &Task,
     parts: [Idx; 4],
-    data: &mut ProcessingData<Dep>,
+    active: ActiveWork<'_, HashWork>,
     dep: Dep,
 ) -> Option<Idx>
 where
     Meta: Default + Sync,
     Dep: Copy,
 {
+    let ActiveWork { work: data, waiting_cnt } = active;
     let both_stages = generations_log2 + 2 >= task.size_log2;
     let [nw, ne, sw, se] = parts;
     if task.size_log2 == LEAF_SIZE_LOG2 + 1 {
@@ -349,7 +303,7 @@ where
 
             // Bias `waiting_cnt` so concurrent notifiers cannot drive it
             // to zero while we are still scanning.
-            data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
             for (i, x) in data.arr.iter_mut().enumerate() {
                 if data.mask9_waiting & (1 << i) == 0 {
                     continue;
@@ -361,15 +315,15 @@ where
                         *x = d.cache.get_value();
                     }
                     DependencyHandlingResult::StartedByThisThread => {
-                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
                         queue.push(Task::new(*x, task.size_log2 - 1));
                     }
                     DependencyHandlingResult::StartedByOtherThread => {
-                        data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
-            let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+            let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
 
             if data.mask9_waiting != 0 {
                 if prev == WAITING_BIAS {
@@ -389,7 +343,7 @@ where
         data.mask4_waiting = 0b1111;
     }
 
-    data.waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+    waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
     for (i, x) in data.arr.iter_mut().take(4).enumerate() {
         if data.mask4_waiting & (1 << i) == 0 {
             continue;
@@ -401,15 +355,15 @@ where
                 *x = d.cache.get_value();
             }
             DependencyHandlingResult::StartedByThisThread => {
-                data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                waiting_cnt.fetch_add(1, Ordering::Relaxed);
                 queue.push(Task::new(*x, task.size_log2 - 1));
             }
             DependencyHandlingResult::StartedByOtherThread => {
-                data.waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                waiting_cnt.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
-    let prev = data.waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
+    let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
 
     if data.mask4_waiting != 0 {
         if prev == WAITING_BIAS {
@@ -518,7 +472,7 @@ pub enum DependencyHandlingResult {
 /// Generic over `Dep`. Pure `HashLife` runs use `Dep = Idx` (registering the
 /// parent task's index). `StreamLife` runs that descend through `HashLife` nodes
 /// use `Dep = Dependent` (a tagged enum that distinguishes a `HashLife` waiter
-/// from a binode waiter). The `ProcessingData<Dep>` allocated for `n` must
+/// from a binode waiter). The `HashProcessingData<Dep>` allocated for `n` must
 /// be of the same flavor across a single run.
 pub fn handle_dependency<Meta: Default + Sync, Dep: Copy>(
     n: &QuadTreeNode<Meta>,
@@ -556,10 +510,9 @@ pub fn handle_dependency<Meta: Default + Sync, Dep: Copy>(
             .compare_exchange_weak(cur, want, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            n.cache
-                .get_ref::<ProcessingData<Dep>>()
-                .dependents
-                .push(dep);
+            // SAFETY: DEPS_LOCK keeps this published payload alive and protects
+            // only its dependents list; an owner may still mutate its work state.
+            unsafe { (&*n.cache.get_ptr::<HashProcessingData<Dep>>()).push_dependent(dep) };
             n.status.fetch_and(!status::DEPS_LOCK, Ordering::Release);
             record_metric(spinner.count(), MetricKind::HandleDep);
             return DependencyHandlingResult::StartedByOtherThread;
