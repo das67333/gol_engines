@@ -546,11 +546,15 @@ pub(super) fn merge_final_universes(
     if size_log2 <= LEAF_SIZE_LOG2 || idx.0 == blank || idx.1 == blank {
         return merge_universes(mem, blank_nodes, idx, size_log2);
     }
+    // At height h there are at most (4^h - 1) / 3 non-leaf pairs to visit.
+    let max_log2 = FINAL_MERGE_CACHE_ENTRIES.ilog2();
+    let height = (size_log2 - LEAF_SIZE_LOG2).min(max_log2);
+    let entries = 1usize << (2 * height - 1).min(max_log2);
     let mut cache = Vec::new();
-    if cache.try_reserve_exact(FINAL_MERGE_CACHE_ENTRIES).is_err() {
+    if cache.try_reserve_exact(entries).is_err() {
         return merge_universes(mem, blank_nodes, idx, size_log2);
     }
-    cache.resize(FINAL_MERGE_CACHE_ENTRIES, MergeCacheEntry::default());
+    cache.resize(entries, MergeCacheEntry::default());
     FinalMerge {
         mem,
         blank_nodes,
