@@ -21,6 +21,11 @@ pub struct StreamLifeEngine {
 }
 
 impl StreamLifeEngine {
+    fn reset_stream_cache(&mut self) {
+        self.biroot = None;
+        self.bicache.clear();
+    }
+
     // Balance the stores by bytes. Buckets are powers of two; entry storage uses the remainder.
     // This accounts for buckets and live entries, excluding allocator chunk slack and metadata.
     fn capacity_plan(mem_limit_mib: u32) -> (u32, usize, u32, usize) {
@@ -98,8 +103,7 @@ impl GoLEngine for StreamLifeEngine {
 
     fn load_pattern(&mut self, pattern: &Pattern, topology: Topology) -> Result<()> {
         self.base.load_pattern(pattern, topology)?;
-        self.biroot = None;
-        self.bicache.clear();
+        self.reset_stream_cache();
         Ok(())
     }
 
@@ -115,7 +119,7 @@ impl GoLEngine for StreamLifeEngine {
         {
             self.run_gc();
         }
-        let backup = self.current_state();
+        let (root, size_log2) = (self.base.root, self.base.size_log2);
         self.base.generations_per_update_log2 = Some(generations_log2);
 
         let frames_cnt = (generations_log2 + 2).max(self.base.size_log2 + 1) - self.base.size_log2;
@@ -135,7 +139,12 @@ impl GoLEngine for StreamLifeEngine {
         let Some(biroot) =
             StreamLifeExecutor::new(self, biroot, self.base.size_log2).run(self.base.threads_cnt)
         else {
-            self.load_pattern(&backup, self.base.topology)?;
+            // The executor leaves structural nodes intact; serialize rollback only on failure.
+            self.base.root = root;
+            self.base.size_log2 = size_log2;
+            self.reset_stream_cache();
+            let backup = self.current_state();
+            self.base.load_pattern(&backup, self.base.topology)?;
             return Err(anyhow!(
                 "StreamLife: overfilled NodeStore or BinodeCache, try smaller step"
             ));
@@ -216,6 +225,36 @@ mod tests {
                 + cache_capacity as u64 * std::mem::size_of::<CacheEntry>() as u64;
             assert!(bytes <= u64::from(gib) << 30);
             assert!((u64::from(gib) << 30) - bytes < 64);
+        }
+    }
+
+    #[test]
+    fn overflow_preserves_state_and_allows_retry() {
+        let snapshot = |pattern: &Pattern| {
+            (pattern.get_size_log2(), pattern.to_format(crate::PatternFormat::PackedCells).unwrap())
+        };
+        for topology in [Topology::Unbounded, Topology::Torus] {
+            for threads in [1, 2] {
+                for failed_step in [0, 1] {
+                    let mut engine = StreamLifeEngine::new(4, threads);
+                    engine.load_pattern(&Pattern::random(5, Some(SEED)).unwrap(), topology).unwrap();
+                    engine.update(0).unwrap();
+                    let before = engine.current_state();
+
+                    // One root entry exceeds this cache's zero soft limit, independently of the pattern.
+                    let mut cache = std::mem::replace(&mut engine.bicache, BinodeCache::new(0, 1, threads));
+                    assert!(engine.update(failed_step).is_err());
+                    assert_eq!(snapshot(&engine.current_state()), snapshot(&before));
+
+                    // The saved cache still contains indices from before rollback, so clear it before reuse.
+                    cache.clear();
+                    engine.bicache = cache;
+                    let mut reference = StreamLifeEngine::new(4, threads);
+                    reference.load_pattern(&before, topology).unwrap();
+                    assert_eq!(engine.update(0).unwrap(), reference.update(0).unwrap());
+                    assert_eq!(snapshot(&engine.current_state()), snapshot(&reference.current_state()));
+                }
+            }
         }
     }
 
