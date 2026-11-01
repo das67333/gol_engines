@@ -336,89 +336,105 @@ fn victim_probe_order(worker_count: usize, thread_idx: usize) -> Vec<usize> {
     probe_order
 }
 
+struct SearchState {
+    last_bi_victim: usize,
+    last_hash_victim: usize,
+    probe_order: Vec<usize>,
+    probe_position: usize,
+}
+
+impl SearchState {
+    fn new(worker_count: usize, thread_idx: usize) -> Self {
+        Self {
+            last_bi_victim: 0,
+            last_hash_victim: 0,
+            probe_order: victim_probe_order(worker_count, thread_idx),
+            probe_position: 0,
+        }
+    }
+
+    /// Try remembered foreign queues, then one complete pass in the worker's shuffled order.
+    fn steal_active(&mut self, worker: &BiExecutorThread<'_>) -> Option<ReadyTask> {
+        if self.last_bi_victim != worker.thread_idx {
+            let bi = worker.try_steal_bi(self.last_bi_victim);
+            record_last_victim_steal(&bi);
+            if let Some(task) = bi {
+                return Some(ReadyTask::Bi(task));
+            }
+        }
+        if self.last_hash_victim != worker.thread_idx {
+            let hash = worker.try_steal_hash(self.last_hash_victim);
+            record_last_victim_steal(&hash);
+            if let Some(task) = hash {
+                return Some(ReadyTask::Hash(task));
+            }
+        }
+        for _ in 0..self.probe_order.len() {
+            let victim = self.probe_order[self.probe_position];
+            self.probe_position += 1;
+            if self.probe_position == self.probe_order.len() {
+                self.probe_position = 0;
+            }
+            if let Some(task) = self.steal_from(worker, victim) {
+                return Some(task);
+            }
+        }
+        None
+    }
+
+    /// The idle captain checks completion, then local, remembered and cyclic foreign queues.
+    fn search_as_captain(&mut self, worker: &BiExecutorThread<'_>) -> Search<ReadyTask> {
+        if worker.cancelled() || is_finished(worker.root_status) {
+            return Search::Stop;
+        }
+        if let Some(task) = worker.pop_local_task() {
+            return Search::Work(task);
+        }
+        let bi = worker.try_steal_bi(self.last_bi_victim);
+        record_last_victim_steal(&bi);
+        if let Some(task) = bi {
+            return Search::Work(ReadyTask::Bi(task));
+        }
+        let hash = worker.try_steal_hash(self.last_hash_victim);
+        record_last_victim_steal(&hash);
+        if let Some(task) = hash {
+            return Search::Work(ReadyTask::Hash(task));
+        }
+        for offset in 1..worker.bi_stealers.len() {
+            let victim = (worker.thread_idx + offset) % worker.bi_stealers.len();
+            if let Some(task) = self.steal_from(worker, victim) {
+                return Search::Work(task);
+            }
+        }
+        Search::Empty
+    }
+
+    fn steal_from(&mut self, worker: &BiExecutorThread<'_>, victim: usize) -> Option<ReadyTask> {
+        if let Some(task) = worker.try_steal_bi(victim) {
+            self.last_bi_victim = victim;
+            return Some(ReadyTask::Bi(task));
+        }
+        if let Some(task) = worker.try_steal_hash(victim) {
+            self.last_hash_victim = victim;
+            return Some(ReadyTask::Hash(task));
+        }
+        None
+    }
+}
+
 impl BiExecutorThread<'_> {
     fn run(&self) -> ExecutionStatistics {
         let _stop_on_exit = self.parking.stop_on_exit();
         set_current_execution_stats();
-        let mut last_bi_victim = 0usize;
-        let mut last_hash_victim = 0usize;
-        // Precompute a worker-specific full scan; no random generation occurs while stealing.
-        let probe_order = victim_probe_order(self.bi_stealers.len(), self.thread_idx);
-        let mut probe_position = 0;
+        let mut search = SearchState::new(self.bi_stealers.len(), self.thread_idx);
 
         loop {
             if self.cancelled() {
                 break;
             }
-            let task = self.pop_local_task();
-            // One bounded pass by an active worker before joining the sleep protocol.
-            // Registered sleepers only search after receiving the captain reservation.
-            let task = task.or_else(|| {
-                if last_bi_victim != self.thread_idx {
-                    let bi = self.try_steal_bi(last_bi_victim);
-                    record_last_victim_steal(&bi);
-                    if let Some(task) = bi {
-                        return Some(ReadyTask::Bi(task));
-                    }
-                }
-                if last_hash_victim != self.thread_idx {
-                    let hash = self.try_steal_hash(last_hash_victim);
-                    record_last_victim_steal(&hash);
-                    if let Some(task) = hash {
-                        return Some(ReadyTask::Hash(task));
-                    }
-                }
-                for _ in 0..probe_order.len() {
-                    let victim = probe_order[probe_position];
-                    probe_position += 1;
-                    if probe_position == probe_order.len() {
-                        probe_position = 0;
-                    }
-                    if let Some(task) = self.try_steal_bi(victim) {
-                        last_bi_victim = victim;
-                        return Some(ReadyTask::Bi(task));
-                    }
-                    if let Some(task) = self.try_steal_hash(victim) {
-                        last_hash_victim = victim;
-                        return Some(ReadyTask::Hash(task));
-                    }
-                }
-                None
-            });
-            let task = task.or_else(|| {
-                self.parking.search(self.thread_idx, &self.parker, || {
-                    if self.cancelled() || is_finished(self.root_status) {
-                        return Search::Stop;
-                    }
-                    if let Some(task) = self.pop_local_task() {
-                        return Search::Work(task);
-                    }
-                    let bi = self.try_steal_bi(last_bi_victim);
-                    record_last_victim_steal(&bi);
-                    if let Some(task) = bi {
-                        return Search::Work(ReadyTask::Bi(task));
-                    }
-                    let hash = self.try_steal_hash(last_hash_victim);
-                    record_last_victim_steal(&hash);
-                    if let Some(task) = hash {
-                        return Search::Work(ReadyTask::Hash(task));
-                    }
-                    // The captain keeps searching while other idle workers are parked.
-                    // Start after this worker to spread first-victim probes across captains.
-                    for offset in 1..self.bi_stealers.len() {
-                        let victim = (self.thread_idx + offset) % self.bi_stealers.len();
-                        if let Some(task) = self.try_steal_bi(victim) {
-                            last_bi_victim = victim;
-                            return Search::Work(ReadyTask::Bi(task));
-                        }
-                        if let Some(task) = self.try_steal_hash(victim) {
-                            last_hash_victim = victim;
-                            return Search::Work(ReadyTask::Hash(task));
-                        }
-                    }
-                    Search::Empty
-                })
-            });
+            let task = self.pop_local_task()
+                .or_else(|| search.steal_active(self))
+                .or_else(|| self.parking.search(self.thread_idx, &self.parker, || search.search_as_captain(self)));
             match task {
                 Some(ReadyTask::Bi(task)) => self.timed_process_bi_task(task),
                 Some(ReadyTask::Hash(task)) => self.timed_process_hash_task(task),
