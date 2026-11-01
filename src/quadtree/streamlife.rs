@@ -1,5 +1,5 @@
 use super::{
-    algorithm,
+    LEAF_SIZE_LOG2, algorithm,
     hashlife::HashLifeEngine,
     hashtable::{BinodeCache, CacheEntry, Idx},
     node::QuadTreeNode,
@@ -65,7 +65,14 @@ impl StreamLifeEngine {
         )
     }
 
-    fn add_frame(&mut self, dx: &mut BigInt, dy: &mut BigInt) {
+    fn add_frame(&mut self, dx: &mut BigInt, dy: &mut BigInt) -> Option<()> {
+        // At most five nodes per framed root, plus every blank level through
+        // the new root. This also covers the executor's root blank if its chain was empty.
+        let framed_roots = if self.biroot.is_some() { 3 } else { 1 };
+        let frame_allocations = framed_roots * 5 + (self.base.size_log2 - LEAF_SIZE_LOG2) as usize + 2;
+        if self.base.mem.capacity().saturating_sub(self.base.mem.len()) < frame_allocations {
+            return None;
+        }
         self.biroot = if let Some(biroot) = self.biroot {
             Some((
                 self.base.with_frame(biroot.0, self.base.size_log2),
@@ -75,9 +82,15 @@ impl StreamLifeEngine {
             None
         };
         self.base.add_frame(dx, dy);
+        Some(())
     }
 
-    fn pop_frame(&mut self, dx: &mut BigInt, dy: &mut BigInt) {
+    fn pop_frame(&mut self, dx: &mut BigInt, dy: &mut BigInt) -> Option<()> {
+        // At most three nodes are allocated; the worker cancellation reserve
+        // covers this burst. All queried blank levels were initialized before the executor.
+        if self.base.mem.exceeds_load_factor() {
+            return None;
+        }
         self.biroot = if let Some(biroot) = self.biroot {
             Some((
                 self.base.without_frame(biroot.0),
@@ -87,6 +100,7 @@ impl StreamLifeEngine {
             None
         };
         self.base.pop_frame(dx, dy);
+        Some(())
     }
 }
 
@@ -122,59 +136,58 @@ impl GoLEngine for StreamLifeEngine {
         let (root, size_log2) = (self.base.root, self.base.size_log2);
         self.base.generations_per_update_log2 = Some(generations_log2);
 
-        let frames_cnt = (generations_log2 + 2).max(self.base.size_log2 + 1) - self.base.size_log2;
-        let (mut dx, mut dy) = (BigInt::ZERO, BigInt::ZERO);
-        for _ in 0..frames_cnt {
-            self.add_frame(&mut dx, &mut dy);
-        }
+        let result = (|| {
+            let frames_cnt = (generations_log2 + 2).max(self.base.size_log2 + 1) - self.base.size_log2;
+            let (mut dx, mut dy) = (BigInt::ZERO, BigInt::ZERO);
+            for _ in 0..frames_cnt {
+                self.add_frame(&mut dx, &mut dy)?;
+            }
 
-        let biroot = self.biroot.unwrap_or((
-            self.base.root,
-            // it guarantees that self.base.blank_nodes doesn't mutate during the update
-            self.base
-                .blank_nodes
-                .get_mut(self.base.size_log2, &self.base.mem),
-        ));
-
-        let Some(biroot) =
-            StreamLifeExecutor::new(self, biroot, self.base.size_log2).run(self.base.threads_cnt)
-        else {
-            // The executor leaves structural nodes intact; serialize rollback only on failure.
-            self.base.root = root;
-            self.base.size_log2 = size_log2;
-            self.reset_stream_cache();
-            let backup = self.current_state();
-            self.base.load_pattern(&backup, self.base.topology)?;
-            return Err(anyhow!(
-                "StreamLife: overfilled NodeStore or BinodeCache, try smaller step"
+            let biroot = self.biroot.unwrap_or((
+                self.base.root,
+                // It guarantees that blank_nodes doesn't mutate during the executor.
+                self.base.blank_nodes.get_mut(self.base.size_log2, &self.base.mem),
             ));
-        };
+            let biroot = StreamLifeExecutor::new(self, biroot, self.base.size_log2).run(self.base.threads_cnt)?;
+            let new_size_log2 = self.base.size_log2 - 1;
+            let new_root = algorithm::merge_final_universes(
+                &self.base.mem,
+                &self.base.blank_nodes,
+                biroot,
+                new_size_log2,
+            )?;
 
-        self.base.size_log2 -= 1;
-        self.biroot = Some(biroot);
-        self.base.root = algorithm::merge_final_universes(
-            &self.base.mem,
-            &self.base.blank_nodes,
-            biroot,
-            self.base.size_log2,
-        );
-        dx -= BigInt::from(1) << (self.base.size_log2 - 1);
-        dy -= BigInt::from(1) << (self.base.size_log2 - 1);
+            self.base.size_log2 = new_size_log2;
+            self.biroot = Some(biroot);
+            self.base.root = new_root;
+            dx -= BigInt::from(1) << (self.base.size_log2 - 1);
+            dy -= BigInt::from(1) << (self.base.size_log2 - 1);
 
-        match self.base.topology {
-            Topology::Torus => {
-                for _ in 0..frames_cnt - 1 {
-                    self.pop_frame(&mut dx, &mut dy);
+            match self.base.topology {
+                Topology::Torus => {
+                    for _ in 0..frames_cnt - 1 {
+                        self.pop_frame(&mut dx, &mut dy)?;
+                    }
+                }
+                Topology::Unbounded => {
+                    while self.base.has_blank_frame() {
+                        self.pop_frame(&mut dx, &mut dy)?;
+                    }
                 }
             }
-            Topology::Unbounded => {
-                while self.base.has_blank_frame() {
-                    self.pop_frame(&mut dx, &mut dy);
-                }
-            }
+            Some([dx, dy])
+        })();
+
+        if let Some(offset) = result {
+            return Ok(offset);
         }
-
-        Ok([dx, dy])
+        // All phases leave structural nodes intact; serialize rollback only on failure.
+        self.base.root = root;
+        self.base.size_log2 = size_log2;
+        self.reset_stream_cache();
+        let backup = self.current_state();
+        self.base.load_pattern(&backup, self.base.topology)?;
+        Err(anyhow!("StreamLife: overfilled NodeStore or BinodeCache, try smaller step"))
     }
 
     fn run_gc(&mut self) {
@@ -256,6 +269,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn final_merge_overflow_preserves_state_and_allows_smaller_retry() {
+        // Opposing, separated gliders leave both output universes nonempty.
+        let pattern = Pattern::from_format(
+            crate::PatternFormat::RLE,
+            b"x = 64, y = 64, rule = B3/S23\n8$9bo$10bo$8b3o$21$48b3o$48bo$49bo!",
+        ).unwrap();
+        let mut engine = StreamLifeEngine::new(1, 1);
+        engine.load_pattern(&pattern, Topology::Unbounded).unwrap();
+        let before = engine.current_state();
+        let (root, size_log2) = (engine.base.root, engine.base.size_log2);
+        assert_eq!(size_log2, 6);
+
+        // Warm only the executor result. The subsequent public update reuses it,
+        // so the exhausted store is first encountered by the final root merge.
+        engine.base.generations_per_update_log2 = Some(3);
+        let (mut dx, mut dy) = (BigInt::ZERO, BigInt::ZERO);
+        engine.add_frame(&mut dx, &mut dy).unwrap();
+        let framed_size = engine.base.size_log2;
+        let blank = engine.base.blank_nodes.get_mut(framed_size, &engine.base.mem);
+        let biroot = StreamLifeExecutor::new(&engine, (engine.base.root, blank), framed_size).run(1).unwrap();
+        let output_blank = engine.base.blank_nodes.get(framed_size - 1);
+        assert!(biroot.0 != output_blank && biroot.1 != output_blank);
+        engine.base.root = root;
+        engine.base.size_log2 = size_log2;
+        for cells in 0.. {
+            if engine.base.mem.exceeds_load_factor() {
+                break;
+            }
+            engine.base.mem.find_or_create_leaf_from_u64((1 << 63) | cells);
+        }
+        assert_eq!(
+            algorithm::merge_final_universes(&engine.base.mem, &engine.base.blank_nodes, biroot, framed_size - 1),
+            None,
+        );
+        assert!(engine.update(3).is_err());
+        let snapshot = |pattern: &Pattern| {
+            (pattern.get_size_log2(), pattern.to_format(crate::PatternFormat::PackedCells).unwrap())
+        };
+        assert_eq!(snapshot(&engine.current_state()), snapshot(&before));
+
+        let mut reference = StreamLifeEngine::new(1, 1);
+        reference.load_pattern(&before, Topology::Unbounded).unwrap();
+        assert_eq!(engine.update(0).unwrap(), reference.update(0).unwrap());
+        assert_eq!(snapshot(&engine.current_state()), snapshot(&reference.current_state()));
     }
 
     #[test]

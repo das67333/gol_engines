@@ -1,12 +1,12 @@
 use super::{
     LEAF_SIZE_LOG2,
     blank::BlankNodes,
-    hashtable::{Idx, NodeAccess},
+    hashtable::{Idx, NodeAccess, NodeStore},
     sharded_statistics::{MetricKind, record_metric},
     spin::Spinner,
     status,
 };
-use std::{hash::BuildHasher, sync::atomic::Ordering};
+use std::sync::atomic::Ordering;
 
 /// Apply Conway's Game of Life rules to a row of cells.
 ///
@@ -536,25 +536,24 @@ pub(super) fn merge_universes(
 
 /// Merge the final roots with a call-local cache of repeated non-leaf pairs.
 /// The executor's 32x32 base merge keeps using `merge_universes` unchanged.
+/// Returns `None` if an allocating step reaches the store's cancellation limit.
 pub(super) fn merge_final_universes(
-    mem: &impl NodeAccess<u64>,
+    mem: &NodeStore<u64>,
     blank_nodes: &BlankNodes,
     idx: (Idx, Idx),
     size_log2: u32,
-) -> Idx {
+) -> Option<Idx> {
     let blank = blank_nodes.get(size_log2);
-    if size_log2 <= LEAF_SIZE_LOG2 || idx.0 == blank || idx.1 == blank {
-        return merge_universes(mem, blank_nodes, idx, size_log2);
-    }
-    // At height h there are at most (4^h - 1) / 3 non-leaf pairs to visit.
-    let max_log2 = FINAL_MERGE_CACHE_ENTRIES.ilog2();
-    let height = (size_log2 - LEAF_SIZE_LOG2).min(max_log2);
-    let entries = 1usize << (2 * height - 1).min(max_log2);
     let mut cache = Vec::new();
-    if cache.try_reserve_exact(entries).is_err() {
-        return merge_universes(mem, blank_nodes, idx, size_log2);
+    if size_log2 > LEAF_SIZE_LOG2 && idx.0 != blank && idx.1 != blank {
+        // At height h there are at most (4^h - 1) / 3 non-leaf pairs to visit.
+        let max_log2 = FINAL_MERGE_CACHE_ENTRIES.ilog2();
+        let height = (size_log2 - LEAF_SIZE_LOG2).min(max_log2);
+        let entries = 1usize << (2 * height - 1).min(max_log2);
+        if cache.try_reserve_exact(entries).is_ok() {
+            cache.resize(entries, MergeCacheEntry::default());
+        }
     }
-    cache.resize(entries, MergeCacheEntry::default());
     FinalMerge {
         mem,
         blank_nodes,
@@ -574,42 +573,50 @@ struct MergeCacheEntry {
     result: Idx,
 }
 
-struct FinalMerge<'a, M> {
-    mem: &'a M,
+struct FinalMerge<'a> {
+    mem: &'a NodeStore<u64>,
     blank_nodes: &'a BlankNodes,
     cache: Vec<MergeCacheEntry>,
     hasher: ahash::RandomState,
 }
 
-impl<M: NodeAccess<u64>> FinalMerge<'_, M> {
-    fn merge(&mut self, idx: (Idx, Idx), size_log2: u32) -> Idx {
-        if size_log2 <= LEAF_SIZE_LOG2 {
-            return merge_universes(self.mem, self.blank_nodes, idx, size_log2);
-        }
+impl FinalMerge<'_> {
+    fn merge(&mut self, idx: (Idx, Idx), size_log2: u32) -> Option<Idx> {
         let blank = self.blank_nodes.get(size_log2);
         if idx.1 == blank {
-            return idx.0;
+            return Some(idx.0);
         }
         if idx.0 == blank {
-            return idx.1;
+            return Some(idx.1);
+        }
+        if size_log2 <= LEAF_SIZE_LOG2 {
+            return (!self.mem.exceeds_load_factor())
+                .then(|| merge_universes(self.mem, self.blank_nodes, idx, size_log2));
         }
         // Live node IDs are nonzero; zero tags mark unused slots. IDs stay valid for this call.
         let key = (u64::from(idx.0) << 32) | u64::from(idx.1);
-        let slot = self.hasher.hash_one(key) as usize & (self.cache.len() - 1);
-        if self.cache[slot].key == key {
-            return self.cache[slot].result;
+        let slot = (!self.cache.is_empty()).then(|| self.hasher.hash_one(key) as usize & (self.cache.len() - 1));
+        if let Some(slot) = slot
+            && self.cache[slot].key == key
+        {
+            return Some(self.cache[slot].result);
         }
         let (a, b) = (self.mem.get(idx.0).parts(), self.mem.get(idx.1).parts());
         let mut parts = [Idx::default(); 4];
         for i in 0..4 {
-            parts[i] = self.merge((a[i], b[i]), size_log2 - 1);
+            parts[i] = self.merge((a[i], b[i]), size_log2 - 1)?;
+        }
+        if self.mem.exceeds_load_factor() {
+            return None;
         }
         let result = self
             .mem
             .find_or_create_node(parts[0], parts[1], parts[2], parts[3]);
         // Children may replace this slot; publish only the fully computed pair.
-        self.cache[slot] = MergeCacheEntry { key, result };
-        result
+        if let Some(slot) = slot {
+            self.cache[slot] = MergeCacheEntry { key, result };
+        }
+        Some(result)
     }
 }
 
@@ -635,19 +642,19 @@ mod tests {
         assert_eq!(merge_universes(&mem, &blanks, (a, b), size_log2), expected);
         assert_eq!(
             merge_final_universes(&mem, &blanks, (a, b), size_log2),
-            expected
+            Some(expected)
         );
         assert_eq!(
             merge_final_universes(&mem, &blanks, (b, a), size_log2),
-            expected
+            Some(expected)
         );
         assert_eq!(
             merge_final_universes(&mem, &blanks, (a, blank), size_log2),
-            a
+            Some(a)
         );
         assert_eq!(
             merge_final_universes(&mem, &blanks, (blank, b), size_log2),
-            b
+            Some(b)
         );
     }
 
@@ -663,13 +670,82 @@ mod tests {
     fn one_slot_merge<'a>(
         mem: &'a NodeStore<u64>,
         blank_nodes: &'a BlankNodes,
-    ) -> FinalMerge<'a, NodeStore<u64>> {
+    ) -> FinalMerge<'a> {
         FinalMerge {
             mem,
             blank_nodes,
             cache: vec![MergeCacheEntry::default()],
             hasher: ahash::RandomState::new(),
         }
+    }
+
+    #[test]
+    fn final_merge_stops_when_a_child_exhausts_capacity() {
+        // Discover the public cancellation boundary without pinning sharding constants.
+        let probe = NodeStore::<u64>::new(10, 1 << 10, 1);
+        for cells in 0.. {
+            if probe.exceeds_load_factor() {
+                break;
+            }
+            probe.find_or_create_leaf_from_u64((1 << 63) | cells);
+        }
+        let last_available = probe.len() - 1;
+
+        // An empty cache is also the fallback when its allocation fails.
+        for cache_entries in [0, 1] {
+            let mem = NodeStore::<u64>::new(10, 1 << 10, 1);
+            let mut blanks = BlankNodes::new();
+            let size_log2 = LEAF_SIZE_LOG2 + 2;
+            blanks.get_mut(size_log2, &mem);
+            let mut a = mem.find_or_create_leaf_from_u64(1);
+            let mut b = mem.find_or_create_leaf_from_u64(2);
+            for _ in LEAF_SIZE_LOG2..size_log2 {
+                a = mem.find_or_create_node(a, a, a, a);
+                b = mem.find_or_create_node(b, b, b, b);
+            }
+            for cells in 0.. {
+                if mem.len() == last_available {
+                    break;
+                }
+                mem.find_or_create_leaf_from_u64((1 << 63) | cells);
+            }
+            assert!(!mem.exceeds_load_factor());
+            let mut merge = FinalMerge {
+                mem: &mem,
+                blank_nodes: &blanks,
+                cache: vec![MergeCacheEntry::default(); cache_entries],
+                hasher: ahash::RandomState::new(),
+            };
+            assert_eq!(merge.merge((a, b), size_log2), None);
+            // The leaf fit; its parent must observe the newly exhausted limit.
+            assert_eq!(mem.len(), last_available + 1);
+            assert!(mem.exceeds_load_factor());
+        }
+    }
+
+    #[test]
+    fn final_merge_keeps_blank_and_cached_hits_available_at_capacity() {
+        let mem = NodeStore::<u64>::new(10, 1 << 10, 1);
+        let mut blanks = BlankNodes::new();
+        let size_log2 = LEAF_SIZE_LOG2 + 1;
+        let blank = blanks.get_mut(size_log2, &mem);
+        let a = mem.find_or_create_leaf_from_u64(1);
+        let b = mem.find_or_create_leaf_from_u64(2);
+        let a = mem.find_or_create_node(a, a, a, a);
+        let b = mem.find_or_create_node(b, b, b, b);
+        let mut merge = one_slot_merge(&mem, &blanks);
+        let result = merge.merge((a, b), size_log2).unwrap();
+        for cells in 0.. {
+            if mem.exceeds_load_factor() {
+                break;
+            }
+            mem.find_or_create_leaf_from_u64((1 << 63) | cells);
+        }
+        let full_len = mem.len();
+        assert_eq!(merge.merge((a, b), size_log2), Some(result));
+        assert_eq!(merge_final_universes(&mem, &blanks, (a, blank), size_log2), Some(a));
+        assert_eq!(merge_final_universes(&mem, &blanks, (blank, b), size_log2), Some(b));
+        assert_eq!(mem.len(), full_len);
     }
 
     #[test]
@@ -688,7 +764,7 @@ mod tests {
         for pair in [(a, b), (b, a), (a, b), (a, blank), (blank, b)] {
             assert_eq!(
                 merge.merge(pair, size_log2),
-                merge_universes(&mem, &blanks, pair, size_log2)
+                Some(merge_universes(&mem, &blanks, pair, size_log2))
             );
         }
         for pair in [
@@ -698,7 +774,7 @@ mod tests {
         ] {
             assert_eq!(
                 merge.merge(pair, size_log2 - 1),
-                merge_universes(&mem, &blanks, pair, size_log2 - 1)
+                Some(merge_universes(&mem, &blanks, pair, size_log2 - 1))
             );
         }
     }
@@ -717,7 +793,7 @@ mod tests {
         let mut merge = one_slot_merge(&mem, &blanks);
         assert_eq!(
             merge.merge((a, b), size_log2),
-            merge_universes(&mem, &blanks, (a, b), size_log2)
+            Some(merge_universes(&mem, &blanks, (a, b), size_log2))
         );
         merge.merge((a, a), size_log2);
     }
