@@ -143,7 +143,7 @@ impl GoLEngine for StreamLifeEngine {
 
         self.base.size_log2 -= 1;
         self.biroot = Some(biroot);
-        self.base.root = algorithm::merge_universes(
+        self.base.root = algorithm::merge_final_universes(
             &self.base.mem,
             &self.base.blank_nodes,
             biroot,

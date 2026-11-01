@@ -6,7 +6,7 @@ use super::{
     spin::Spinner,
     status,
 };
-use std::sync::atomic::Ordering;
+use std::{hash::BuildHasher, sync::atomic::Ordering};
 
 /// Apply Conway's Game of Life rules to a row of cells.
 ///
@@ -531,5 +531,208 @@ pub(super) fn merge_universes(
             r[i] = merge_universes(mem, blank_nodes, (m0[i], m1[i]), size_log2 - 1);
         }
         mem.find_or_create_node(r[0], r[1], r[2], r[3])
+    }
+}
+
+/// Merge the final roots with a call-local cache of repeated non-leaf pairs.
+/// The executor's 32x32 base merge keeps using `merge_universes` unchanged.
+pub(super) fn merge_final_universes(
+    mem: &impl NodeAccess<u64>,
+    blank_nodes: &BlankNodes,
+    idx: (Idx, Idx),
+    size_log2: u32,
+) -> Idx {
+    let blank = blank_nodes.get(size_log2);
+    if size_log2 <= LEAF_SIZE_LOG2 || idx.0 == blank || idx.1 == blank {
+        return merge_universes(mem, blank_nodes, idx, size_log2);
+    }
+    // At height h there are at most (4^h - 1) / 3 non-leaf pairs to visit.
+    let max_log2 = FINAL_MERGE_CACHE_ENTRIES.ilog2();
+    let height = (size_log2 - LEAF_SIZE_LOG2).min(max_log2);
+    let entries = 1usize << (2 * height - 1).min(max_log2);
+    let mut cache = Vec::new();
+    if cache.try_reserve_exact(entries).is_err() {
+        return merge_universes(mem, blank_nodes, idx, size_log2);
+    }
+    cache.resize(entries, MergeCacheEntry::default());
+    FinalMerge {
+        mem,
+        blank_nodes,
+        cache,
+        hasher: ahash::RandomState::new(),
+    }
+    .merge(idx, size_log2)
+}
+
+const FINAL_MERGE_CACHE_BYTES: usize = 4 << 20;
+const FINAL_MERGE_CACHE_ENTRIES: usize =
+    1usize << (FINAL_MERGE_CACHE_BYTES / std::mem::size_of::<MergeCacheEntry>()).ilog2();
+
+#[derive(Clone, Copy, Default)]
+struct MergeCacheEntry {
+    key: u64,
+    result: Idx,
+}
+
+struct FinalMerge<'a, M> {
+    mem: &'a M,
+    blank_nodes: &'a BlankNodes,
+    cache: Vec<MergeCacheEntry>,
+    hasher: ahash::RandomState,
+}
+
+impl<M: NodeAccess<u64>> FinalMerge<'_, M> {
+    fn merge(&mut self, idx: (Idx, Idx), size_log2: u32) -> Idx {
+        if size_log2 <= LEAF_SIZE_LOG2 {
+            return merge_universes(self.mem, self.blank_nodes, idx, size_log2);
+        }
+        let blank = self.blank_nodes.get(size_log2);
+        if idx.1 == blank {
+            return idx.0;
+        }
+        if idx.0 == blank {
+            return idx.1;
+        }
+        // Live node IDs are nonzero; zero tags mark unused slots. IDs stay valid for this call.
+        let key = (u64::from(idx.0) << 32) | u64::from(idx.1);
+        let slot = self.hasher.hash_one(key) as usize & (self.cache.len() - 1);
+        if self.cache[slot].key == key {
+            return self.cache[slot].result;
+        }
+        let (a, b) = (self.mem.get(idx.0).parts(), self.mem.get(idx.1).parts());
+        let mut parts = [Idx::default(); 4];
+        for i in 0..4 {
+            parts[i] = self.merge((a[i], b[i]), size_log2 - 1);
+        }
+        let result = self
+            .mem
+            .find_or_create_node(parts[0], parts[1], parts[2], parts[3]);
+        // Children may replace this slot; publish only the fully computed pair.
+        self.cache[slot] = MergeCacheEntry { key, result };
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quadtree::hashtable::NodeStore;
+
+    #[test]
+    fn final_merge_preserves_shared_subtrees_and_empty_roots() {
+        let mem = NodeStore::<u64>::new(10, 1 << 10, 1);
+        let mut blanks = BlankNodes::new();
+        let size_log2 = LEAF_SIZE_LOG2 + 8;
+        let blank = blanks.get_mut(size_log2, &mem);
+        let mut a = mem.find_or_create_leaf_from_u64(0x0000_0000_0000_000f);
+        let mut b = mem.find_or_create_leaf_from_u64(0x0000_0000_f000_0000);
+        let mut expected = mem.find_or_create_leaf_from_u64(0x0000_0000_f000_000f);
+        for _ in LEAF_SIZE_LOG2..size_log2 {
+            a = mem.find_or_create_node(a, a, a, a);
+            b = mem.find_or_create_node(b, b, b, b);
+            expected = mem.find_or_create_node(expected, expected, expected, expected);
+        }
+        assert_eq!(merge_universes(&mem, &blanks, (a, b), size_log2), expected);
+        assert_eq!(
+            merge_final_universes(&mem, &blanks, (a, b), size_log2),
+            expected
+        );
+        assert_eq!(
+            merge_final_universes(&mem, &blanks, (b, a), size_log2),
+            expected
+        );
+        assert_eq!(
+            merge_final_universes(&mem, &blanks, (a, blank), size_log2),
+            a
+        );
+        assert_eq!(
+            merge_final_universes(&mem, &blanks, (blank, b), size_log2),
+            b
+        );
+    }
+
+    #[test]
+    fn final_merge_cache_stays_within_memory_budget() {
+        let entry_bytes = std::mem::size_of::<MergeCacheEntry>();
+        assert!(FINAL_MERGE_CACHE_ENTRIES.is_power_of_two());
+        assert!(FINAL_MERGE_CACHE_ENTRIES * entry_bytes <= FINAL_MERGE_CACHE_BYTES);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(entry_bytes, 16);
+    }
+
+    fn one_slot_merge<'a>(
+        mem: &'a NodeStore<u64>,
+        blank_nodes: &'a BlankNodes,
+    ) -> FinalMerge<'a, NodeStore<u64>> {
+        FinalMerge {
+            mem,
+            blank_nodes,
+            cache: vec![MergeCacheEntry::default()],
+            hasher: ahash::RandomState::new(),
+        }
+    }
+
+    #[test]
+    fn final_merge_collisions_preserve_distinct_repeated_pairs() {
+        let mem = NodeStore::<u64>::new(10, 1 << 10, 1);
+        let mut blanks = BlankNodes::new();
+        let size_log2 = LEAF_SIZE_LOG2 + 2;
+        let blank = blanks.get_mut(size_log2, &mem);
+        let nodes = [1, 2, 4, 8].map(|cells| {
+            let leaf = mem.find_or_create_leaf_from_u64(cells);
+            mem.find_or_create_node(leaf, leaf, leaf, leaf)
+        });
+        let a = mem.find_or_create_node(nodes[0], nodes[1], nodes[0], nodes[1]);
+        let b = mem.find_or_create_node(nodes[2], nodes[3], nodes[2], nodes[3]);
+        let mut merge = one_slot_merge(&mem, &blanks);
+        for pair in [(a, b), (b, a), (a, b), (a, blank), (blank, b)] {
+            assert_eq!(
+                merge.merge(pair, size_log2),
+                merge_universes(&mem, &blanks, pair, size_log2)
+            );
+        }
+        for pair in [
+            (nodes[0], nodes[2]),
+            (nodes[1], nodes[3]),
+            (nodes[0], nodes[2]),
+        ] {
+            assert_eq!(
+                merge.merge(pair, size_log2 - 1),
+                merge_universes(&mem, &blanks, pair, size_log2 - 1)
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "universes overlap")]
+    fn final_merge_collision_does_not_hide_overlap() {
+        let mem = NodeStore::<u64>::new(10, 1 << 10, 1);
+        let mut blanks = BlankNodes::new();
+        let size_log2 = LEAF_SIZE_LOG2 + 1;
+        blanks.get_mut(size_log2, &mem);
+        let a = mem.find_or_create_leaf_from_u64(1);
+        let b = mem.find_or_create_leaf_from_u64(2);
+        let a = mem.find_or_create_node(a, a, a, a);
+        let b = mem.find_or_create_node(b, b, b, b);
+        let mut merge = one_slot_merge(&mem, &blanks);
+        assert_eq!(
+            merge.merge((a, b), size_log2),
+            merge_universes(&mem, &blanks, (a, b), size_log2)
+        );
+        merge.merge((a, a), size_log2);
+    }
+
+    #[test]
+    #[should_panic(expected = "universes overlap")]
+    fn final_merge_rejects_overlapping_shared_subtrees() {
+        let mem = NodeStore::<u64>::new(10, 1 << 10, 1);
+        let mut blanks = BlankNodes::new();
+        let size_log2 = LEAF_SIZE_LOG2 + 3;
+        blanks.get_mut(size_log2, &mem);
+        let mut root = mem.find_or_create_leaf_from_u64(1);
+        for _ in LEAF_SIZE_LOG2..size_log2 {
+            root = mem.find_or_create_node(root, root, root, root);
+        }
+        merge_final_universes(&mem, &blanks, (root, root), size_log2);
     }
 }
