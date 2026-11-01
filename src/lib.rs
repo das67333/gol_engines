@@ -7,6 +7,7 @@ mod simd;
 mod topology;
 mod traits;
 
+#[cfg(not(miri))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
