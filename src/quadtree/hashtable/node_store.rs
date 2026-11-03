@@ -201,7 +201,7 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
 
     /// Parallel mark-and-sweep GC. Marks all nodes reachable from `roots`
     /// using a status bit (`GC_MARK`), then sweeps the bucket chains in
-    /// parallel — removing dead entries to per-thread free lists and
+    /// parallel — recycling dead entries in shared batches and
     /// resetting computation state on survivors.
     pub fn gc(&mut self, roots: &[Idx], size_log2: u32) {
         let threads_cnt = self.inner.thread_states.len();
