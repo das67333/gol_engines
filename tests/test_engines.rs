@@ -160,4 +160,33 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn parallel_collection_preserves_future_updates() {
+        let pattern = Pattern::random(7, Some(42)).unwrap();
+        for topology in [Topology::Unbounded, Topology::Torus] {
+            for workers in [1, 4, 16] {
+                let engines: Vec<Box<dyn GoLEngine>> = vec![
+                    Box::new(HashLifeEngine::new(64, workers)),
+                    Box::new(StreamLifeEngine::new(64, workers)),
+                ];
+                for mut engine in engines {
+                    engine.load_pattern(&pattern, topology).unwrap();
+                    for step in [0, 3, 1] {
+                        let before = engine.current_state();
+                        let mut reference = HashLifeEngine::new(64, 1);
+                        reference.load_pattern(&before, topology).unwrap();
+                        let expected_offset = reference.update(step).unwrap();
+                        engine.run_gc();
+                        assert_eq!(engine.current_state().hash(), before.hash());
+                        assert_eq!(engine.update(step).unwrap(), expected_offset);
+                        assert_eq!(
+                            engine.current_state().hash(),
+                            reference.current_state().hash()
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
