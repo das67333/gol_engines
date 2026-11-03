@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 
 /// Shared interface for accessing nodes.
 pub trait NodeAccess<Meta: Default + Sync> {
+    fn exceeds_load_factor(&self) -> bool;
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta>;
     fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx;
     fn find_or_create_leaf_from_u64(&self, value: u64) -> Idx;
@@ -36,6 +37,9 @@ pub struct NodeStore<Meta> {
 unsafe impl<Meta: Sync> Sync for NodeStore<Meta> {}
 
 impl<Meta: Default + Sync> NodeAccess<Meta> for NodeStore<Meta> {
+    fn exceeds_load_factor(&self) -> bool {
+        self.exceeds_load_factor()
+    }
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
         self.get(idx)
     }
@@ -265,6 +269,9 @@ impl<Meta: Default + Sync> NodeStoreRef<'_, Meta> {
 }
 
 impl<Meta: Default + Sync> NodeAccess<Meta> for NodeStoreRef<'_, Meta> {
+    fn exceeds_load_factor(&self) -> bool {
+        self.exceeds_load_factor()
+    }
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
         self.get(idx)
     }
