@@ -63,9 +63,9 @@ const OFFSET_MASK: u32 = CHUNK_SIZE - 1;
 /// between [`ConcurrentHashTable::length_limit`] (cancellation threshold)
 /// and the table's hard capacity.
 ///
-/// 64 is a generous upper bound — measured worst-case is ~14
-/// (`nine_children_disjoint` 9 + `four_children_overlapping` 4 + final result
-/// 1).
+/// Recursive lane classification checks the limit before allocating each
+/// pseudochild. Other task stages allocate a bounded set of overlapping nodes,
+/// dependencies and results; the reserve also covers the current pseudochild.
 const MAX_ALLOCS_PER_TASK: usize = 64;
 
 pub(super) fn chunk_id(idx: Idx) -> u32 {

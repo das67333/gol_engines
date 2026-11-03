@@ -1,6 +1,81 @@
 use super::*;
 use crate::quadtree::hashtable::NodeStore;
 
+fn lane_test_tile(mem: &NodeStore<u64>, blanks: &mut BlankNodes) -> Idx {
+    let empty = blanks.get_mut(LEAF_SIZE_LOG2, mem);
+    let glider = mem.find_or_create_leaf_from_u64((1 << 10) | (1 << 19) | (7 << 25));
+    let corner = mem.find_or_create_node(empty, empty, empty, glider);
+    let empty = blanks.get_mut(LEAF_SIZE_LOG2 + 1, mem);
+    blanks.get_mut(LEAF_SIZE_LOG2 + 2, mem);
+    mem.find_or_create_node(corner, empty, empty, empty)
+}
+
+#[test]
+fn lane_classification_cancels_and_allows_concurrent_retry() {
+    let size_log2 = LEAF_SIZE_LOG2 + 2;
+    let reference = NodeStore::<u64>::new(12, 4096, 4);
+    let mut reference_blanks = BlankNodes::new();
+    let root = lane_test_tile(&reference, &mut reference_blanks);
+    let expected = node2lanes(&reference, &reference_blanks, root, size_log2).unwrap();
+    assert_ne!(
+        expected & 0xff,
+        0,
+        "the tile must require directional classification"
+    );
+
+    // Discover the cancellation boundary, independently of length-shard batching.
+    let probe = NodeStore::<u64>::new(12, 4096, 4);
+    for cells in 0.. {
+        if probe.exceeds_load_factor() {
+            break;
+        }
+        probe.find_or_create_leaf_from_u64((1 << 63) | cells);
+    }
+    let last_available = probe.len() - 1;
+    let mut mem = NodeStore::<u64>::new(12, 4096, 4);
+    let mut blanks = BlankNodes::new();
+    let root = lane_test_tile(&mem, &mut blanks);
+    for cells in 0.. {
+        if mem.len() == last_available {
+            break;
+        }
+        mem.find_or_create_leaf_from_u64((1 << 63) | cells);
+    }
+    assert!(!mem.exceeds_load_factor());
+    assert_eq!(node2lanes(&mem, &blanks, root, size_log2), None);
+    assert!(mem.exceeds_load_factor());
+
+    // Collection preserves completed lane descriptors; unfinished claims must
+    // therefore be released by cancellation itself, before the next attempt.
+    mem.gc(&[root], size_log2);
+    blanks.clear();
+    blanks.get_mut(size_log2, &mem);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..4)
+            .map(|shard| {
+                let mem = &mem;
+                let blanks = &blanks;
+                scope.spawn(move || node2lanes(&mem.create_ref(shard), blanks, root, size_log2))
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), Some(expected));
+        }
+    });
+
+    for cells in 0.. {
+        if mem.exceeds_load_factor() {
+            break;
+        }
+        mem.find_or_create_leaf_from_u64((1 << 63) | cells);
+    }
+    assert_eq!(node2lanes(&mem, &blanks, root, size_log2), Some(expected));
+    assert_eq!(
+        node2lanes(&mem, &blanks, blanks.get(size_log2), size_log2),
+        Some(0xffff)
+    );
+}
+
 #[test]
 fn final_merge_preserves_shared_subtrees_and_empty_roots() {
     let mem = NodeStore::<u64>::new(10, 1 << 10, 1);
