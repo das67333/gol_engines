@@ -99,7 +99,7 @@ pub(super) fn run_update(args: UpdateArgs) {
     let mut step = BigInt::from(1) << step_log2;
     let gens_total = BigInt::from(1) << args.gens_log2;
     let mut gens_left = gens_total.clone();
-    let mut gc_can_help = false;
+    let mut can_retry = false;
     loop {
         match engine.update(step_log2) {
             Ok(_) => {
@@ -113,13 +113,13 @@ pub(super) fn run_update(args: UpdateArgs) {
                     &gens_total - &gens_left,
                     &gens_total
                 );
-                gc_can_help = true;
+                can_retry = true;
             }
             Err(_) => {
-                if gc_can_help {
-                    println!("{}  Overfilled hashtables, running GC", local_time());
-                    engine.run_gc();
-                    gc_can_help = false;
+                if can_retry {
+                    // Both CLI engines restore failed updates with cleared caches.
+                    println!("{}  Overfilled hashtables, retrying after rollback", local_time());
+                    can_retry = false;
                 } else {
                     let new_step_log2 = step_log2.checked_sub(2).unwrap();
                     println!(
