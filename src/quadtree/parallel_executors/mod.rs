@@ -5,6 +5,7 @@ mod hashlife;
 mod parking;
 mod processing;
 mod streamlife;
+mod task_queue;
 
 pub(super) use gc_mark::GcMarkExecutor;
 pub(super) use gc_sweep::GcSweepExecutor;

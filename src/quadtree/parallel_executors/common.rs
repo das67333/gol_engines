@@ -93,9 +93,19 @@ pub(super) struct HashWork {
 pub(super) type HashProcessingData<Dep> = ProcessingData<HashWork, Dep>;
 
 /// A unit of work representing a node to be processed.
+#[derive(Clone, Copy)]
 pub struct Task {
     pub idx: Idx,
     pub size_log2: u32,
+}
+
+impl super::task_queue::TaskWord for Task {
+    fn into_word(self) -> u64 {
+        u64::from(self.idx) | (u64::from(self.size_log2) << 32)
+    }
+    fn from_word(word: u64) -> Self {
+        Self::new(word as u32, (word >> 32) as u32)
+    }
 }
 
 impl Task {
@@ -257,7 +267,7 @@ pub fn start_processing_node<Meta: Default + Sync, Dep>(
 /// Async work body for a `HashLife` node: drive the node's `ProcessingData`
 /// state machine through Stage 1 (9 overlapping children, if `both_stages`)
 /// and Stage 2 (4 final children), registering dependencies and pushing
-/// child tasks via `queue` as needed.
+/// child tasks via `enqueue` as needed.
 ///
 /// Returns `Some(result)` if all child results are ready and the node can be
 /// finalized; returns `None` when at least one child is still in flight, in
@@ -269,7 +279,7 @@ pub fn start_processing_node<Meta: Default + Sync, Dep>(
 /// `Dep = Dependent` and a tagged-enum value identifying the parent task.
 pub fn update_node_async<Meta, Dep>(
     mem: &impl NodeAccess<Meta>,
-    queue: &Worker<Task>,
+    enqueue: impl Fn(Task),
     generations_log2: u32,
     task: &Task,
     parts: [Idx; 4],
@@ -316,7 +326,7 @@ where
                     }
                     DependencyHandlingResult::StartedByThisThread => {
                         waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                        queue.push(Task::new(*x, task.size_log2 - 1));
+                        enqueue(Task::new(*x, task.size_log2 - 1));
                     }
                     DependencyHandlingResult::StartedByOtherThread => {
                         waiting_cnt.fetch_add(1, Ordering::Relaxed);
@@ -330,7 +340,7 @@ where
                     // Every dependency we registered already notified
                     // before our `fetch_sub`; re-queue ourselves so the
                     // mask gets re-scanned with their now-`Ready` status.
-                    queue.push(Task::new(task.idx, task.size_log2));
+                    enqueue(Task::new(task.idx, task.size_log2));
                 }
                 return None;
             }
@@ -356,7 +366,7 @@ where
             }
             DependencyHandlingResult::StartedByThisThread => {
                 waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                queue.push(Task::new(*x, task.size_log2 - 1));
+                enqueue(Task::new(*x, task.size_log2 - 1));
             }
             DependencyHandlingResult::StartedByOtherThread => {
                 waiting_cnt.fetch_add(1, Ordering::Relaxed);
@@ -367,7 +377,7 @@ where
 
     if data.mask4_waiting != 0 {
         if prev == WAITING_BIAS {
-            queue.push(Task::new(task.idx, task.size_log2));
+            enqueue(Task::new(task.idx, task.size_log2));
         }
         return None;
     }

@@ -168,7 +168,7 @@ impl<Meta: Default + Sync> ExecutorThread<'_, Meta> {
         let data = unsafe { &*data_ptr };
         let result = update_node_async(
             &self.mem,
-            &self.queue,
+            |task| self.queue.push(task),
             self.generations_log2,
             &task,
             n.parts(),
