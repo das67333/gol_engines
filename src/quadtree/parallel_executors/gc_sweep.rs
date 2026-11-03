@@ -1,11 +1,13 @@
 //! Parallel GC sweep phase: walks every bucket chain in parallel.
 //!
-//! `is_dead(entry)` returns `true` for entries to remove (pushed to a per-thread
-//! free list) and `false` for survivors kept in the chain. The callback may reset
+//! `is_dead(entry)` returns `true` for entries to recycle in shared batches
+//! and `false` for survivors kept in the chain. The callback may reset
 //! live entries as a side effect. Must run after [`GcMarkExecutor`] and after all
 //! executor threads have joined.
 
-use crate::quadtree::hashtable::{ConcurrentHashTable, HashtableSlot, NULL_IDX, ThreadState};
+use crate::quadtree::hashtable::{
+    ConcurrentHashTable, HashtableSlot, Idx, NULL_IDX, RECYCLE_BATCH_SIZE,
+};
 use std::sync::atomic::Ordering;
 
 pub struct GcSweepExecutor<'a, E> {
@@ -30,7 +32,7 @@ impl<'a, E: HashtableSlot> GcSweepExecutor<'a, E> {
         let table = &*self.table;
         let is_dead = &is_dead;
 
-        let per_thread_live: Vec<usize> = std::thread::scope(|scope| {
+        let swept: Vec<(usize, Vec<Idx>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..threads_cnt)
                 .map(|tid| {
                     let start = tid * buckets_per_thread;
@@ -41,9 +43,13 @@ impl<'a, E: HashtableSlot> GcSweepExecutor<'a, E> {
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-        self.table
-            .length
-            .set(per_thread_live.iter().sum());
+        let mut live = 0;
+        let recycled = self.table.recycled_batches.get_mut().unwrap();
+        for (count, batches) in swept {
+            live += count;
+            recycled.extend(batches);
+        }
+        self.table.length.set(live);
 
         println!("Time spent on gc sweep executor: {:?}", timer.elapsed());
     }
@@ -55,19 +61,26 @@ fn sweep_range<E: HashtableSlot, F: Fn(&E) -> bool + Sync>(
     start: usize,
     end: usize,
     is_dead: &F,
-) -> usize {
-    let free_list = table.thread_states[tid].get();
+) -> (usize, Vec<Idx>) {
+    let mut free = FreeBatches::default();
+    let mut head = table.take_local_free_list(tid);
+    while head != NULL_IDX {
+        let entry = table.get(head);
+        let next = entry.next().load(Ordering::Relaxed);
+        free.push(entry, head);
+        head = next;
+    }
     let mut live = 0usize;
     for bucket in start..end {
-        live += sweep_bucket(table, bucket, free_list, is_dead);
+        live += sweep_bucket(table, bucket, &mut free, is_dead);
     }
-    live
+    (live, free.finish())
 }
 
 fn sweep_bucket<E: HashtableSlot, F: Fn(&E) -> bool>(
     table: &ConcurrentHashTable<E>,
     bucket: usize,
-    free_list: *mut ThreadState,
+    free: &mut FreeBatches,
     is_dead: &F,
 ) -> usize {
     let mut live = 0usize;
@@ -77,7 +90,7 @@ fn sweep_bucket<E: HashtableSlot, F: Fn(&E) -> bool>(
         let entry = table.get(cur);
         let next = entry.next().load(Ordering::Relaxed);
         if is_dead(entry) {
-            push_free(entry, free_list, cur);
+            free.push(entry, cur);
         } else {
             live += 1;
             entry.next().store(new_head, Ordering::Relaxed);
@@ -89,9 +102,29 @@ fn sweep_bucket<E: HashtableSlot, F: Fn(&E) -> bool>(
     live
 }
 
-fn push_free<E: HashtableSlot>(entry: &E, free_list: *mut ThreadState, idx: u32) {
-    // SAFETY: `free_list` is this thread's `ThreadState`; bucket ranges are disjoint.
-    let old_head = unsafe { (*free_list).free_list_head };
-    entry.next().store(old_head, Ordering::Relaxed);
-    unsafe { (*free_list).free_list_head = idx };
+#[derive(Default)]
+struct FreeBatches {
+    head: Idx,
+    len: usize,
+    batches: Vec<Idx>,
+}
+
+impl FreeBatches {
+    fn push<E: HashtableSlot>(&mut self, entry: &E, idx: Idx) {
+        entry.next().store(self.head, Ordering::Relaxed);
+        self.head = idx;
+        self.len += 1;
+        if self.len == RECYCLE_BATCH_SIZE {
+            self.batches.push(self.head);
+            self.head = NULL_IDX;
+            self.len = 0;
+        }
+    }
+
+    fn finish(mut self) -> Vec<Idx> {
+        if self.head != NULL_IDX {
+            self.batches.push(self.head);
+        }
+        self.batches
+    }
 }
