@@ -553,7 +553,7 @@ impl BiExecutorThread<'_> {
         // on the bump pointer / free list and produces torn slot bodies.
         if data.phase == BiPhase::Entry {
             // is_solitonic is sync; it spins on node2lanes' status_extra.
-            if algorithm::is_solitonic(&self.node_ref, &engine.base.blank_nodes, idx, size_log2) {
+            if algorithm::is_solitonic(&self.node_ref, &engine.base.blank_nodes, idx, size_log2)? {
                 data.phase = BiPhase::Solitonic;
                 data.hash_mask = 0b11; // need both i1, i2
             } else if size_log2 == LEAF_SIZE_LOG2 + 2 {
@@ -678,7 +678,7 @@ impl BiExecutorThread<'_> {
             // Sync: lane query (kept synchronous in v1; node2lanes uses its
             // own spinner-on-status_extra for in-flight waits).
             let lanes =
-                algorithm::node2lanes(&self.node_ref, &engine.base.blank_nodes, ind3, size_log2);
+                algorithm::node2lanes(&self.node_ref, &engine.base.blank_nodes, ind3, size_log2)?;
             let blank_child = engine.base.blank_nodes.get(size_log2 - 1);
             if lanes & 0xf0 != 0 {
                 (blank_child, i3)
@@ -743,7 +743,7 @@ impl BiExecutorThread<'_> {
         } else {
             // Sync: lane query on the merged node.
             let lanes =
-                algorithm::node2lanes(&self.node_ref, &engine.base.blank_nodes, merged, size_log2);
+                algorithm::node2lanes(&self.node_ref, &engine.base.blank_nodes, merged, size_log2)?;
             if lanes & 0xf0 != 0 {
                 (blank_child, i3)
             } else {

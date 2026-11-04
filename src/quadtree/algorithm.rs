@@ -289,59 +289,70 @@ fn determine_direction<Meta: Default + Sync>(
     dmap | (lmask << 32)
 }
 
-/// Compute lane descriptors for a node. Thread-safe (uses CAS on `status_extra`).
-///
-/// Kept synchronous: `node2lanes` is idempotent and cheap to spin on (it only
-/// needs the already-present cell data, not async `HashLife` results), so a
-/// simple CAS + spinner avoids the cost of adding a `BiTask` phase for it.
-/// Called from both `is_solitonic` (the solitonic check inside the binode
-/// phase machine) and from the finalization steps of Phases Solitonic / Base.
+/// Compute lane descriptors, or cancel when the node store reaches its limit.
+/// Completed descriptors are immutable. An interrupted classifier releases its
+/// claim so a later update can retry; no partial descriptor is published.
 pub(super) fn node2lanes(
     mem: &impl NodeAccess<u64>,
     blank_nodes: &BlankNodes,
     idx: Idx,
     size_log2: u32,
-) -> u64 {
+) -> Option<u64> {
     if idx == blank_nodes.get(size_log2) {
-        // blank node
-        return 0xffff;
+        return Some(0xffff);
     }
 
     let n = mem.get(idx);
-    let status = n.status_extra.load(Ordering::Acquire);
-    if status == status::FINISHED {
-        return unsafe { *n.extra.get() };
+    let mut current = n.status_extra.load(Ordering::Acquire);
+    if current == status::FINISHED {
+        return Some(unsafe { *n.extra.get() });
     }
-
-    if !(status == status::NOT_STARTED
-        && n.status_extra
-            .compare_exchange(
-                status::NOT_STARTED,
-                status::PROCESSING,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .is_ok())
-    {
-        let mut spinner = Spinner::new();
-        while n.status_extra.load(Ordering::Acquire) != status::FINISHED {
-            spinner.spin();
+    let mut spinner = Spinner::new();
+    loop {
+        if mem.exceeds_load_factor() {
+            return None;
         }
-        record_metric(spinner.count(), MetricKind::Node2Lanes);
-        return unsafe { *n.extra.get() };
+        if current == status::NOT_STARTED
+            && n.status_extra
+                .compare_exchange(
+                    status::NOT_STARTED,
+                    status::PROCESSING,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            break;
+        }
+        spinner.spin();
+        current = n.status_extra.load(Ordering::Acquire);
+        if current == status::FINISHED {
+            record_metric(spinner.count(), MetricKind::Node2Lanes);
+            return Some(unsafe { *n.extra.get() });
+        }
     }
-
-    if size_log2 == LEAF_SIZE_LOG2 + 1 {
-        let extra = determine_direction(mem, n.nw, n.ne, n.sw, n.se);
+    let result = compute_lanes(mem, blank_nodes, n.parts(), size_log2);
+    if let Some(extra) = result {
         unsafe { *n.extra.get() = extra };
         n.status_extra.store(status::FINISHED, Ordering::Release);
-        return extra;
+    } else {
+        n.status_extra.store(status::NOT_STARTED, Ordering::Release);
+    }
+    result
+}
+
+fn compute_lanes(
+    mem: &impl NodeAccess<u64>,
+    blank_nodes: &BlankNodes,
+    parts: [Idx; 4],
+    size_log2: u32,
+) -> Option<u64> {
+    if size_log2 == LEAF_SIZE_LOG2 + 1 {
+        let [nw, ne, sw, se] = parts;
+        return Some(determine_direction(mem, nw, ne, sw, se));
     }
 
-    let (nw, ne, sw, se) = {
-        let n = mem.get(idx);
-        (n.nw, n.ne, n.sw, n.se)
-    };
+    let [nw, ne, sw, se] = parts;
 
     let mut childlanes = [0u64; 9];
     let mut adml = 0xff;
@@ -350,25 +361,23 @@ pub(super) fn node2lanes(
      * This will handle the vast majority of random tiles.
      */
     if adml != 0 {
-        childlanes[0] = node2lanes(mem, blank_nodes, nw, size_log2 - 1);
+        childlanes[0] = node2lanes(mem, blank_nodes, nw, size_log2 - 1)?;
         adml &= childlanes[0];
     }
     if adml != 0 {
-        childlanes[2] = node2lanes(mem, blank_nodes, ne, size_log2 - 1);
+        childlanes[2] = node2lanes(mem, blank_nodes, ne, size_log2 - 1)?;
         adml &= childlanes[2];
     }
     if adml != 0 {
-        childlanes[6] = node2lanes(mem, blank_nodes, sw, size_log2 - 1);
+        childlanes[6] = node2lanes(mem, blank_nodes, sw, size_log2 - 1)?;
         adml &= childlanes[6];
     }
     if adml != 0 {
-        childlanes[8] = node2lanes(mem, blank_nodes, se, size_log2 - 1);
+        childlanes[8] = node2lanes(mem, blank_nodes, se, size_log2 - 1)?;
         adml &= childlanes[8];
     }
     if adml == 0 {
-        unsafe { *n.extra.get() = 0 };
-        n.status_extra.store(status::FINISHED, Ordering::Release);
-        return 0;
+        return Some(0);
     }
 
     if size_log2 == LEAF_SIZE_LOG2 + 2 {
@@ -404,7 +413,10 @@ pub(super) fn node2lanes(
         };
 
         for (i, x) in [(1, &tc), (3, &cl), (4, &cc), (5, &cr), (7, &bc)] {
-            childlanes[i] = node2lanes(mem, blank_nodes, prepared(x), size_log2 - 1);
+            if mem.exceeds_load_factor() {
+                return None;
+            }
+            childlanes[i] = node2lanes(mem, blank_nodes, prepared(x), size_log2 - 1)?;
         }
         adml &= childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
     } else {
@@ -421,7 +433,10 @@ pub(super) fn node2lanes(
         let prepared = |x: &[Idx; 4]| mem.find_or_create_node(x[0], x[1], x[2], x[3]);
 
         for (i, x) in [(1, &tc), (3, &cl), (4, &cc), (5, &cr), (7, &bc)] {
-            childlanes[i] = node2lanes(mem, blank_nodes, prepared(x), size_log2 - 1);
+            if mem.exceeds_load_factor() {
+                return None;
+            }
+            childlanes[i] = node2lanes(mem, blank_nodes, prepared(x), size_log2 - 1)?;
         }
         adml &= childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
     }
@@ -474,10 +489,7 @@ pub(super) fn node2lanes(
         lanes |= rotr32(childlanes[6], a2);
     }
 
-    let extra = adml | (lanes << 32);
-    unsafe { *n.extra.get() = extra };
-    n.status_extra.store(status::FINISHED, Ordering::Release);
-    extra
+    Some(adml | (lanes << 32))
 }
 
 /// Check if two universes are provably non-interacting (solitonic).
@@ -487,20 +499,20 @@ pub(super) fn is_solitonic(
     blank_nodes: &BlankNodes,
     idx: (Idx, Idx),
     size_log2: u32,
-) -> bool {
-    let lanes1 = node2lanes(mem, blank_nodes, idx.0, size_log2);
+) -> Option<bool> {
+    let lanes1 = node2lanes(mem, blank_nodes, idx.0, size_log2)?;
     if lanes1.trailing_zeros() >= 8 {
-        return false;
+        return Some(false);
     }
-    let lanes2 = node2lanes(mem, blank_nodes, idx.1, size_log2);
+    let lanes2 = node2lanes(mem, blank_nodes, idx.1, size_log2)?;
     if lanes2.trailing_zeros() >= 8 {
-        return false;
+        return Some(false);
     }
     let commonlanes = (lanes1 & lanes2) >> 32;
     if commonlanes != 0 {
-        return false;
+        return Some(false);
     }
-    (((lanes1 >> 4) & lanes2) | ((lanes2 >> 4) & lanes1)) & 15 != 0
+    Some((((lanes1 >> 4) & lanes2) | ((lanes2 >> 4) & lanes1)) & 15 != 0)
 }
 
 /// Merge two non-overlapping universes into a single node. Thread-safe.
