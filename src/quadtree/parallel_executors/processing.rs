@@ -41,6 +41,12 @@ impl<Work, Dep> ProcessingData<Work, Dep> {
     }
 
     /// # Safety
+    /// Every worker accessing this payload has joined; no owner or pusher may run.
+    pub(super) unsafe fn paused_work(&self) -> &Work {
+        unsafe { &*self.work.get() }
+    }
+
+    /// # Safety
     /// The caller holds DEPS_LOCK and the payload is PENDING or ACTIVE.
     pub(super) unsafe fn push_dependent(&self, dependent: Dep) {
         unsafe { &mut *self.dependents.get() }.push(dependent);

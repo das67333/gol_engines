@@ -9,6 +9,9 @@ use crate::{GoLEngine, Pattern, Topology};
 use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
 
+// Bound recovery if retaining the active frontier repeatedly evicts useful memoized work.
+const MAX_RESUMED_COLLECTIONS: usize = 32;
+
 /// Implementation of [StreamLife algorithm](https://conwaylife.com/wiki/StreamLife).
 ///
 /// Built on top of [`HashLifeEngine`]. Uses a static hashtable for caching
@@ -21,6 +24,36 @@ pub struct StreamLifeEngine {
 }
 
 impl StreamLifeEngine {
+    fn run_executor(&mut self, biroot: (Idx, Idx), rollback_roots: &[(Idx, u32)]) -> Option<(Idx, Idx)> {
+        let mut paused = None;
+        for collection in 0..=MAX_RESUMED_COLLECTIONS {
+            let executor = StreamLifeExecutor::new(self, biroot, self.base.size_log2);
+            if let Some(result) = executor.run(paused.take()) {
+                return Some(result);
+            }
+            if collection == MAX_RESUMED_COLLECTIONS { break; }
+            let mut work = executor.paused_work();
+            work.roots.extend_from_slice(rollback_roots);
+            let before = (self.base.mem.len(), self.bicache.len());
+            self.collect_preserving_work(&work.roots);
+            self.base.blank_nodes.get_mut(self.base.size_log2, &self.base.mem);
+            println!("StreamLife resume GC: {:?} -> {:?}", before, (self.base.mem.len(), self.bicache.len()));
+            if self.base.mem.exceeds_load_factor() || self.bicache.exceeds_load_factor() || !work.can_resume() {
+                break;
+            }
+            paused = Some(work);
+        }
+        None
+    }
+
+    /// Workers have joined and every pending input, scratch node, and result is rooted.
+    fn collect_preserving_work(&mut self, roots: &[(Idx, u32)]) {
+        self.base.mem.mark(roots, true);
+        self.bicache.retain_marked(&self.base.mem);
+        self.base.mem.sweep(true);
+        self.base.blank_nodes.clear();
+    }
+
     fn reset_stream_cache(&mut self) {
         self.biroot = None;
         self.bicache.clear();
@@ -133,7 +166,9 @@ impl GoLEngine for StreamLifeEngine {
         {
             self.run_gc();
         }
-        let (root, size_log2) = (self.base.root, self.base.size_log2);
+        let (root, size_log2, biroot) = (self.base.root, self.base.size_log2, self.biroot);
+        let mut rollback_roots = vec![(root, size_log2)];
+        if let Some((a, b)) = biroot { rollback_roots.extend([(a, size_log2), (b, size_log2)]); }
         self.base.generations_per_update_log2 = Some(generations_log2);
 
         let result = (|| {
@@ -148,7 +183,7 @@ impl GoLEngine for StreamLifeEngine {
                 // It guarantees that blank_nodes doesn't mutate during the executor.
                 self.base.blank_nodes.get_mut(self.base.size_log2, &self.base.mem),
             ));
-            let biroot = StreamLifeExecutor::new(self, biroot, self.base.size_log2).run(self.base.threads_cnt)?;
+            let biroot = self.run_executor(biroot, &rollback_roots)?;
             let new_size_log2 = self.base.size_log2 - 1;
             let new_root = algorithm::merge_final_universes(
                 &self.base.mem,
@@ -181,12 +216,16 @@ impl GoLEngine for StreamLifeEngine {
         if let Some(offset) = result {
             return Ok(offset);
         }
+        StreamLifeExecutor::discard_pending(self);
         // All phases leave structural nodes intact; serialize rollback only on failure.
         self.base.root = root;
         self.base.size_log2 = size_log2;
-        self.reset_stream_cache();
-        let backup = self.current_state();
-        self.base.load_pattern(&backup, self.base.topology)?;
+        self.biroot = biroot;
+        let mut roots = vec![(root, size_log2)];
+        if let Some((a, b)) = biroot {
+            roots.extend([(a, size_log2), (b, size_log2)]);
+        }
+        self.collect_preserving_work(&roots);
         Err(anyhow!("StreamLife: overfilled NodeStore or BinodeCache, try smaller step"))
     }
 

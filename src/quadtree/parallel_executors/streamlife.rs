@@ -32,6 +32,9 @@
 //! machine. The bit-flag state machine on `n.status` is shared across both
 //! engines.
 
+mod recovery;
+use recovery::PausedWork;
+
 use super::{
     super::{
         LEAF_SIZE_LOG2, algorithm,
@@ -157,7 +160,8 @@ impl<'a> StreamLifeExecutor<'a> {
         }
     }
 
-    pub fn run(&self, num_threads: usize) -> Option<(Idx, Idx)> {
+    pub fn run(&self, paused: Option<PausedWork>) -> Option<(Idx, Idx)> {
+        let num_threads = self.engine.base.threads_cnt;
         let timer = std::time::Instant::now();
         let bicache = &self.engine.bicache;
 
@@ -165,23 +169,13 @@ impl<'a> StreamLifeExecutor<'a> {
         let root_idx = bicache.entry(self.biroot);
         let root_status = bicache.get(root_idx).status();
 
-        // Reuse an already-computed root instead of queueing a task that can
-        // never acquire the PENDING -> ACTIVE processing guard.
-        if !start_processing_entry(bicache, root_idx, smallvec![]) {
-            let status_value = root_status.load(Ordering::Acquire);
-            assert!(
-                status_value & status::FINISHED != 0,
-                "root binode has nonterminal status {status_value:#010b} before executor start"
-            );
-            println!("Time spent on streamlife executor: {:?}", timer.elapsed());
-            println!(
-                "Nodes count: {} / {}, BiCache count: {} / {}",
-                self.engine.base.mem.len(),
-                self.engine.base.mem.capacity(),
-                bicache.len(),
-                bicache.capacity()
-            );
+        if is_finished(root_status) {
             return Some(bicache.get(root_idx).payload().get_value());
+        }
+        if paused.is_none() {
+            assert!(start_processing_entry(bicache, root_idx, smallvec![]));
+        } else {
+            assert_eq!(root_status.load(Ordering::Relaxed), status::PENDING);
         }
 
         // Create worker queues and stealers for both task kinds.
@@ -199,11 +193,17 @@ impl<'a> StreamLifeExecutor<'a> {
             hash_queues.push(hash_queue);
         }
 
-        // The root was claimed above; queue its initial task.
-        bi_queues[0].push(BiTask {
-            entry_idx: root_idx,
-            size_log2: self.size_log2,
-        });
+        let tasks = paused.map_or_else(
+            || vec![ReadyTask::Bi(BiTask { entry_idx: root_idx, size_log2: self.size_log2 })],
+            |paused| paused.tasks,
+        );
+        assert!(!tasks.is_empty(), "unfinished update has no runnable tasks");
+        for (i, task) in tasks.into_iter().enumerate() {
+            match task {
+                ReadyTask::Bi(task) => bi_queues[i % num_threads].push(task),
+                ReadyTask::Hash(task) => hash_queues[i % num_threads].push(task),
+            }
+        }
 
         let (parking, parkers) = Parking::new(num_threads);
         let mut total_stats = ExecutionStatistics::new();
@@ -237,7 +237,6 @@ impl<'a> StreamLifeExecutor<'a> {
         });
 
         if self.engine.base.mem.exceeds_load_factor() || bicache.exceeds_load_factor() {
-            self.free_orphaned_processing_data();
             return None;
         }
 
@@ -260,27 +259,29 @@ impl<'a> StreamLifeExecutor<'a> {
     /// `BiProcessingData` (binode entries) on cancellation. Must be called
     /// from a single-threaded context after `thread::scope` has joined; only
     /// PENDING slots own a live box at that point.
-    fn free_orphaned_processing_data(&self) {
+    pub fn discard_pending(engine: &StreamLifeEngine) {
         // Binode entries
-        let bicache = &self.engine.bicache;
+        let bicache = &engine.bicache;
         bicache.for_each_idx(|idx| {
             let entry = bicache.get(idx);
             let status = entry.status().load(Ordering::Relaxed);
             if status == status::PENDING {
                 // SAFETY: PENDING owns the original Box pointer; all workers have joined.
                 unsafe { drop(Box::from_raw(entry.payload().get_ptr::<BiProcessingData>())) };
+                entry.status().store(status::NOT_STARTED, Ordering::Relaxed);
             }
         });
         // HashLife nodes processed asynchronously during this StreamLife run
         // can also be orphaned in PENDING state. Free their
         // `HashProcessingData<Dependent>` boxes.
-        let mem = &self.engine.base.mem;
+        let mem = &engine.base.mem;
         mem.for_each_idx(|idx| {
             let n = mem.get(idx);
             let status = n.status.load(Ordering::Relaxed);
             if status == status::PENDING {
                 // SAFETY: PENDING owns the original Box pointer; all workers have joined.
                 unsafe { drop(Box::from_raw(n.cache.get_ptr::<HashProcessingData<Dependent>>())) };
+                n.status.store(status::NOT_STARTED, Ordering::Relaxed);
             }
         });
     }

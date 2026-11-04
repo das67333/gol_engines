@@ -244,7 +244,7 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
     fn run_gc(&mut self) {
         let len_before = self.mem.len();
         let t = std::time::Instant::now();
-        self.mem.gc(&[self.root], self.size_log2);
+        self.mem.gc(&[(self.root, self.size_log2)], false);
         self.blank_nodes.clear();
         let elapsed = t.elapsed();
         let len_after = self.mem.len();
