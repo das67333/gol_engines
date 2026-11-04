@@ -137,7 +137,7 @@ impl GoLEngine for StreamLifeEngine {
         self.base.generations_per_update_log2 = Some(generations_log2);
 
         let result = (|| {
-            let frames_cnt = (generations_log2 + 2).max(self.base.size_log2 + 1) - self.base.size_log2;
+            let frames_cnt = self.base.frames_for_update(generations_log2);
             let (mut dx, mut dy) = (BigInt::ZERO, BigInt::ZERO);
             for _ in 0..frames_cnt {
                 self.add_frame(&mut dx, &mut dy)?;
