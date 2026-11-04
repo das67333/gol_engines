@@ -28,7 +28,7 @@ fn gc_drops_invalidated_results_but_keeps_structural_children() {
 }
 
 #[test]
-fn high_load_survives_gc_and_slot_reuse() {
+fn concurrent_interning_survives_gc() {
     let mut store = NodeStore::<u64>::new(12, 10_000, 4);
     let copies = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..4)
@@ -52,7 +52,6 @@ fn high_load_survives_gc_and_slot_reuse() {
     assert!(!store.exceeds_load_factor());
 
     let roots = &copies[0][..64];
-    let dead: HashSet<_> = copies[0][64..].iter().copied().collect();
     store.gc(roots, crate::quadtree::LEAF_SIZE_LOG2);
     assert_eq!(store.len(), roots.len());
     for (key, &idx) in roots.iter().enumerate() {
@@ -66,9 +65,7 @@ fn high_load_survives_gc_and_slot_reuse() {
                     let mem = store.create_ref(shard);
                     (0..1_500)
                         .map(|key| {
-                            mem.find_or_create_leaf_from_u64(
-                                10_000 + 1_500 * shard as u64 + key,
-                            )
+                            mem.find_or_create_leaf_from_u64(10_000 + 1_500 * shard as u64 + key)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -81,7 +78,6 @@ fn high_load_survives_gc_and_slot_reuse() {
     });
     assert_eq!(store.len(), 6_064);
     assert_eq!(replacements.iter().collect::<HashSet<_>>().len(), 6_000);
-    assert!(replacements.iter().any(|idx| dead.contains(idx)));
     for (offset, &idx) in replacements.iter().enumerate() {
         assert_eq!(
             store.find_or_create_leaf_from_u64(10_000 + offset as u64),
@@ -90,5 +86,52 @@ fn high_load_survives_gc_and_slot_reuse() {
     }
     store.clear();
     store.find_or_create_leaf_from_u64(42);
+    assert_eq!(store.len(), 1);
+}
+
+#[test]
+fn workers_reuse_slots_after_parallel_gc() {
+    let mut store = NodeStore::<u64>::new(19, 1_000_000, 4);
+    let roots: Vec<_> = (0..64)
+        .map(|cells| store.find_or_create_leaf_from_u64(cells))
+        .collect();
+    for cells in 64..800_000 {
+        store.find_or_create_leaf_from_u64(cells);
+    }
+    for (round, workers) in [1, 4, 1].into_iter().enumerate() {
+        store.gc(&roots, crate::quadtree::LEAF_SIZE_LOG2);
+        assert_eq!(store.len(), roots.len());
+        let slots = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|shard| {
+                    let store = &store;
+                    scope.spawn(move || {
+                        let mem = store.create_ref(shard);
+                        let start = 1_000_000 * (round as u64 + 1)
+                            + shard as u64 * (800_000 / workers as u64);
+                        (start..start + 800_000 / workers as u64)
+                            .map(|cells| {
+                                assert!(!store.exceeds_load_factor());
+                                mem.find_or_create_leaf_from_u64(cells)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(slots.iter().collect::<HashSet<_>>().len(), 800_000);
+        assert_eq!(store.len(), 800_064);
+        for (cells, &idx) in roots.iter().enumerate() {
+            assert_eq!(store.find_or_create_leaf_from_u64(cells as u64), idx);
+        }
+    }
+    store.gc(&roots, crate::quadtree::LEAF_SIZE_LOG2);
+    store.clear();
+    let leaf = store.find_or_create_leaf_from_u64(42);
+    assert_eq!(store.find_or_create_leaf_from_u64(42), leaf);
     assert_eq!(store.len(), 1);
 }

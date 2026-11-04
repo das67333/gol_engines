@@ -40,7 +40,10 @@ use super::super::sharded_statistics::{LengthShard, ShardedLength};
 use crossbeam::utils::CachePadded;
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicPtr, AtomicU32, Ordering},
+    },
 };
 
 /// Index into a [`ConcurrentHashTable`]. Encoded as `(chunk_id, offset)`;
@@ -55,6 +58,8 @@ pub const NULL_IDX: Idx = 0;
 const CHUNK_LOG2: u32 = 16;
 const CHUNK_SIZE: u32 = 1 << CHUNK_LOG2;
 const OFFSET_MASK: u32 = CHUNK_SIZE - 1;
+// A borrowed free batch occupies less than the existing one-chunk-per-worker reserve.
+pub(crate) const RECYCLE_BATCH_SIZE: usize = CHUNK_SIZE as usize / 64;
 
 /// Bound on the number of `find_or_create_*` allocations a worker may issue
 /// inside a single `process_task` invocation. The cancellation flag is read
@@ -234,6 +239,8 @@ pub(crate) struct ConcurrentHashTable<E> {
     pub(crate) thread_states: Box<[CachePadded<UnsafeCell<ThreadState>>]>,
     /// Length tracking (existing sharded mechanism).
     pub(crate) length: ShardedLength,
+    /// GC splits recycled slots into batches that any allocating worker can claim.
+    pub(crate) recycled_batches: Mutex<Vec<Idx>>,
     /// Cancellation threshold: when `len_upper_bound > length_limit`, callers
     /// stop fetching new tasks. Set below `capacity` by [`MAX_ALLOCS_PER_TASK`]
     /// × `threads_cnt` so that the post-cancel allocation burst can complete
@@ -326,6 +333,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
             next_chunk_id: AtomicU32::new(1),
             thread_states,
             length: ShardedLength::new(threads_cnt),
+            recycled_batches: Mutex::new(Vec::new()),
             length_limit,
             capacity,
         }
@@ -431,8 +439,8 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     }
 
     /// Allocate a fresh `Idx` from the given thread's pool. Prefers the
-    /// free list; falls back to bumping within the current chunk;
-    /// claims a new chunk if the current one is full.
+    /// free list, then the current bump chunk, then a shared recycled batch.
+    /// Claims a new chunk only when those sources are exhausted.
     pub(super) fn allocate(&self, shard_idx: usize) -> Idx {
         let ts = self.thread_state_mut(shard_idx);
 
@@ -451,6 +459,13 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
             let off = ts.next_offset_in_chunk;
             ts.next_offset_in_chunk = off + 1;
             return encode_idx(ts.current_chunk_id, off);
+        }
+
+        // Borrow recycled slots only after the bump chunk is full. Thus a worker
+        // holds either a partial bump chunk or a recycled batch, not both.
+        if let Some(head) = self.recycled_batches.lock().unwrap().pop() {
+            ts.free_list_head = self.get(head).next().load(Ordering::Relaxed);
+            return head;
         }
 
         // Claim a new chunk.
@@ -490,6 +505,11 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         ts.free_list_head = idx;
     }
 
+    /// Called by the shard's GC worker after all mutator threads have joined.
+    pub(crate) fn take_local_free_list(&self, shard_idx: usize) -> Idx {
+        std::mem::take(&mut self.thread_state_mut(shard_idx).free_list_head)
+    }
+
     /// SAFETY: caller must access only their own shard. We rely on
     /// the executor's per-thread sharding discipline.
     #[allow(clippy::mut_from_ref)]
@@ -520,6 +540,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
             ts.get_mut().reset();
         }
         self.length.set(0);
+        self.recycled_batches.get_mut().unwrap().clear();
     }
 
     pub(super) fn bytes_total(&self) -> usize {
@@ -531,7 +552,9 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         let buckets = self.buckets.len() * std::mem::size_of::<AtomicU32>();
         let thread_states =
             self.thread_states.len() * std::mem::size_of::<CachePadded<UnsafeCell<ThreadState>>>();
-        chunk_storage + chunks_table + buckets + thread_states
+        let recycled =
+            self.recycled_batches.lock().unwrap().capacity() * std::mem::size_of::<Idx>();
+        chunk_storage + chunks_table + buckets + thread_states + recycled
     }
 
     pub(super) fn len(&self) -> usize {
