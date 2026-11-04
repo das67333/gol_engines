@@ -25,6 +25,16 @@ pub struct HashLifeEngine<Meta> {
 }
 
 impl<Meta: Default + Sync> HashLifeEngine<Meta> {
+    // The executor keeps the central half. An extra frame lets unbounded growth
+    // cross the old boundary without being cropped from that result.
+    pub(super) fn frames_for_update(&self, generations_log2: u32) -> u32 {
+        let padding = match self.topology {
+            Topology::Torus => 1,
+            Topology::Unbounded => 2,
+        };
+        (generations_log2 + 1 + padding).max(self.size_log2 + padding) - self.size_log2
+    }
+
     /// Add a frame around the field: if `self.topology` is Unbounded, frame is blank,
     /// and if `self.topology` is Torus, frame mirrors the field.
     /// The field becomes two times bigger.
@@ -196,7 +206,7 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
         let backup = self.current_state();
         self.generations_per_update_log2 = Some(generations_log2);
 
-        let frames_cnt = (generations_log2 + 2).max(self.size_log2 + 1) - self.size_log2;
+        let frames_cnt = self.frames_for_update(generations_log2);
         let (mut dx, mut dy) = (BigInt::ZERO, BigInt::ZERO);
         for _ in 0..frames_cnt {
             self.add_frame(&mut dx, &mut dy);
