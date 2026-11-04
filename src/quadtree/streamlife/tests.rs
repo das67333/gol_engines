@@ -62,7 +62,9 @@ fn final_merge_overflow_preserves_state_and_allows_smaller_retry() {
     // so the exhausted store is first encountered by the final root merge.
     engine.base.generations_per_update_log2 = Some(3);
     let (mut dx, mut dy) = (BigInt::ZERO, BigInt::ZERO);
-    engine.add_frame(&mut dx, &mut dy).unwrap();
+    for _ in 0..engine.base.frames_for_update(3) {
+        engine.add_frame(&mut dx, &mut dy).unwrap();
+    }
     let framed_size = engine.base.size_log2;
     let blank = engine.base.blank_nodes.get_mut(framed_size, &engine.base.mem);
     let biroot = StreamLifeExecutor::new(&engine, (engine.base.root, blank), framed_size).run(1).unwrap();
