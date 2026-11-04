@@ -1,13 +1,12 @@
 //! Parallel GC mark phase using work-stealing.
 //!
-//! Each thread DFS-walks the quadtree from the given roots. `fetch_or(GC_MARK)`
-//! serves as both the atomic mark and the already-visited check. Must run
+//! Each thread walks a private DFS stack and shares surplus subtrees with thieves.
+//! `fetch_or(GC_MARK)` claims nodes not already marked. Must run
 //! before [`GcSweepExecutor`] and after all executor threads have joined.
 
 use super::super::{
     LEAF_SIZE_LOG2,
     hashtable::{Idx, NodeStore},
-    node::QuadTreeNode,
     status,
 };
 use crossbeam::deque::{Steal, Stealer, Worker};
@@ -48,6 +47,7 @@ impl<'a, Meta: Default + Sync> GcMarkExecutor<'a, Meta> {
                     queue,
                     stealers: &stealers,
                     pending: &pending,
+                    local: Vec::new(),
                 };
                 scope.spawn(move || worker.run());
             }
@@ -79,10 +79,11 @@ struct MarkWorker<'a, 'b, Meta: Default + Sync> {
     queue: Worker<(Idx, u32)>,
     stealers: &'b [Stealer<(Idx, u32)>],
     pending: &'b AtomicUsize,
+    local: Vec<(Idx, u32)>,
 }
 
 impl<Meta: Default + Sync> MarkWorker<'_, '_, Meta> {
-    fn run(self) {
+    fn run(mut self) {
         loop {
             match self.next_item() {
                 Some((idx, sl2)) => self.visit(idx, sl2),
@@ -101,21 +102,35 @@ impl<Meta: Default + Sync> MarkWorker<'_, '_, Meta> {
         })
     }
 
-    fn visit(&self, idx: Idx, sl2: u32) {
-        let n = self.mem.get(idx);
-        let prev = n.status.fetch_or(status::GC_MARK, Ordering::Relaxed);
-        if prev & status::GC_MARK == 0 && sl2 > LEAF_SIZE_LOG2 {
-            self.enqueue_children(n, sl2);
+    fn visit(&mut self, idx: Idx, sl2: u32) {
+        // One pending token covers this complete private traversal, including
+        // descendants that have not been discovered yet.
+        self.local.push((idx, sl2));
+        while let Some((idx, sl2)) = self.local.pop() {
+            let node = self.mem.get(idx);
+            // Only this phase sets the bit; sweep starts after every marker joins.
+            if node.status.load(Ordering::Relaxed) & status::GC_MARK != 0 {
+                continue;
+            }
+            let prev = node.status.fetch_or(status::GC_MARK, Ordering::Relaxed);
+            if prev & status::GC_MARK == 0 && sl2 > LEAF_SIZE_LOG2 {
+                self.local
+                    .extend(node.parts().map(|child| (child, sl2 - 1)));
+                self.share_frontier();
+            }
         }
         self.pending.fetch_sub(1, Ordering::Relaxed);
     }
 
-    fn enqueue_children(&self, n: &QuadTreeNode<Meta>, sl2: u32) {
-        // Sweep invalidates every memoized result, so its output is not a GC root.
-        let child_sl2 = sl2 - 1;
-        for child in n.parts() {
-            self.pending.fetch_add(1, Ordering::Relaxed);
-            self.queue.push((child, child_sl2));
+    fn share_frontier(&mut self) {
+        if self.local.len() >= 16 && self.queue.is_empty() {
+            let count = self.local.len() / 2;
+            // Transfer coverage from the current traversal to new queue tokens
+            // before thieves can observe any of the published roots.
+            self.pending.fetch_add(count, Ordering::Relaxed);
+            for item in self.local.drain(..count) {
+                self.queue.push(item);
+            }
         }
     }
 }
