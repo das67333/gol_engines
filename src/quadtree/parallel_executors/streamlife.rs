@@ -7,15 +7,15 @@
 //!
 //! ## Two queues per worker
 //!
-//! Each worker holds two crossbeam deques:
-//! - `bi_queue: Worker<BiTask>` — binode tasks (the existing work item).
-//! - `hash_queue: Worker<Task>` — `HashLife` tasks descended from binode
+//! Each worker holds two task deques:
+//! - `bi_queue: TaskQueue<BiTask>` — binode tasks (the existing work item).
+//! - `hash_queue: TaskQueue<Task>` — `HashLife` tasks descended from binode
 //!   Phases Solitonic / Base.
 //!
 //! Pop policy: local LIFO hash first to finish dependencies, then local bi.
 //! Stealing prefers bi, then hash, with a complete scan before idle workers park.
 //! `HashLife`'s pure-engine path is unchanged: it still uses a single
-//! `Worker<Task>`.
+//! crossbeam `Worker<Task>`.
 //!
 //! ## Cross-engine dependents
 //!
@@ -47,16 +47,16 @@ use super::{
     },
     parking::{Parking, Search},
     processing::{ActiveWork, ProcessingData},
+    task_queue::{TaskQueue, TaskStealer},
 };
-use crossbeam::{
-    deque::{Steal, Stealer, Worker},
-    sync::Parker,
-};
+use crossbeam::{deque::Steal, sync::Parker};
 use smallvec::{SmallVec, smallvec};
 use std::{
     sync::atomic::{AtomicU8, Ordering},
     thread,
 };
+
+const INITIAL_TASK_QUEUE_CAPACITY: usize = 32;
 
 /// A unit of work representing a binode pair to be processed.
 #[derive(Clone, Copy)]
@@ -65,6 +65,18 @@ pub struct BiTask {
     pub entry_idx: Idx,
     /// Size (log2) of the nodes in this pair.
     pub size_log2: u32,
+}
+
+impl super::task_queue::TaskWord for BiTask {
+    fn into_word(self) -> u64 {
+        u64::from(self.entry_idx) | (u64::from(self.size_log2) << 32)
+    }
+    fn from_word(word: u64) -> Self {
+        Self {
+            entry_idx: word as u32,
+            size_log2: (word >> 32) as u32,
+        }
+    }
 }
 
 /// Tagged dependent for a `HashLife` `QuadTreeNode` processed during a
@@ -179,8 +191,8 @@ impl<'a> StreamLifeExecutor<'a> {
         let mut hash_stealers = Vec::with_capacity(num_threads);
 
         for _ in 0..num_threads {
-            let bi_queue = Worker::new_lifo();
-            let hash_queue = Worker::new_lifo();
+            let bi_queue = TaskQueue::new(INITIAL_TASK_QUEUE_CAPACITY);
+            let hash_queue = TaskQueue::new(INITIAL_TASK_QUEUE_CAPACITY);
             bi_stealers.push(bi_queue.stealer());
             hash_stealers.push(hash_queue.stealer());
             bi_queues.push(bi_queue);
@@ -291,10 +303,10 @@ struct BiExecutorThread<'a> {
     node_ref: NodeStoreRef<'a, u64>,
     root_status: &'a AtomicU8,
     thread_idx: usize,
-    bi_queue: Worker<BiTask>,
-    hash_queue: Worker<Task>,
-    bi_stealers: &'a [Stealer<BiTask>],
-    hash_stealers: &'a [Stealer<Task>],
+    bi_queue: TaskQueue<BiTask>,
+    hash_queue: TaskQueue<Task>,
+    bi_stealers: &'a [TaskStealer<BiTask>],
+    hash_stealers: &'a [TaskStealer<Task>],
 }
 
 fn victim_probe_order(worker_count: usize, thread_idx: usize) -> Vec<usize> {
@@ -445,7 +457,7 @@ impl BiExecutorThread<'_> {
 
     fn try_steal_bi(&self, victim: usize) -> Option<BiTask> {
         loop {
-            let result = self.bi_stealers[victim].steal_batch_with_limit_and_pop(&self.bi_queue, 1);
+            let result = self.bi_queue.steal_from(&self.bi_stealers[victim]);
             record_steal(&result);
             match result {
                 Steal::Success(task) => return Some(task),
@@ -457,8 +469,7 @@ impl BiExecutorThread<'_> {
 
     fn try_steal_hash(&self, victim: usize) -> Option<Task> {
         loop {
-            let result =
-                self.hash_stealers[victim].steal_batch_with_limit_and_pop(&self.hash_queue, 1);
+            let result = self.hash_queue.steal_from(&self.hash_stealers[victim]);
             record_steal(&result);
             match result {
                 Steal::Success(task) => return Some(task),
@@ -505,7 +516,7 @@ impl BiExecutorThread<'_> {
         let parts = n.parts();
         let result = update_node_async(
             &self.node_ref,
-            &self.hash_queue,
+            |task| self.hash_queue.push(task),
             self.engine.base.generations_per_update_log2.unwrap(),
             &task,
             parts,
