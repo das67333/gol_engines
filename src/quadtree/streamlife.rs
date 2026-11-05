@@ -9,9 +9,6 @@ use crate::{GoLEngine, Pattern, Topology};
 use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
 
-// Bound recovery if retaining the active frontier repeatedly evicts useful memoized work.
-const MAX_RESUMED_COLLECTIONS: usize = 32;
-
 /// Implementation of [StreamLife algorithm](https://conwaylife.com/wiki/StreamLife).
 ///
 /// Built on top of [`HashLifeEngine`]. Uses a static hashtable for caching
@@ -26,12 +23,11 @@ pub struct StreamLifeEngine {
 impl StreamLifeEngine {
     fn run_executor(&mut self, biroot: (Idx, Idx), rollback_roots: &[(Idx, u32)]) -> Option<(Idx, Idx)> {
         let mut paused = None;
-        for collection in 0..=MAX_RESUMED_COLLECTIONS {
+        loop {
             let executor = StreamLifeExecutor::new(self, biroot, self.base.size_log2);
             if let Some(result) = executor.run(paused.take()) {
                 return Some(result);
             }
-            if collection == MAX_RESUMED_COLLECTIONS { break; }
             let mut work = executor.paused_work();
             work.roots.extend_from_slice(rollback_roots);
             let before = (self.base.mem.len(), self.bicache.len());
@@ -39,11 +35,10 @@ impl StreamLifeEngine {
             self.base.blank_nodes.get_mut(self.base.size_log2, &self.base.mem);
             println!("StreamLife resume GC: {:?} -> {:?}", before, (self.base.mem.len(), self.bicache.len()));
             if self.base.mem.exceeds_load_factor() || self.bicache.exceeds_load_factor() || !work.can_resume() {
-                break;
+                return None;
             }
             paused = Some(work);
         }
-        None
     }
 
     /// Workers have joined and every pending input, scratch node, and result is rooted.
