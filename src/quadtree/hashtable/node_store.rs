@@ -1,7 +1,7 @@
 use super::{
     super::{
         node::QuadTreeNode,
-        parallel_executors::{GcMarkExecutor, GcSweepExecutor},
+        parallel_executors::{GcMarkExecutor, GcMarkOptions, GcSweepExecutor},
         sharded_statistics::LengthShard,
         status,
     },
@@ -204,28 +204,37 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
     }
 
     /// Parallel mark-and-sweep GC. Marks all nodes reachable from `roots`
-    /// using a status bit (`GC_MARK`), then sweeps the bucket chains in
-    /// parallel — recycling dead entries in shared batches and
-    /// resetting computation state on survivors.
-    pub fn gc(&mut self, roots: &[Idx], size_log2: u32) {
-        let threads_cnt = self.inner.thread_states.len();
-        GcMarkExecutor::new(self, roots, size_log2, threads_cnt).run();
+    /// using a status bit (`GC_MARK`), then recycles dead entries in parallel.
+    /// Cached computation results are invalidated.
+    pub fn gc(&mut self, roots: &[(Idx, u32)]) {
+        self.mark(roots, false);
+        self.sweep(false);
+    }
 
-        // Sweep: remove unmarked entries, reset survivors (clears GC_MARK
-        // along with all other status bits). We intentionally leave
+    /// If requested, follow completed results; the caller must keep their
+    /// update-size context valid. Preserving work also requires marking every
+    /// pending input, intermediate node, and unconsumed result.
+    pub fn mark(&self, roots: &[(Idx, u32)], retain_results: bool) {
+        let threads_cnt = self.inner.thread_states.len();
+        GcMarkExecutor::new(self, roots, GcMarkOptions { threads_cnt, retain_results }).run();
+    }
+
+    pub fn sweep(&mut self, retain_results: bool) {
+        // Sweep removes unmarked entries and clears transient status bits.
+        // We intentionally leave
         // `status_extra` and `extra` (StreamLife lane data) untouched —
         // they depend only on cell structure, which is immutable for a given Idx.
-        GcSweepExecutor::new(&mut self.inner).run(is_dead_after_mark);
+        GcSweepExecutor::new(&mut self.inner).run(|entry| {
+            let old = entry.status.load(Ordering::Relaxed);
+            if old & status::GC_MARK == 0 {
+                assert_eq!(old & status::PENDING, 0, "pending node was not rooted");
+                return true;
+            }
+            let retained = if retain_results { old & (status::FINISHED | status::PENDING) } else { status::NOT_STARTED };
+            entry.status.store(retained, Ordering::Relaxed);
+            false
+        });
     }
-}
-
-/// Returns `true` if the node was not marked reachable and should be removed.
-fn is_dead_after_mark<Meta: Default + Sync>(entry: &QuadTreeNode<Meta>) -> bool {
-    if entry.status.load(Ordering::Relaxed) & status::GC_MARK == 0 {
-        return true;
-    }
-    entry.status.store(status::NOT_STARTED, Ordering::Relaxed);
-    false
 }
 
 impl<Meta: Default + Sync> NodeStoreRef<'_, Meta> {

@@ -13,7 +13,7 @@ fn gc_drops_invalidated_results_but_keeps_structural_children() {
         .status
         .store(status::FINISHED, Ordering::Relaxed);
 
-    store.gc(&[root], crate::quadtree::LEAF_SIZE_LOG2 + 1);
+    store.gc(&[(root, crate::quadtree::LEAF_SIZE_LOG2 + 1)]);
 
     assert_eq!(store.len(), 5);
     assert_eq!(
@@ -52,7 +52,7 @@ fn concurrent_interning_survives_gc() {
     assert!(!store.exceeds_load_factor());
 
     let roots = &copies[0][..64];
-    store.gc(roots, crate::quadtree::LEAF_SIZE_LOG2);
+    store.gc(&roots.iter().map(|&idx| (idx, crate::quadtree::LEAF_SIZE_LOG2)).collect::<Vec<_>>());
     assert_eq!(store.len(), roots.len());
     for (key, &idx) in roots.iter().enumerate() {
         assert_eq!(store.find_or_create_leaf_from_u64(key as u64), idx);
@@ -99,7 +99,7 @@ fn workers_reuse_slots_after_parallel_gc() {
         store.find_or_create_leaf_from_u64(cells);
     }
     for (round, workers) in [1, 4, 1].into_iter().enumerate() {
-        store.gc(&roots, crate::quadtree::LEAF_SIZE_LOG2);
+        store.gc(&roots.iter().map(|&idx| (idx, crate::quadtree::LEAF_SIZE_LOG2)).collect::<Vec<_>>());
         assert_eq!(store.len(), roots.len());
         let slots = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..workers)
@@ -129,7 +129,7 @@ fn workers_reuse_slots_after_parallel_gc() {
             assert_eq!(store.find_or_create_leaf_from_u64(cells as u64), idx);
         }
     }
-    store.gc(&roots, crate::quadtree::LEAF_SIZE_LOG2);
+    store.gc(&roots.iter().map(|&idx| (idx, crate::quadtree::LEAF_SIZE_LOG2)).collect::<Vec<_>>());
     store.clear();
     let leaf = store.find_or_create_leaf_from_u64(42);
     assert_eq!(store.find_or_create_leaf_from_u64(42), leaf);

@@ -362,6 +362,21 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         unsafe { (*slot_ptr).get() }
     }
 
+    pub(super) fn find(&self, hash: usize, key_matches: impl Fn(&E) -> bool) -> Option<Idx> {
+        let head = self.buckets[hash & (self.buckets.len() - 1)].load(Ordering::Acquire);
+        self.find_in_chain(head, &key_matches)
+    }
+
+    #[inline]
+    fn find_in_chain(&self, mut cur: Idx, key_matches: &impl Fn(&E) -> bool) -> Option<Idx> {
+        while cur != NULL_IDX {
+            let entry = self.get(cur);
+            if key_matches(entry) { return Some(cur); }
+            cur = entry.next().load(Ordering::Acquire);
+        }
+        None
+    }
+
     /// Find an entry matching `key_matches`; if not found, allocate a new
     /// slot, run `init` to populate the key fields, and publish into the
     /// chain via Release-CAS on the bucket head.
@@ -382,13 +397,8 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
 
         // Phase 1: walk chain looking for an existing match.
         let mut head = self.buckets[bucket].load(Ordering::Acquire);
-        let mut cur = head;
-        while cur != NULL_IDX {
-            let entry = self.get(cur);
-            if key_matches(entry) {
-                return (cur, false);
-            }
-            cur = entry.next().load(Ordering::Acquire);
+        if let Some(idx) = self.find_in_chain(head, &key_matches) {
+            return (idx, false);
         }
 
         // Phase 2: allocate from this thread's pool; populate fields.

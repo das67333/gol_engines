@@ -1,7 +1,8 @@
 use super::base::{CacheField, ConcurrentHashTable, HashtableSlot, Idx, NULL_IDX};
-use super::node_store::ShardedRef;
+use super::node_store::{ShardedRef, NodeStore};
+use super::super::{parallel_executors::GcSweepExecutor, status};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU8, AtomicU32};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 pub struct CacheEntry {
     key: (Idx, Idx),
@@ -61,16 +62,21 @@ impl BinodeCache {
         }
     }
 
+    fn hash(&self, key: (Idx, Idx)) -> usize {
+        let mut hasher = self.hasher.clone();
+        key.hash(&mut hasher);
+        hasher.finish() as usize
+    }
+
+    pub fn find(&self, key: (Idx, Idx)) -> Option<Idx> {
+        self.inner.find(self.hash(key), |slot| slot.key == key)
+    }
+
     /// Find or create a cache entry for the given binode key.
     /// Returns `(index, was_inserted)`.
     fn entry_inner(&self, shard_idx: usize, key: (Idx, Idx)) -> (Idx, bool) {
-        let hash = {
-            let mut hasher = self.hasher.clone();
-            key.hash(&mut hasher);
-            hasher.finish() as usize
-        };
         self.inner.find_or_create(
-            hash,
+            self.hash(key),
             shard_idx,
             |slot| slot.key == key,
             |slot| unsafe {
@@ -98,6 +104,25 @@ impl BinodeCache {
             shard_idx,
             length_shard: self.inner.shard(shard_idx),
         }
+    }
+
+    /// Keep rooted pending work and finished pairs whose keys and results survive node GC.
+    /// Workers have joined; run after marking and before recycling node indices.
+    pub fn retain_marked<Meta: Default + Sync>(&mut self, nodes: &NodeStore<Meta>) {
+        GcSweepExecutor::new(&mut self.inner).run(|entry| {
+            let state = entry.status().load(Ordering::Relaxed);
+            if state & status::PENDING != 0 {
+                assert_ne!(state & status::GC_MARK, 0, "pending pair was not rooted");
+                entry.status().store(status::PENDING, Ordering::Relaxed);
+                return false;
+            }
+            if state != status::FINISHED {
+                return true;
+            }
+            let (a, b) = entry.key();
+            let (x, y) = entry.payload().get_value();
+            ![a, b, x, y].into_iter().all(|idx| nodes.get(idx).status.load(Ordering::Relaxed) & status::GC_MARK != 0)
+        });
     }
 
     pub fn clear(&mut self) {

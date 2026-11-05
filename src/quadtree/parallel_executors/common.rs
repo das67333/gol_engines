@@ -88,6 +88,21 @@ pub(super) struct HashWork {
     mask4_waiting: u32,
 }
 
+impl HashWork {
+    pub(super) fn retained_roots(&self, size_log2: u32, roots: &mut Vec<(Idx, u32)>) {
+        let (count, waiting) = if self.mask4_waiting != 0 {
+            (4, self.mask4_waiting)
+        } else if self.mask9_waiting != 0 {
+            (9, self.mask9_waiting)
+        } else {
+            return;
+        };
+        for (i, &idx) in self.arr[..count].iter().enumerate() {
+            if idx != 0 { roots.push((idx, size_log2 - if waiting & (1 << i) != 0 { 1 } else { 2 })); }
+        }
+    }
+}
+
 /// Pure HashLife uses Idx dependents; StreamLife uses its tagged Dependent.
 /// The type-erased node cache must use one instantiation throughout a run.
 pub(super) type HashProcessingData<Dep> = ProcessingData<HashWork, Dep>;

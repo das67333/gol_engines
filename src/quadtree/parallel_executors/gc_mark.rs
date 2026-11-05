@@ -14,23 +14,27 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct GcMarkExecutor<'a, Meta: Default + Sync> {
     mem: &'a NodeStore<Meta>,
-    roots: &'a [Idx],
-    size_log2: u32,
+    roots: &'a [(Idx, u32)],
     threads_cnt: usize,
+    retain_results: bool,
+}
+
+pub struct GcMarkOptions {
+    pub threads_cnt: usize,
+    pub retain_results: bool,
 }
 
 impl<'a, Meta: Default + Sync> GcMarkExecutor<'a, Meta> {
     pub fn new(
         mem: &'a NodeStore<Meta>,
-        roots: &'a [Idx],
-        size_log2: u32,
-        threads_cnt: usize,
+        roots: &'a [(Idx, u32)],
+        options: GcMarkOptions,
     ) -> Self {
         Self {
             mem,
             roots,
-            size_log2,
-            threads_cnt,
+            threads_cnt: options.threads_cnt,
+            retain_results: options.retain_results,
         }
     }
 
@@ -38,7 +42,7 @@ impl<'a, Meta: Default + Sync> GcMarkExecutor<'a, Meta> {
         let timer = std::time::Instant::now();
         let (queues, stealers) = new_work_queues(self.threads_cnt);
         let pending = AtomicUsize::new(self.roots.len());
-        seed_roots(&queues[0], self.roots, self.size_log2);
+        seed_roots(&queues[0], self.roots);
 
         std::thread::scope(|scope| {
             for queue in queues {
@@ -48,6 +52,7 @@ impl<'a, Meta: Default + Sync> GcMarkExecutor<'a, Meta> {
                     stealers: &stealers,
                     pending: &pending,
                     local: Vec::new(),
+                    retain_results: self.retain_results,
                 };
                 scope.spawn(move || worker.run());
             }
@@ -68,9 +73,9 @@ fn new_work_queues(threads_cnt: usize) -> (Vec<Worker<(Idx, u32)>>, Vec<Stealer<
     (queues, stealers)
 }
 
-fn seed_roots(queue: &Worker<(Idx, u32)>, roots: &[Idx], size_log2: u32) {
+fn seed_roots(queue: &Worker<(Idx, u32)>, roots: &[(Idx, u32)]) {
     for &root in roots {
-        queue.push((root, size_log2));
+        queue.push(root);
     }
 }
 
@@ -80,6 +85,7 @@ struct MarkWorker<'a, 'b, Meta: Default + Sync> {
     stealers: &'b [Stealer<(Idx, u32)>],
     pending: &'b AtomicUsize,
     local: Vec<(Idx, u32)>,
+    retain_results: bool,
 }
 
 impl<Meta: Default + Sync> MarkWorker<'_, '_, Meta> {
@@ -116,6 +122,9 @@ impl<Meta: Default + Sync> MarkWorker<'_, '_, Meta> {
             if prev & status::GC_MARK == 0 && sl2 > LEAF_SIZE_LOG2 {
                 self.local
                     .extend(node.parts().map(|child| (child, sl2 - 1)));
+                if self.retain_results && prev & status::FINISHED != 0 {
+                    self.local.push((node.cache.get_value(), sl2 - 1));
+                }
                 self.share_frontier();
             }
         }

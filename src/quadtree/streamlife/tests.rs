@@ -67,7 +67,7 @@ fn final_merge_overflow_preserves_state_and_allows_smaller_retry() {
     }
     let framed_size = engine.base.size_log2;
     let blank = engine.base.blank_nodes.get_mut(framed_size, &engine.base.mem);
-    let biroot = StreamLifeExecutor::new(&engine, (engine.base.root, blank), framed_size).run(1).unwrap();
+    let biroot = StreamLifeExecutor::new(&engine, (engine.base.root, blank), framed_size).run(None).unwrap();
     let output_blank = engine.base.blank_nodes.get(framed_size - 1);
     assert!(biroot.0 != output_blank && biroot.1 != output_blank);
     engine.base.root = root;
