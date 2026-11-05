@@ -55,7 +55,7 @@ use super::{
 use crossbeam::{deque::Steal, sync::Parker};
 use smallvec::{SmallVec, smallvec};
 use std::{
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, AtomicU16, Ordering},
     thread,
 };
 
@@ -285,6 +285,11 @@ impl<'a> StreamLifeExecutor<'a> {
             }
         });
     }
+}
+
+enum ChildResult {
+    Ready((Idx, Idx)),
+    Pending,
 }
 
 enum ReadyTask {
@@ -641,7 +646,6 @@ impl BiExecutorThread<'_> {
         active: ActiveWork<'_, BiWork>,
     ) -> Option<(Idx, Idx)> {
         let ActiveWork { work: data, waiting_cnt } = active;
-        let engine = self.engine;
         let targets = [idx.0, idx.1];
         let dep = Dependent::Binode {
             entry_idx: parent_entry_idx,
@@ -681,9 +685,11 @@ impl BiExecutorThread<'_> {
             }
         }
 
-        // Both hash results in. Finalize per `compute_solitonic` semantics.
-        let i1 = data.hash_results[0];
-        let i2 = data.hash_results[1];
+        self.finish_solitonic(idx, data.hash_results, size_log2)
+    }
+
+    fn finish_solitonic(&self, idx: (Idx, Idx), [i1, i2]: [Idx; 2], size_log2: u32) -> Option<(Idx, Idx)> {
+        let engine = self.engine;
         let b = engine.base.blank_nodes.get(size_log2);
         let result = if idx.0 == b || idx.1 == b {
             let (i3, ind3) = if idx.0 == b { (i2, idx.1) } else { (i1, idx.0) };
@@ -765,6 +771,52 @@ impl BiExecutorThread<'_> {
         Some(result)
     }
 
+    // Independent universes already share HashLife's memoized results. Avoid a
+    // second cache entry and intermediary task just to wait for those results.
+    fn request_child(&self, key: (Idx, Idx), parent: BiTask, waiting_cnt: &AtomicU16) -> Option<ChildResult> {
+        let size_log2 = parent.size_log2 - 1;
+        if algorithm::is_solitonic(&self.node_ref, &self.engine.base.blank_nodes, key, size_log2)? {
+            let dep = Dependent::Binode { entry_idx: parent.entry_idx, size_log2: parent.size_log2 };
+            let mut results = [0; 2];
+            let mut ready = true;
+            for (i, idx) in [key.0, key.1].into_iter().enumerate() {
+                let node = self.node_ref.get(idx);
+                match handle_dependency(node, dep) {
+                    DependencyHandlingResult::Ready => results[i] = node.cache.get_value(),
+                    DependencyHandlingResult::StartedByThisThread => {
+                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        self.hash_queue.push(Task::new(idx, size_log2));
+                        ready = false;
+                    }
+                    DependencyHandlingResult::StartedByOtherThread => {
+                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        ready = false;
+                    }
+                }
+            }
+            return if ready {
+                Some(ChildResult::Ready(self.finish_solitonic(key, results, size_log2)?))
+            } else {
+                Some(ChildResult::Pending)
+            };
+        }
+        let child_idx = self.bicache_ref.entry(key);
+        match handle_bi_dependency(&self.engine.bicache, child_idx, parent.entry_idx, parent.size_log2) {
+            BiDependencyResult::Ready => {
+                Some(ChildResult::Ready(self.bicache_ref.get(child_idx).payload().get_value()))
+            }
+            BiDependencyResult::StartedByThisThread => {
+                waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                self.bi_queue.push(BiTask { entry_idx: child_idx, size_log2 });
+                Some(ChildResult::Pending)
+            }
+            BiDependencyResult::StartedByOtherThread => {
+                waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                Some(ChildResult::Pending)
+            }
+        }
+    }
+
     /// Phase Recursive: existing 9-then-4 binode children logic.
     fn recursive_phase(
         &self,
@@ -773,7 +825,6 @@ impl BiExecutorThread<'_> {
         active: ActiveWork<'_, BiWork>,
     ) -> Option<(Idx, Idx)> {
         let ActiveWork { work: data, waiting_cnt } = active;
-        let engine = self.engine;
 
         // Stage 1: Wait for 9 overlapping children (if both_stages).
         if data.mask4_waiting == 0 && data.mask9_waiting != 0 {
@@ -783,25 +834,14 @@ impl BiExecutorThread<'_> {
                     continue;
                 }
                 let child_key = (data.arr0[i], data.arr1[i]);
-                let child_idx = self.bicache_ref.entry(child_key);
-                match handle_bi_dependency(&engine.bicache, child_idx, parent_entry_idx, size_log2)
-                {
-                    BiDependencyResult::Ready => {
+                let parent = BiTask { entry_idx: parent_entry_idx, size_log2 };
+                match self.request_child(child_key, parent, waiting_cnt)? {
+                    ChildResult::Ready((a, b)) => {
                         data.mask9_waiting &= !(1 << i);
-                        let val = self.bicache_ref.get(child_idx).payload().get_value();
-                        data.arr0[i] = val.0;
-                        data.arr1[i] = val.1;
+                        data.arr0[i] = a;
+                        data.arr1[i] = b;
                     }
-                    BiDependencyResult::StartedByThisThread => {
-                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                        self.bi_queue.push(BiTask {
-                            entry_idx: child_idx,
-                            size_log2: size_log2 - 1,
-                        });
-                    }
-                    BiDependencyResult::StartedByOtherThread => {
-                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                    }
+                    ChildResult::Pending => {}
                 }
             }
             let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
@@ -833,24 +873,14 @@ impl BiExecutorThread<'_> {
                 continue;
             }
             let child_key = (data.arr0[i], data.arr1[i]);
-            let child_idx = self.bicache_ref.entry(child_key);
-            match handle_bi_dependency(&engine.bicache, child_idx, parent_entry_idx, size_log2) {
-                BiDependencyResult::Ready => {
+            let parent = BiTask { entry_idx: parent_entry_idx, size_log2 };
+            match self.request_child(child_key, parent, waiting_cnt)? {
+                ChildResult::Ready((a, b)) => {
                     data.mask4_waiting &= !(1 << i);
-                    let val = self.bicache_ref.get(child_idx).payload().get_value();
-                    data.arr0[i] = val.0;
-                    data.arr1[i] = val.1;
+                    data.arr0[i] = a;
+                    data.arr1[i] = b;
                 }
-                BiDependencyResult::StartedByThisThread => {
-                    waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                    self.bi_queue.push(BiTask {
-                        entry_idx: child_idx,
-                        size_log2: size_log2 - 1,
-                    });
-                }
-                BiDependencyResult::StartedByOtherThread => {
-                    waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                }
+                ChildResult::Pending => {}
             }
         }
         let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);

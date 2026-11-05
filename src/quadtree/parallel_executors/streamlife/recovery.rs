@@ -1,7 +1,6 @@
 //! Paused-update roots and queue reconstruction. Every worker has joined before entry.
 
 use super::*;
-use std::sync::atomic::AtomicU16;
 
 pub(in crate::quadtree) struct PausedWork {
     pub(in crate::quadtree) roots: Vec<(Idx, u32)>,
