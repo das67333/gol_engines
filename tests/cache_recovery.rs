@@ -3,8 +3,6 @@ use gol_engines::{GoLEngine, Pattern, PatternFormat, SIMDEngine, StreamLifeEngin
 #[test]
 fn repeated_low_memory_recovery_matches_simd() {
     let packed = |p: Pattern| p.to_format(PatternFormat::PackedCells).unwrap();
-    let mut failures = 0;
-    let mut successes = 0;
     for workers in [1, 4] {
         for seed in 0..8 {
             let pattern = Pattern::random(7, Some(seed)).unwrap();
@@ -16,14 +14,11 @@ fn repeated_low_memory_recovery_matches_simd() {
                 let before = packed(engine.current_state());
                 if engine.update(step).is_ok() {
                     reference.update(step).unwrap();
-                    successes += 1;
                 } else {
                     assert_eq!(packed(engine.current_state()), before);
-                    failures += 1;
                 }
                 assert_eq!(packed(engine.current_state()), packed(reference.current_state()), "workers={workers}, seed={seed}, step={step}");
             }
         }
     }
-    eprintln!("recovery_oracle successes={successes} failures={failures}");
 }

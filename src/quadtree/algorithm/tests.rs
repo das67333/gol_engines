@@ -47,7 +47,7 @@ fn lane_classification_cancels_and_allows_concurrent_retry() {
 
     // Collection preserves completed lane descriptors; unfinished claims must
     // therefore be released by cancellation itself, before the next attempt.
-    mem.gc(&[(root, size_log2)], false);
+    mem.gc(&[(root, size_log2)]);
     blanks.clear();
     blanks.get_mut(size_log2, &mem);
     std::thread::scope(|scope| {

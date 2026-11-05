@@ -205,14 +205,15 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
 
     /// Parallel mark-and-sweep GC. Marks all nodes reachable from `roots`
     /// using a status bit (`GC_MARK`), then recycles dead entries in parallel.
-    /// If requested, follow and preserve completed results; the caller must
-    /// keep their update-size context valid. Preserving work also requires
-    /// marking every pending input, intermediate node, and unconsumed result.
-    pub fn gc(&mut self, roots: &[(Idx, u32)], retain_results: bool) {
-        self.mark(roots, retain_results);
-        self.sweep(retain_results);
+    /// Cached computation results are invalidated.
+    pub fn gc(&mut self, roots: &[(Idx, u32)]) {
+        self.mark(roots, false);
+        self.sweep(false);
     }
 
+    /// If requested, follow completed results; the caller must keep their
+    /// update-size context valid. Preserving work also requires marking every
+    /// pending input, intermediate node, and unconsumed result.
     pub fn mark(&self, roots: &[(Idx, u32)], retain_results: bool) {
         let threads_cnt = self.inner.thread_states.len();
         GcMarkExecutor::new(self, roots, GcMarkOptions { threads_cnt, retain_results }).run();
