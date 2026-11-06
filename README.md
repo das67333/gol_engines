@@ -17,7 +17,7 @@ The tree engines use concurrent chained hash tables, per-thread chunk allocators
 queues. Idle workers park while one worker continues looking for work. Garbage collection recycles
 unused entries; StreamLife can preserve pending work and resume an update after collection.
 
-Both tree engines support unbounded fields and square tori with power-of-two side lengths.
+Both tree engines support unbounded fields and square tori with power-of-two side lengths of at least 16 cells.
 `Pattern` stores a cell configuration as a compact quadtree. It supports `.rle`, `.mc`, and `.mc.gz`
 files, population and hash calculation, and replacing cells with metacells. Macrocell formats are
 suitable for large recursive patterns; the current macrocell writer requires a nonempty pattern.
@@ -43,8 +43,7 @@ target/release/gol_engines_cli update \
 
 This advances the input by `2^27` generations and writes the final state. Choose the memory budget
 and worker count for your machine. `--engine` defaults to `hashlife`, `--workers` to `1`, and
-`--topology` to `unbounded`; `torus` connects opposite field edges. The update command requires an
-input field of at least `16 x 16`.
+`--topology` to `unbounded`; `torus` connects opposite field edges.
 
 Inspect a pattern or replace a glider's cells with OTCA metapixels:
 
@@ -75,7 +74,9 @@ Optional per-thread runtime statistics can be enabled with `--features cli_deps,
 
 StreamLife attempts work-preserving GC internally. If an engine returns a recoverable failure,
 its previous pattern is retained. The CLI retries at the same step when the previous attempt
-succeeded; otherwise it tries a smaller step.
+succeeded; otherwise it decreases `S` by two, reducing the number of generations per update fourfold.
+`S0` and `S1` are terminal steps: if the update and any permitted retry fail, the CLI returns an error
+without reducing the step further.
 
 ## Performance
 
