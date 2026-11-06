@@ -4,6 +4,8 @@
 //! Each thread has its own `Worker<Task>` queue; when a thread runs out of
 //! work, it steals from other threads via `Stealer`. No global queue is used.
 
+mod recovery;
+
 use super::{
     super::{
         hashlife::HashLifeEngine,
@@ -16,6 +18,7 @@ use super::{
         HashProcessingData, ProcessingGuard, Task, TaskFetcher, is_finished, start_processing_node,
         update_node_async,
     },
+    recovery::PausedWork,
 };
 use crossbeam::deque::{Stealer, Worker};
 use smallvec::{SmallVec, smallvec};
@@ -39,21 +42,19 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
         }
     }
 
-    pub fn run(&self, num_threads: usize) -> Option<Idx> {
+    pub fn run(&self, num_threads: usize, paused: Option<PausedWork<Task>>) -> Option<Idx> {
         let timer = std::time::Instant::now();
         let root_node = self.mem.get(self.root);
 
-        // Reuse an already-computed root instead of queueing a task that can
-        // never acquire the PENDING -> ACTIVE processing guard.
-        if !start_processing_node::<Meta, Idx>(root_node, smallvec![]) {
-            let root_status = root_node.status.load(Ordering::Acquire);
-            assert!(
-                root_status & status::FINISHED != 0,
-                "root node has nonterminal status {root_status:#010b} before executor start"
-            );
+        if is_finished(&root_node.status) {
             println!("Time spent on hashlife executor: {:?}", timer.elapsed());
             println!("Nodes count: {} / {}", self.mem.len(), self.mem.capacity());
             return Some(root_node.cache.get_value());
+        }
+        if paused.is_none() {
+            assert!(start_processing_node::<Meta, Idx>(root_node, smallvec![]));
+        } else {
+            assert_eq!(root_node.status.load(Ordering::Relaxed), status::PENDING);
         }
 
         // Create worker queues and stealers
@@ -67,7 +68,11 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
             stealers.push(stealer);
         }
 
-        queues[0].push(Task::new(self.root, self.size_log2));
+        let tasks = paused.map_or_else(|| vec![Task::new(self.root, self.size_log2)], |work| work.tasks);
+        assert!(!tasks.is_empty(), "unfinished update has no runnable tasks");
+        for (i, task) in tasks.into_iter().enumerate() {
+            queues[i % num_threads].push(task);
+        }
 
         let mut total_stats = ExecutionStatistics::new();
         thread::scope(|scope| {
@@ -90,7 +95,6 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
         });
 
         if self.mem.exceeds_load_factor() {
-            self.free_orphaned_processing_data();
             return None;
         }
 
@@ -101,21 +105,6 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
         println!("{total_stats}");
 
         Some(root_node.cache.get_value())
-    }
-
-    /// Drop `HashProcessingData` boxes orphaned by cancellation. Must be called
-    /// from a single-threaded context after `thread::scope` has joined; only
-    /// PENDING slots own a live box at that point.
-    fn free_orphaned_processing_data(&self) {
-        self.mem.for_each_idx(|idx| {
-            let n = self.mem.get(idx);
-            let status = n.status.load(Ordering::Relaxed);
-            if status == status::PENDING {
-                // SAFETY: PENDING contains the original Box pointer installed by
-                // start_processing_node; all workers have joined.
-                unsafe { drop(Box::from_raw(n.cache.get_ptr::<HashProcessingData<Idx>>())) };
-            }
-        });
     }
 }
 

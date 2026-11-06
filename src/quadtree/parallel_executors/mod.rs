@@ -4,6 +4,7 @@ mod gc_sweep;
 mod hashlife;
 mod parking;
 mod processing;
+mod recovery;
 mod streamlife;
 mod task_queue;
 

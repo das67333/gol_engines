@@ -2,20 +2,8 @@
 
 use super::*;
 
-pub(in crate::quadtree) struct PausedWork {
-    pub(in crate::quadtree) roots: Vec<(Idx, u32)>,
-    pub(super) tasks: Vec<ReadyTask>,
-    root_finished: bool,
-}
-
-impl PausedWork {
-    pub(in crate::quadtree) fn can_resume(&self) -> bool {
-        self.root_finished || !self.tasks.is_empty()
-    }
-}
-
 impl StreamLifeExecutor<'_> {
-    pub(in crate::quadtree) fn paused_work(&self) -> PausedWork {
+    pub(in crate::quadtree) fn paused_work(&self) -> PausedWork<ReadyTask> {
         let mut paused = PausedWork {
             roots: vec![(self.biroot.0, self.size_log2), (self.biroot.1, self.size_log2)],
             tasks: Vec::new(),

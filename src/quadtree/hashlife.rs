@@ -25,6 +25,26 @@ pub struct HashLifeEngine<Meta> {
 }
 
 impl<Meta: Default + Sync> HashLifeEngine<Meta> {
+    fn run_executor(&mut self) -> Option<Idx> {
+        let mut paused = None;
+        loop {
+            let executor = HashLifeExecutor::new(self);
+            if let Some(result) = executor.run(self.threads_cnt, paused.take()) {
+                return Some(result);
+            }
+            let work = executor.paused_work();
+            let before = self.mem.len();
+            self.mem.mark(&work.roots, true);
+            self.mem.sweep(true);
+            self.blank_nodes.clear();
+            println!("HashLife resume GC: {before} -> {}", self.mem.len());
+            if self.mem.exceeds_load_factor() || !work.can_resume() {
+                return None;
+            }
+            paused = Some(work);
+        }
+    }
+
     // The executor keeps the central half. An extra frame lets unbounded growth
     // cross the old boundary without being cropped from that result.
     pub(super) fn frames_for_update(&self, generations_log2: u32) -> u32 {
@@ -212,9 +232,10 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
             self.add_frame(&mut dx, &mut dy);
         }
 
-        self.root = if let Some(x) = HashLifeExecutor::new(self).run(self.threads_cnt) {
+        self.root = if let Some(x) = self.run_executor() {
             x
         } else {
+            HashLifeExecutor::new(self).discard_pending();
             self.load_pattern(&backup, self.topology)?;
             return Err(anyhow!(
                 "HashLifeAsync: overfilled NodeStore, try smaller step"
