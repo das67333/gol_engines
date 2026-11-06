@@ -97,13 +97,13 @@ on a Google Cloud C3D VM with AMD EPYC 9B14: 45 workers pinned to 45 physical co
 per core. Rust 1.98 release build, statistics disabled, frame pointers enabled. Each input starts at
 generation zero with cold caches; times are means of two fresh-process runs.
 
-| Pattern | Generations | Step | Update time, s | Peak RSS, GiB |
-| --- | ---: | ---: | ---: | ---: |
-| 0E0P metaglider | `2^27` | `2^27` | 32.2 | 30.0 |
-| 0E0P metaglider | `2^29` | `2^26` | 626.7 | 109.5 |
-| Pi calculator | `2^28` | `2^28` | 2.24 | 1.19 |
+| Pattern | Generations | Step | Budget, GiB | Update time, s | Peak RSS, GiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0E0P metaglider | `2^27` | `2^27` | 64 | 32.2 | 30.0 |
+| 0E0P metaglider | `2^29` | `2^26` | 128 | 626.7 | 109.5 |
+| Pi calculator | `2^28` | `2^28` | 8 | 2.24 | 1.19 |
 
-The table-sizing budgets were 64, 128, and 8 GiB, respectively; they affect cache capacity and GC frequency.
+Budget is the configured table-sizing budget; it affects cache capacity and GC frequency.
 Update time sums engine calls, including internal GC, and excludes loading, validation, and file I/O.
 Peak RSS is the maximum of the two whole-process peaks, measured on Linux with GNU `time`'s `%M`
 (KiB divided by `2^20` for GiB). It includes loading and serialization as well as engine execution.
