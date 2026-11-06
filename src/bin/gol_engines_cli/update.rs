@@ -6,7 +6,7 @@ use num_bigint::BigInt;
 
 #[derive(Args, Debug)]
 pub(super) struct UpdateArgs {
-    /// Path to the file containing the pattern; supports .rle, .mc and .mc.gz formats
+    /// Input pattern (.rle, .mc or .mc.gz) with a field of at least 16x16 cells
     pattern: String,
 
     /// Path to the file where the resulting pattern will be saved
@@ -90,7 +90,7 @@ pub(super) fn run_update(args: UpdateArgs) -> Result<()> {
 
     let timer = std::time::Instant::now();
     let pattern = Pattern::from_file(&args.pattern).unwrap();
-    engine.load_pattern(&pattern, topology).unwrap();
+    engine.load_pattern(&pattern, topology)?;
     println!(
         "Loaded pattern in {:.1} secs",
         timer.elapsed().as_secs_f64()
@@ -137,10 +137,10 @@ fn advance(gens_log2: u32, mut step_log2: u32, mut update: impl FnMut(u32) -> Re
                     // Rollback can free cache space; retry a step that has already succeeded.
                     println!("{}  Overfilled hashtables, retrying after rollback", local_time());
                     can_retry = false;
-                } else if step_log2 == 0 {
-                    return Err(error.context("Cannot advance by one generation; increase --mem-limit-gib"));
+                } else if step_log2 <= 1 {
+                    return Err(error.context("Cannot advance at the minimum step; increase --mem-limit-gib"));
                 } else {
-                    let new_step_log2 = step_log2.saturating_sub(2);
+                    let new_step_log2 = step_log2 - 2;
                     println!(
                         "{}  Overfilled hashtables, reducing step_log2 from {} to {}",
                         local_time(),

@@ -13,6 +13,7 @@ use num_bigint::BigInt;
 ///
 /// Built on top of [`HashLifeEngine`]. Uses a static hashtable for caching
 /// results of `update_binode` function.
+/// Has the same minimum field size as [`HashLifeEngine`]: 16x16 cells.
 pub struct StreamLifeEngine {
     pub(super) base: HashLifeEngine<u64>,
     // streamlife-specific

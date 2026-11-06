@@ -96,7 +96,7 @@ fn final_merge_overflow_preserves_state_and_allows_smaller_retry() {
 
 #[test]
 fn test_pattern_roundtrip() {
-    for size_log2 in 3..10 {
+    for size_log2 in 4..10 {
         let original = Pattern::random(size_log2, Some(SEED)).unwrap();
         let mut engine = StreamLifeEngine::new(1, 1);
         engine.load_pattern(&original, Topology::Unbounded).unwrap();
