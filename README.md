@@ -44,7 +44,7 @@ target/release/gol_engines_cli update \
 This advances the input by `2^27` generations and writes the final state. Choose the memory budget
 and worker count for your machine. `--engine` defaults to `hashlife`, `--workers` to `1`, and
 `--topology` to `unbounded`; `torus` connects opposite field edges. The update command requires an
-input field of at least `8 x 8`.
+input field of at least `16 x 16`.
 
 Inspect a pattern or replace a glider's cells with OTCA metapixels:
 
@@ -75,8 +75,7 @@ Optional per-thread runtime statistics can be enabled with `--features cli_deps,
 
 StreamLife attempts work-preserving GC internally. If an engine returns a recoverable failure,
 its previous pattern is retained. The CLI retries at the same step when the previous attempt
-succeeded; otherwise it reduces the step exponent by two. This fallback currently panics if it
-needs to reduce an exponent of zero or one.
+succeeded; otherwise it tries a smaller step.
 
 ## Performance
 
