@@ -10,10 +10,13 @@ use ahash::AHashMap as HashMap;
 use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
 
+const MIN_SIZE_LOG2: u32 = LEAF_SIZE_LOG2 + 1;
+
 /// Parallel implementation of [HashLife algorithm](https://conwaylife.com/wiki/HashLife).
 ///
 /// Stores nodes in a chained hashtable backed by per-thread chunk allocators.
 /// The table is pre-sized at construction and never resizes.
+/// Fields must be at least 16x16 cells, so the root contains four 8x8 leaves or larger subtrees.
 pub struct HashLifeEngine<Meta> {
     pub(super) size_log2: u32,
     pub(super) root: Idx,
@@ -60,7 +63,7 @@ impl<Meta: Default + Sync> HashLifeEngine<Meta> {
     }
 
     pub(super) fn has_blank_frame(&mut self) -> bool {
-        if self.size_log2 <= LEAF_SIZE_LOG2 + 1 {
+        if self.size_log2 <= MIN_SIZE_LOG2 {
             return false;
         }
 
@@ -150,9 +153,10 @@ impl<Meta: Default + Sync> HashLifeEngine<Meta> {
 
     pub(super) fn with_capacity(cap_log2: u32, entry_capacity: usize, threads_cnt: usize) -> Self {
         let mem = NodeStore::new(cap_log2, entry_capacity, threads_cnt);
+        let blank = mem.find_or_create_leaf_from_u64(0);
         Self {
-            size_log2: LEAF_SIZE_LOG2,
-            root: mem.find_or_create_leaf_from_u64(0),
+            size_log2: MIN_SIZE_LOG2,
+            root: mem.find_or_create_node(blank, blank, blank, blank),
             mem,
             generations_per_update_log2: None,
             topology: Topology::Unbounded,
@@ -178,8 +182,8 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
 
     fn load_pattern(&mut self, pattern: &Pattern, topology: Topology) -> Result<()> {
         let size_log2 = pattern.get_size_log2();
-        if size_log2 < LEAF_SIZE_LOG2 {
-            return Err(anyhow!("Pattern is too small"));
+        if size_log2 < MIN_SIZE_LOG2 {
+            return Err(anyhow!("Pattern field must be at least 16x16 cells"));
         }
         self.size_log2 = size_log2;
         self.mem.clear();
@@ -269,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_pattern_roundtrip() {
-        for size_log2 in 3..10 {
+        for size_log2 in 4..10 {
             let original = Pattern::random(size_log2, Some(SEED)).unwrap();
             let mut engine = HashLifeEngine::<()>::new(1, 1);
             engine.load_pattern(&original, Topology::Unbounded).unwrap();

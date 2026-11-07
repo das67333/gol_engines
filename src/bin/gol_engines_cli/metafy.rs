@@ -1,4 +1,5 @@
 use crate::util::print_population;
+use anyhow::Result;
 use clap::Args;
 use gol_engines::Pattern;
 
@@ -26,18 +27,18 @@ pub(super) struct MetafyArgs {
     population: bool,
 }
 
-pub(super) fn run_metafy(args: MetafyArgs) {
+pub(super) fn run_metafy(args: MetafyArgs) -> Result<()> {
     let timer = std::time::Instant::now();
-    let pattern = Pattern::from_file(&args.pattern).unwrap();
-    let meta_0 = Pattern::from_file(&args.meta_0).unwrap();
-    let meta_1 = Pattern::from_file(&args.meta_1).unwrap();
+    let pattern = Pattern::from_file(&args.pattern)?;
+    let meta_0 = Pattern::from_file(&args.meta_0)?;
+    let meta_1 = Pattern::from_file(&args.meta_1)?;
     println!(
         "Loaded patterns in {:.1} secs",
         timer.elapsed().as_secs_f64()
     );
 
     let timer = std::time::Instant::now();
-    let metafied = pattern.metafy([&meta_0, &meta_1], args.k).unwrap();
+    let metafied = pattern.metafy([&meta_0, &meta_1], args.k)?;
     println!(
         "Metafied pattern in {:.1} secs",
         timer.elapsed().as_secs_f64()
@@ -45,5 +46,5 @@ pub(super) fn run_metafy(args: MetafyArgs) {
     if args.population {
         print_population(&metafied);
     }
-    metafied.to_file(&args.output).unwrap();
+    metafied.to_file(&args.output)
 }

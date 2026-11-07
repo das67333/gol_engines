@@ -25,7 +25,7 @@ enum Action {
     Stats(StatsArgs),
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let args = CLIParser::parse();
 
     match args.action {

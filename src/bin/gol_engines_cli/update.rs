@@ -1,11 +1,12 @@
 use crate::util::{local_time, print_population};
+use anyhow::{Result, ensure};
 use clap::{Args, ValueEnum};
 use gol_engines::{GoLEngine, HashLifeEngine, Pattern, StreamLifeEngine};
 use num_bigint::BigInt;
 
 #[derive(Args, Debug)]
 pub(super) struct UpdateArgs {
-    /// Path to the file containing the pattern; supports .rle, .mc and .mc.gz formats
+    /// Input pattern (.rle, .mc or .mc.gz) with a field of at least 16x16 cells
     pattern: String,
 
     /// Path to the file where the resulting pattern will be saved
@@ -59,14 +60,14 @@ enum Topology {
     Torus,
 }
 
-pub(super) fn run_update(args: UpdateArgs) {
-    let mut step_log2 = args.step_log2.unwrap_or(args.gens_log2);
-    assert!(
+pub(super) fn run_update(args: UpdateArgs) -> Result<()> {
+    let step_log2 = args.step_log2.unwrap_or(args.gens_log2);
+    ensure!(
         step_log2 <= args.gens_log2,
         "step_log2 cannot exceed gens_log2"
     );
-    assert!(args.workers > 0, "Number of workers must be greater than 0");
-    assert!(
+    ensure!(args.workers > 0, "Number of workers must be greater than 0");
+    ensure!(
         args.mem_limit_gib > 0,
         "Memory limit must be greater than 0"
     );
@@ -88,24 +89,39 @@ pub(super) fn run_update(args: UpdateArgs) {
     );
 
     let timer = std::time::Instant::now();
-    let pattern = Pattern::from_file(&args.pattern).unwrap();
-    engine.load_pattern(&pattern, topology).unwrap();
+    let pattern = Pattern::from_file(&args.pattern)?;
+    engine.load_pattern(&pattern, topology)?;
     println!(
         "Loaded pattern in {:.1} secs",
         timer.elapsed().as_secs_f64()
     );
 
     let timer = std::time::Instant::now();
+    advance(args.gens_log2, step_log2, |step| engine.update(step).map(|_| ()))?;
+    println!(
+        "Updated pattern by 2^{} generations in {:.1} secs",
+        args.gens_log2,
+        timer.elapsed().as_secs_f64()
+    );
+
+    let updated = engine.current_state();
+    if args.population {
+        print_population(&updated);
+    }
+    updated.to_file(&args.output)
+}
+
+fn advance(gens_log2: u32, mut step_log2: u32, mut update: impl FnMut(u32) -> Result<()>) -> Result<()> {
     let mut step = BigInt::from(1) << step_log2;
-    let gens_total = BigInt::from(1) << args.gens_log2;
+    let gens_total = BigInt::from(1) << gens_log2;
     let mut gens_left = gens_total.clone();
     let mut can_retry = false;
     loop {
-        match engine.update(step_log2) {
+        match update(step_log2) {
             Ok(_) => {
                 gens_left -= &step;
                 if gens_left == BigInt::ZERO {
-                    break;
+                    return Ok(());
                 }
                 println!(
                     "{}  Updated by {} out of {} generations",
@@ -115,13 +131,15 @@ pub(super) fn run_update(args: UpdateArgs) {
                 );
                 can_retry = true;
             }
-            Err(_) => {
+            Err(error) => {
                 if can_retry {
-                    // Both CLI engines restore failed updates with cleared caches.
+                    // Rollback can free cache space; retry a step that has already succeeded.
                     println!("{}  Overfilled hashtables, retrying after rollback", local_time());
                     can_retry = false;
+                } else if step_log2 <= 1 {
+                    return Err(error.context("Cannot advance at the minimum step; increase --mem-limit-gib"));
                 } else {
-                    let new_step_log2 = step_log2.checked_sub(2).unwrap();
+                    let new_step_log2 = step_log2 - 2;
                     println!(
                         "{}  Overfilled hashtables, reducing step_log2 from {} to {}",
                         local_time(),
@@ -134,15 +152,7 @@ pub(super) fn run_update(args: UpdateArgs) {
             }
         }
     }
-    println!(
-        "Updated pattern by 2^{} generations in {:.1} secs",
-        args.gens_log2,
-        timer.elapsed().as_secs_f64()
-    );
-
-    let updated = engine.current_state();
-    if args.population {
-        print_population(&updated);
-    }
-    updated.to_file(&args.output).unwrap();
 }
+
+#[cfg(test)]
+mod tests;
