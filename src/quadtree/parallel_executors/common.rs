@@ -33,7 +33,8 @@
 //!   dependencies (preserves `DEPS_LOCK`).
 //! - `ACTIVE → PROCESSING`: Finish barrier; spins until `DEPS_LOCK` is
 //!   clear, then no pusher can observe `pd` again.
-//! - `PROCESSING → FINISHED`: Result published, dependents drained.
+//! - `PROCESSING → FINISHED`: Result published, dependents drained. A fixed-size
+//!   base case can take this transition directly without a pending task.
 //!
 //! ## Dependents-list synchronization
 //!
@@ -331,6 +332,9 @@ where
                     continue;
                 }
                 let d = mem.get(*x);
+                if task.size_log2 == LEAF_SIZE_LOG2 + 2 {
+                    try_complete_base_case(mem, d, generations_log2);
+                }
                 match handle_dependency(d, dep) {
                     DependencyHandlingResult::Ready => {
                         data.mask9_waiting &= !(1 << i);
@@ -371,6 +375,9 @@ where
             continue;
         }
         let d = mem.get(*x);
+        if task.size_log2 == LEAF_SIZE_LOG2 + 2 {
+            try_complete_base_case(mem, d, generations_log2);
+        }
         match handle_dependency(d, dep) {
             DependencyHandlingResult::Ready => {
                 data.mask4_waiting &= !(1 << i);
@@ -395,6 +402,38 @@ where
     }
 
     Some(mem.find_or_create_node(data.arr[0], data.arr[1], data.arr[2], data.arr[3]))
+}
+
+// The base case has no child dependencies, so it can finish under the init
+// barrier without allocating a task. Other workers observe FINISHED only after
+// the result is published; none can register a dependent while PROCESSING is set.
+fn try_complete_base_case<Meta: Default + Sync>(
+    mem: &impl NodeAccess<Meta>,
+    node: &QuadTreeNode<Meta>,
+    generations_log2: u32,
+) {
+    if node.status.load(Ordering::Relaxed) != status::NOT_STARTED {
+        return;
+    }
+    if node
+        .status
+        .compare_exchange(
+            status::NOT_STARTED,
+            status::PROCESSING,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        record_status_claim_fail();
+        return;
+    }
+    let [nw, ne, sw, se] = node.parts();
+    let steps = 1 << generations_log2.min(LEAF_SIZE_LOG2 - 1);
+    let result = algorithm::update_leaves(mem, nw, ne, sw, se, steps);
+    node.cache.set_value(result);
+    node.status.store(status::FINISHED, Ordering::Release);
+    record_status_claim_success();
 }
 
 /// RAII guard for the owner-mutex bit (`ACTIVE`).
@@ -487,9 +526,9 @@ pub enum DependencyHandlingResult {
 /// Handle a dependency: check if ready, start processing, or register as dependent.
 ///
 /// Registration uses the [`status::DEPS_LOCK`] overlay bit, which can coexist
-/// with both `PENDING` and `ACTIVE`. This means a pusher never has to wait
-/// for the owner's compute burst — only for the brief init / finish
-/// barriers (encoded as `PROCESSING`) or for another concurrent pusher.
+/// with both `PENDING` and `ACTIVE`. Pushers wait only for initialization,
+/// finalization, a fixed-size base case (all encoded as `PROCESSING`),
+/// or another concurrent pusher.
 ///
 /// Generic over `Dep`. Pure `HashLife` runs use `Dep = Idx` (registering the
 /// parent task's index). `StreamLife` runs that descend through `HashLife` nodes
@@ -516,7 +555,7 @@ pub fn handle_dependency<Meta: Default + Sync, Dep: Copy>(
             continue;
         }
         if cur & status::PROCESSING != 0 {
-            // Init or finish barrier; brief by construction.
+            // Init, finish, or fixed-size base case; no payload is accessible.
             spinner.spin();
             continue;
         }
