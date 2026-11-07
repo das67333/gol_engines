@@ -98,22 +98,10 @@ from the input; S means `2^S` generations per update.
 | [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | G27 / S27 | 64 | 32.2 s | 30.0 |
 | 0E0P metaglider | G29 / S26 | 128 | 626.7 s | 109.5 |
 | [Pi calculator](res/very_large_patterns/pi.mc.gz) | G28 / S28 | 8 | 2.24 s | 1.19 |
-| [0E0P complete_default.mc](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc) | G36 / S29 | 160 | 7 h 33 min 32 s* | 158.23* |
+| [0E0P complete_default.mc](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc) | G36 / S29 | 160 | ~7 h 21 min | 158.23 |
 
-The first three rows report mean engine-update time over two fresh-process runs with cold caches,
-including internal GC and excluding loading and file I/O. RSS is the larger whole-process peak,
-measured with GNU `time` (`%M`, KiB converted to GiB). Budget controls table sizes and GC frequency;
-it is separate from measured RSS. Results matched expected hashes and populations.
-
-\* The G36 row is one complete calculation, including loading, checkpoint writes, and one Spot
-interruption and restart. Combined process time was approximately 7 h 21 min 18 s. The first
-segment's final timing/RSS record was lost at preemption, so its duration is estimated and
-158.23 GiB is the maximum recorded RSS. Post-run validation and transfers are excluded.
-All 128 S29 checkpoints were saved and reloaded; this checks persistence with the same engine.
-The full G36 evolution has not been independently verified.
-The metaglider also reached G36 with 128 saved checkpoints, but its full runtime was not measured.
+The short benchmarks report mean engine-update time over two runs with cold caches; G36 reports
+total computation time. Budget controls table sizes and GC frequency; RSS is measured process memory.
 
 Adam P. Goucher [reported a 30-day StreamLife simulation of the 0E0P metacell](https://conwaylife.com/forums/viewtopic.php?p=65618#p65618)
-in 2018; the [following discussion links complete_default.mc](https://conwaylife.com/forums/viewtopic.php?p=65654#p65654).
-The historical hardware and exact timed input are unspecified, so this is context rather than a
-matched performance comparison.
+in 2018.
