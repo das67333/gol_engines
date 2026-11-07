@@ -13,17 +13,14 @@ A Rust library and CLI for Conway's Game of Life (B3/S23), with parallel HashLif
 | `StreamLifeEngine` | `streamlife` | Separates non-interacting streams into two universes and caches pairs of HashLife nodes. |
 | `SIMDEngine` | Library only | Updates a bit-packed dense grid without quadtree memoization. |
 
-The tree engines use shared memoization tables, per-thread chunk allocators, and work-stealing queues.
-The tables use concurrent chaining. In StreamLife, idle workers park while one worker continues
-looking for work. Garbage collection recycles unused entries; StreamLife can preserve pending work
-and resume an update after collection.
+The tree engines share memoization tables with concurrent chaining, allocate entries in per-thread
+chunks, and distribute work through work-stealing queues. StreamLife parks idle workers and can
+preserve pending work across garbage collection.
 
-Both tree engines support unbounded fields and square tori with power-of-two side lengths of at least 16 cells.
+Both tree engines support unbounded fields and square tori with power-of-two side lengths.
 `Pattern` stores a cell configuration as a compact quadtree. It supports `.rle`, `.mc`, and `.mc.gz`
 files, population and hash calculation, and replacing cells with metacells. Macrocell formats are
 suitable for large recursive patterns; the current macrocell writer requires a nonempty pattern.
-
-### Compared with lifelib
 
 [lifelib](https://gitlab.com/apgoucher/lifelib) provides the original StreamLife implementation,
 broader cellular-automaton rule support, and Python/C++ APIs. GoL Engines focuses on running a single
@@ -41,29 +38,29 @@ Build the CLI from the repository root with a Rust toolchain and native build to
 cargo build --release --bin gol_engines_cli --features cli_deps
 ```
 
-Example for a machine with 45 physical cores and room for a 64 GiB engine budget:
+Advance the included ticker pattern by `2^12` generations:
 
 ```sh
-mkdir -p output
-target/release/gol_engines_cli update \
-    res/very_large_patterns/0e0p-metaglider.mc.gz \
-    --engine=streamlife --mem-limit-gib=64 --workers=45 \
-    --gens-log2=27 --step-log2=27 \
-    --output=output/0e0p-g27.mc.gz --population
+target/release/gol_engines_cli update res/golly-ticker.rle \
+    --mem-limit-gib=1 --gens-log2=12 --output=ticker-g12.mc
 ```
 
-This advances the input by `2^27` generations and writes the final state. Choose the memory budget
-and worker count for your machine. `--engine` defaults to `hashlife`, `--workers` to `1`, and
-`--topology` to `unbounded`; `torus` connects opposite field edges.
+Use `--engine=streamlife` for StreamLife and `--workers=N` to select the number of worker threads.
+The defaults are HashLife, one worker, and an unbounded field; `--topology=torus` connects opposite
+field edges. Choose the memory budget and worker count for the workload and machine.
 
-Inspect a pattern or replace a glider's cells with OTCA metapixels:
+Inspect a pattern's population, hash, and quadtree statistics:
 
 ```sh
 target/release/gol_engines_cli stats res/very_large_patterns/pi.mc.gz
-mkdir -p output
+```
+
+Replace a glider's dead and live cells with the corresponding OTCA metapixels:
+
+```sh
 target/release/gol_engines_cli metafy \
     res/glider.rle res/otca_0.mc.gz res/otca_1.mc.gz \
-    --output=output/otca-metaglider.mc.gz --population
+    --output=otca-metaglider.mc.gz --population
 ```
 
 `metafy --k=N` repeats the replacement `N` times. Use `--help` on any subcommand for its options.
@@ -79,76 +76,43 @@ Optional per-thread runtime statistics can be enabled with `--features cli_deps,
   Too little memory can cause repeated collection and expensive retries.
 - **Step size.** Larger steps can exploit more repetition but need more intermediate cached state.
   Compare complete sequences of updates. Changing the step triggers GC; a fixed step permits cache reuse.
-- **Workers.** More cores help when the pattern exposes independent work. Expensive patterns such as
-  the Pi calculator can still have limited parallelism. Measure elapsed time and CPU consumption;
-  distinguish physical cores from SMT threads.
+- **Workers.** `--workers=N` creates N computing threads; the calling thread waits for them.
+  One worker per physical core is a starting point, not a measured optimum. Compare smaller counts
+  and, on SMT machines, counts up to the logical CPU limit. Expensive patterns such as the Pi
+  calculator can still have limited parallelism; measure elapsed time and CPU consumption.
 
-StreamLife attempts work-preserving GC internally. If an engine returns a recoverable failure,
-its previous pattern is retained. The CLI retries at the same step when the previous attempt
-succeeded; otherwise it decreases `S` by two, reducing the number of generations per update fourfold.
-`S0` and `S1` are terminal steps: if the update and any permitted retry fail, the CLI returns an error
-without reducing the step further.
+StreamLife attempts work-preserving GC internally. If recovery fails, the CLI can retry or reduce
+`S` by two (four times fewer generations per update). A smaller step may allow an update to fit,
+but can also lose useful memoization; compare complete runs when tuning it.
 
 ## Performance
 
-StreamLife measurements with engine sources matching
-[`b0ab6e7`](https://github.com/das67333/gol_engines/commit/b0ab6e76a703af93eb6df6a665203f4bc1840006),
-on a Google Cloud C3D VM with AMD EPYC 9B14: 45 workers pinned to 45 physical cores, one SMT thread
-per core. Rust 1.98 release build, statistics disabled, frame pointers enabled. Each input starts at
-generation zero with cold caches; times are means of two fresh-process runs.
+StreamLife on Google Cloud C3D (AMD EPYC 9B14), with 45 workers and process affinity restricted to
+one SMT thread on each of 45 physical cores. Engine sources match
+[`b0ab6e7`](https://github.com/das67333/gol_engines/commit/b0ab6e76a703af93eb6df6a665203f4bc1840006);
+Rust 1.98 release build, statistics disabled, frame pointers enabled. G means `2^G` generations
+from the input; S means `2^S` generations per update.
 
-| Pattern | Generations | Step | Budget, GiB | Update time, s | Peak RSS, GiB |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 0E0P metaglider | `2^27` | `2^27` | 64 | 32.2 | 30.0 |
-| 0E0P metaglider | `2^29` | `2^26` | 128 | 626.7 | 109.5 |
-| Pi calculator | `2^28` | `2^28` | 8 | 2.24 | 1.19 |
+| Pattern | Target / step | Budget, GiB | Time | Peak RSS, GiB |
+| --- | --- | ---: | ---: | ---: |
+| [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | G27 / S27 | 64 | 32.2 s | 30.0 |
+| 0E0P metaglider | G29 / S26 | 128 | 626.7 s | 109.5 |
+| [Pi calculator](res/very_large_patterns/pi.mc.gz) | G28 / S28 | 8 | 2.24 s | 1.19 |
+| [0E0P complete_default.mc](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc) | G36 / S29 | 160 | 7 h 33 min 32 s* | 158.23* |
 
-Budget is the configured table-sizing budget; it affects cache capacity and GC frequency.
-Update time sums engine calls, including internal GC, and excludes loading, validation, and file I/O.
-Peak RSS is the maximum of the two whole-process peaks, measured on Linux with GNU `time`'s `%M`
-(KiB divided by `2^20` for GiB). It includes loading and serialization as well as engine execution.
-All runs reached their target and matched expected state hashes and populations. These are
-fixed-machine measurements; scaling depends on the pattern, step, and available memory.
+The first three rows report mean engine-update time over two fresh-process runs with cold caches,
+including internal GC and excluding loading and file I/O. RSS is the larger whole-process peak,
+measured with GNU `time` (`%M`, KiB converted to GiB). Budget controls table sizes and GC frequency;
+it is separate from measured RSS. Results matched expected hashes and populations.
 
-### 0E0P metacell: complete_default.mc
+\* The G36 row is one complete calculation, including loading, checkpoint writes, and one Spot
+interruption and restart. Combined process time was approximately 7 h 21 min 18 s. The first
+segment's final timing/RSS record was lost at preemption, so its duration is estimated and
+158.23 GiB is the maximum recorded RSS. Post-run validation and transfers are excluded.
+All 128 S29 checkpoints were saved and reloaded; this checks persistence with the same engine.
+The metaglider also reached G36 with 128 saved checkpoints, but its full runtime was not measured.
 
-The published
-[`complete_default.mc`](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc)
-was advanced from generation zero through **`2^36` Life generations**, using the same C3D setup
-with a **160 GiB budget** and a fixed **`2^29` step**.
-
-| Measurement | Result |
-| --- | ---: |
-| Elapsed time, including one Spot interruption and recovery | 7 h 33 min 32 s |
-| Combined simulation process time, including loading and checkpoint writes | approximately 7 h 21 min 18 s |
-| Maximum recorded RSS | 158.23 GiB |
-
-These figures come from one completed calculation across two process segments. The interrupted
-segment's duration is estimated from launch and the provider's preemption event; its RSS was sampled.
-The process-time sum includes unfinished work lost at preemption. Build, post-run readback and
-transfers are excluded. All 128 checkpoints were saved, reloaded with the same engine, and checked
-against their recorded hashes and populations; SHA-256 checks verified the local copies.
-
-At `2^36`, the pattern has the same position and bounding box as the input. Exact cell comparison
-finds 58 removed cells and 26 added cells; population changes from 18,650,451 to 18,650,419.
-The overall construction returns, with these small differences from its initial state.
-
-For context, Adam P. Goucher
-[reported 30 days with StreamLife to simulate the 0E0P metacell](https://conwaylife.com/forums/viewtopic.php?p=65618#p65618)
-in November 2018. The
-[following discussion identifies `complete_default.mc` as a working sample](https://conwaylife.com/forums/viewtopic.php?p=65654#p65654).
-The report does not pin the hardware or exact timed input, so these figures are not a matched
-performance comparison.
-
-### 0E0P metaglider: a complete metatick
-
-The included [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) has reached
-**`2^36` ordinary Life generations (68,719,476,736)**: one complete
-[0E0P metatick](https://conwaylife.com/wiki/0E0P_metacell). All 128 states at `2^29`-generation
-boundaries were saved, reloaded, and checked against their recorded hashes and populations using
-the same StreamLife implementation. This does not provide an independent-engine correctness check.
-
-The calculation used checkpoint continuations; its final continuation used 45 workers and a 160 GiB
-engine budget. It is a completed workload, without a measured continuous generation-zero-to-`2^36`
-runtime, so it is separate from the timed table above. A metaglider's full four-metatick phase cycle
-would require `2^38` generations; that longer calculation has not been completed here.
+Adam P. Goucher [reported a 30-day StreamLife simulation of the 0E0P metacell](https://conwaylife.com/forums/viewtopic.php?p=65618#p65618)
+in 2018; the [following discussion links complete_default.mc](https://conwaylife.com/forums/viewtopic.php?p=65654#p65654).
+The historical hardware and exact timed input are unspecified, so this is context rather than a
+matched performance comparison.
