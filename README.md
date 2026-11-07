@@ -110,6 +110,36 @@ Peak RSS is the maximum of the two whole-process peaks, measured on Linux with G
 All runs reached their target and matched expected state hashes and populations. These are
 fixed-machine measurements; scaling depends on the pattern, step, and available memory.
 
+### 0E0P metacell: complete_default.mc
+
+The published
+[`complete_default.mc`](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc)
+was advanced from generation zero through **`2^36` Life generations**, using the same C3D setup
+with a **160 GiB budget** and a fixed **`2^29` step**.
+
+| Measurement | Result |
+| --- | ---: |
+| Elapsed time, including one Spot interruption and recovery | 7 h 33 min 32 s |
+| Combined simulation process time, including loading and checkpoint writes | approximately 7 h 21 min 18 s |
+| Maximum recorded RSS | 158.23 GiB |
+
+These figures come from one completed calculation across two process segments. The interrupted
+segment's duration is estimated from launch and the provider's preemption event; its RSS was sampled.
+The process-time sum includes unfinished work lost at preemption. Build, post-run readback and
+transfers are excluded. All 128 checkpoints were saved, reloaded with the same engine, and checked
+against their recorded hashes and populations; SHA-256 checks verified the local copies.
+
+At `2^36`, the pattern has the same position and bounding box as the input. Exact cell comparison
+finds 58 removed cells and 26 added cells; population changes from 18,650,451 to 18,650,419.
+The overall construction returns, with these small differences from its initial state.
+
+For context, Adam P. Goucher
+[reported 30 days with StreamLife to simulate the 0E0P metacell](https://conwaylife.com/forums/viewtopic.php?p=65618#p65618)
+in November 2018. The
+[following discussion identifies `complete_default.mc` as a working sample](https://conwaylife.com/forums/viewtopic.php?p=65654#p65654).
+The report does not pin the hardware or exact timed input, so these figures are not a matched
+performance comparison.
+
 ### 0E0P metaglider: a complete metatick
 
 The included [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) has reached
