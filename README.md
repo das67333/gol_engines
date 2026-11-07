@@ -27,8 +27,8 @@ broader cellular-automaton rule support, and Python/C++ APIs. GoL Engines focuse
 large B3/S23 update across many CPU cores, with a Rust API and CLI. The
 [upstream StreamLife recursion](https://gitlab.com/apgoucher/lifelib/-/blob/05632e382096925c0b1724fd59d2f0784f0213d6/streamlife.h#L301-311)
 evaluates child problems sequentially; GoL Engines schedules independent work across threads sharing
-cached results. The benefit depends on the available parallelism in the pattern. The measurements
-below report GoL Engines performance.
+cached results. The benefit depends on the available parallelism in the pattern. The benchmarks
+below compare both engines with lifelib and Golly.
 
 ## Build and use
 
@@ -85,22 +85,47 @@ The CLI may reduce the step for either engine if an update does not fit in memor
 
 ## Performance
 
-StreamLife on Google Cloud C3D (AMD EPYC 9B14), with 45 workers and process affinity restricted to
-one SMT thread on each of 45 physical cores. Engine sources match
-[`b0ab6e7`](https://github.com/das67333/gol_engines/commit/b0ab6e76a703af93eb6df6a665203f4bc1840006);
-Rust 1.98 release build, statistics disabled, frame pointers enabled. G means `2^G` generations
-from the input; S means `2^S` generations per update.
+Benchmarks used a Google Cloud Spot (preemptible) `c3d-highcpu-90` VM in `australia-southeast1`:
+45 physical AMD EPYC 9B14 cores, 90 vCPUs, and 180 GiB RAM, at about
+[US$0.40/hour](https://cloud.google.com/spot-vms/pricing) for CPU and memory.
+Core counts below refer to physical cores, using one hardware thread per core.
 
-| Pattern | Target / step | Budget, GiB | Time | Peak RSS, GiB |
-| --- | --- | ---: | ---: | ---: |
-| [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | G27 / S27 | 64 | 32.2 s | 30.0 |
-| 0E0P metaglider | G29 / S26 | 128 | 626.7 s | 109.5 |
-| [Pi calculator](res/very_large_patterns/pi.mc.gz) | G28 / S28 | 8 | 2.24 s | 1.19 |
-| [0E0P complete_default.mc](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc) | G36 / S29 | 160 | 7 h 21 min | 158.23 |
+The comparison uses a GoL Engines release build ([`622bf9e`](https://github.com/das67333/gol_engines/commit/622bf9e2e28df26396b2a53d6811f89942d7b680)),
+[lifelib 2.5.9](https://gitlab.com/apgoucher/lifelib/-/tree/05632e382096925c0b1724fd59d2f0784f0213d6),
+and [Golly 5.0](https://golly.sourceforge.io/).
+Times are seconds for one update by `2^G` generations from the input, excluding file loading.
+Golly and lifelib use one core; columns 1–32 show GoL Engines at that many cores.
+Each implementation uses the same memory budget for a given pattern.
 
-Budget controls table sizes and GC frequency; RSS is measured process memory.
+**HashLife**
 
-The `complete_default.mc` input exactly matches the first frame of the
+| Pattern | G | Budget, GiB | Golly | lifelib | 1 | 2 | 4 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | 11 | 64 | 81.33 | 156.17 | 80.69 | 39.06 | 18.88 | 9.85 | 5.13 | 2.72 |
+| [Pi calculator](res/very_large_patterns/pi.mc.gz) | 31 | 16 | 4.38 | 3.82 | 2.76 | 2.30 | 2.17 | 2.16 | 2.41 | 2.83 |
+| [Demonoid](res/very_large_patterns/0hd-demonoid-p438852.mc.gz) | 20 | 16 | 47.47 | 130.91 | 63.61 | 28.95 | 14.41 | 7.72 | 4.33 | 2.75 |
+| [Caterloopillar](res/very_large_patterns/caterloopillar-c17.mc.gz) | 36 | 16 | 6.65 | 8.23 | 4.49 | 2.38 | 1.23 | 0.66 | 0.40 | 0.28 |
+| [Mersenne 44497](res/very_large_patterns/mersenne-44497.mc.gz) | 28 | 16 | 1.07 | 2.56 | 1.35 | 1.35 | 1.38 | 1.40 | 1.66 | 1.87 |
+
+**StreamLife**
+
+| Pattern | G | Budget, GiB | lifelib | 1 | 2 | 4 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | 11 | 64 | 32.90 | 18.20 | 9.34 | 4.81 | 2.67 | 1.52 | 0.97 |
+| [Pi calculator](res/very_large_patterns/pi.mc.gz) | 31 | 16 | 7.92 | 6.19 | 3.73 | 3.65 | 3.52 | 5.03 | 5.65 |
+| [Demonoid](res/very_large_patterns/0hd-demonoid-p438852.mc.gz) | 20 | 16 | 8.48 | 6.46 | 3.14 | 1.79 | 1.14 | 1.59 | 1.66 |
+| [Caterloopillar](res/very_large_patterns/caterloopillar-c17.mc.gz) | 36 | 16 | 18.98 | 12.54 | 6.10 | 3.20 | 1.67 | 1.04 | 0.62 |
+| [Mersenne 44497](res/very_large_patterns/mersenne-44497.mc.gz) | 28 | 16 | 5.53 | 3.59 | 2.65 | 3.27 | 3.32 | 4.61 | 5.04 |
+
+On the metaglider at G11, HashLife speeds up 29.6× from 1 to 32 cores; StreamLife speeds up 18.7×
+and remains faster in absolute time. Pi and Mersenne have limited parallelism and can slow down
+with more workers. Golly is fastest on Mersenne in this comparison.
+
+For a complete 0E0P metatick, StreamLife advances
+[`complete_default.mc`](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc)
+by `2^36` generations in **7 h 21 min**, with 45 workers, step `2^29`, a 160 GiB budget,
+and 158.23 GiB peak RSS. Budget controls table sizes and GC frequency; RSS is measured process memory.
+The input exactly matches the first frame of the
 [historical 0E0P timeline](https://conwaylife.com/forums/viewtopic.php?p=196996#p196996).
 Goucher [reported 30 days with StreamLife](https://conwaylife.com/forums/viewtopic.php?p=65620#p65620)
-for a full metatick (`2^36` generations) in 2018.
+for a full metatick in 2018.
