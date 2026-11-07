@@ -142,8 +142,7 @@ pub struct TaskFetcher<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> {
 impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
     /// Number of tasks to steal at once when work-stealing.
     const STEAL_BATCH_SIZE: usize = 1;
-    const INITIAL_WAIT_DURATION: Duration = Duration::from_micros(100);
-    const MAX_WAIT_DURATION: Duration = Duration::from_millis(100);
+    const IDLE_WAIT_DURATION: Duration = Duration::from_micros(100);
 
     pub fn new(
         thread_idx: usize,
@@ -186,7 +185,6 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
             return result;
         }
 
-        let mut duration = Self::INITIAL_WAIT_DURATION;
         while !(self.finish_condition)() && !(self.cancel_condition)() {
             // power of two choices - choosing a longer queue
             let (i, j) = (self.generate_random_index(), self.generate_random_index());
@@ -203,8 +201,7 @@ impl<'a, T: Send, F: Fn() -> bool, C: Fn() -> bool> TaskFetcher<'a, T, F, C> {
                 return Some(task);
             }
 
-            thread::sleep(duration);
-            duration = Self::MAX_WAIT_DURATION.min(duration * 2);
+            thread::sleep(Self::IDLE_WAIT_DURATION);
         }
 
         None
