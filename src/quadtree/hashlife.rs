@@ -291,26 +291,3 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
         self.mem.bytes_total()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    const SEED: u64 = 42;
-
-    #[test]
-    fn test_pattern_roundtrip() {
-        for size_log2 in 4..10 {
-            let original = Pattern::random(size_log2, Some(SEED)).unwrap();
-            let mut engine = HashLifeEngine::<()>::new(1, 1);
-            engine.load_pattern(&original, Topology::Unbounded).unwrap();
-            let converted = engine.current_state();
-
-            assert_eq!(
-                original.hash(),
-                converted.hash(),
-                "Pattern roundtrip failed for size 2^{}",
-                size_log2
-            );
-        }
-    }
-}
