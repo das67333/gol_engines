@@ -110,6 +110,7 @@ interruption and restart. Combined process time was approximately 7 h 21 min 18 
 segment's final timing/RSS record was lost at preemption, so its duration is estimated and
 158.23 GiB is the maximum recorded RSS. Post-run validation and transfers are excluded.
 All 128 S29 checkpoints were saved and reloaded; this checks persistence with the same engine.
+The full G36 evolution has not been independently verified.
 The metaglider also reached G36 with 128 saved checkpoints, but its full runtime was not measured.
 
 Adam P. Goucher [reported a 30-day StreamLife simulation of the 0E0P metacell](https://conwaylife.com/forums/viewtopic.php?p=65618#p65618)
