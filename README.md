@@ -81,9 +81,7 @@ Optional per-thread runtime statistics can be enabled with `--features cli_deps,
   and, on SMT machines, counts up to the logical CPU limit. Expensive patterns such as the Pi
   calculator can still have limited parallelism; measure elapsed time and CPU consumption.
 
-StreamLife attempts work-preserving GC internally. If recovery fails, the CLI can retry or reduce
-`S` by two (four times fewer generations per update). A smaller step may allow an update to fit,
-but can also lose useful memoization; compare complete runs when tuning it.
+The CLI may reduce the step for either engine if an update does not fit in memory.
 
 ## Performance
 
@@ -98,10 +96,9 @@ from the input; S means `2^S` generations per update.
 | [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | G27 / S27 | 64 | 32.2 s | 30.0 |
 | 0E0P metaglider | G29 / S26 | 128 | 626.7 s | 109.5 |
 | [Pi calculator](res/very_large_patterns/pi.mc.gz) | G28 / S28 | 8 | 2.24 s | 1.19 |
-| [0E0P complete_default.mc](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc) | G36 / S29 | 160 | ~7 h 21 min | 158.23 |
+| [0E0P complete_default.mc](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc) | G36 / S29 | 160 | 7 h 21 min | 158.23 |
 
-The short benchmarks report mean engine-update time over two runs with cold caches; G36 reports
-total computation time. Budget controls table sizes and GC frequency; RSS is measured process memory.
+Budget controls table sizes and GC frequency; RSS is measured process memory.
 
 The `complete_default.mc` input exactly matches the first frame of the
 [historical 0E0P timeline](https://conwaylife.com/forums/viewtopic.php?p=196996#p196996).
