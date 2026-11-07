@@ -85,8 +85,11 @@ The CLI may reduce the step for either engine if an update does not fit in memor
 
 ## Performance
 
-StreamLife on Google Cloud C3D (AMD EPYC 9B14), with 45 workers and process affinity restricted to
-one SMT thread on each of 45 physical cores. Engine sources match
+StreamLife benchmarks used a Google Cloud Spot (preemptible) `c3d-highcpu-90` VM in
+`australia-southeast1`: 90 vCPUs, 45 physical AMD EPYC 9B14 cores, and 180 GiB RAM.
+CPU and memory cost about US$0.40/hour ([Spot pricing](https://cloud.google.com/spot-vms/pricing));
+prices vary, and disk and network usage are billed separately. Runs used 45 workers, with process
+affinity restricted to one SMT thread on each physical core. Engine sources match
 [`b0ab6e7`](https://github.com/das67333/gol_engines/commit/b0ab6e76a703af93eb6df6a665203f4bc1840006);
 Rust 1.98 release build, statistics disabled, frame pointers enabled. G means `2^G` generations
 from the input; S means `2^S` generations per update.
