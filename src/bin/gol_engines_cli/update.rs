@@ -1,5 +1,5 @@
 use crate::util::{local_time, print_population};
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use clap::{Args, ValueEnum};
 use gol_engines::{GoLEngine, HashLifeEngine, Pattern, StreamLifeEngine};
 use num_bigint::BigInt;
@@ -62,12 +62,12 @@ enum Topology {
 
 pub(super) fn run_update(args: UpdateArgs) -> Result<()> {
     let step_log2 = args.step_log2.unwrap_or(args.gens_log2);
-    assert!(
+    ensure!(
         step_log2 <= args.gens_log2,
         "step_log2 cannot exceed gens_log2"
     );
-    assert!(args.workers > 0, "Number of workers must be greater than 0");
-    assert!(
+    ensure!(args.workers > 0, "Number of workers must be greater than 0");
+    ensure!(
         args.mem_limit_gib > 0,
         "Memory limit must be greater than 0"
     );
@@ -89,7 +89,7 @@ pub(super) fn run_update(args: UpdateArgs) -> Result<()> {
     );
 
     let timer = std::time::Instant::now();
-    let pattern = Pattern::from_file(&args.pattern).unwrap();
+    let pattern = Pattern::from_file(&args.pattern)?;
     engine.load_pattern(&pattern, topology)?;
     println!(
         "Loaded pattern in {:.1} secs",
@@ -108,8 +108,7 @@ pub(super) fn run_update(args: UpdateArgs) -> Result<()> {
     if args.population {
         print_population(&updated);
     }
-    updated.to_file(&args.output).unwrap();
-    Ok(())
+    updated.to_file(&args.output)
 }
 
 fn advance(gens_log2: u32, mut step_log2: u32, mut update: impl FnMut(u32) -> Result<()>) -> Result<()> {

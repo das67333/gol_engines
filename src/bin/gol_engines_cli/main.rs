@@ -29,9 +29,8 @@ fn main() -> anyhow::Result<()> {
     let args = CLIParser::parse();
 
     match args.action {
-        Action::Update(args) => run_update(args)?,
+        Action::Update(args) => run_update(args),
         Action::Metafy(args) => run_metafy(args),
         Action::Stats(args) => run_stats(args),
     }
-    Ok(())
 }

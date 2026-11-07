@@ -1,5 +1,6 @@
 use crate::util::print_population;
 use ahash::AHashSet;
+use anyhow::Result;
 use clap::Args;
 use gol_engines::{Pattern, PatternNode};
 
@@ -9,9 +10,9 @@ pub(super) struct StatsArgs {
     pattern: String,
 }
 
-pub(super) fn run_stats(args: StatsArgs) {
+pub(super) fn run_stats(args: StatsArgs) -> Result<()> {
     let timer = std::time::Instant::now();
-    let mut pattern = Pattern::from_file(&args.pattern).unwrap();
+    let mut pattern = Pattern::from_file(&args.pattern)?;
     pattern.expand(3); // expand to at least leaf size
     println!("Hash: 0x{:016x}", pattern.hash());
     print_population(&pattern);
@@ -20,6 +21,7 @@ pub(super) fn run_stats(args: StatsArgs) {
         "Computed stats in {:.1} secs",
         timer.elapsed().as_secs_f64()
     );
+    Ok(())
 }
 
 fn print_distibution(pattern: &Pattern) {
