@@ -64,9 +64,9 @@ pub trait GoLEngine {
     ///
     /// Returns an error if the engine experiences a recoverable failure during simulation,
     /// for example, overfills its non-growable hashtable. This can happen with
-    /// large patterns or high generation counts. If this error occurs, try reducing the
-    /// `generations_log2` value to process fewer generations at once. While it is
-    /// possible to handle it internally, it was decided to choose a more explicit approach.
+    /// large patterns or high generation counts. Engines may collect unused cache entries
+    /// and resume internally. If recovery fails, try reducing `generations_log2` to process
+    /// fewer generations at once, or increase the memory budget.
     ///
     /// It is guaranteed that in case of failure, the engine will store the pattern
     /// that it stored before the update.

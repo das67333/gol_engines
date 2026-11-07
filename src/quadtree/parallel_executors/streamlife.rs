@@ -33,7 +33,6 @@
 //! engines.
 
 mod recovery;
-use recovery::PausedWork;
 
 use super::{
     super::{
@@ -50,6 +49,7 @@ use super::{
     },
     parking::{Parking, Search},
     processing::{ActiveWork, ProcessingData},
+    recovery::PausedWork,
     task_queue::{TaskQueue, TaskStealer},
 };
 use crossbeam::{deque::Steal, sync::Parker};
@@ -160,7 +160,7 @@ impl<'a> StreamLifeExecutor<'a> {
         }
     }
 
-    pub fn run(&self, paused: Option<PausedWork>) -> Option<(Idx, Idx)> {
+    pub fn run(&self, paused: Option<PausedWork<ReadyTask>>) -> Option<(Idx, Idx)> {
         let num_threads = self.engine.base.threads_cnt;
         let timer = std::time::Instant::now();
         let bicache = &self.engine.bicache;
@@ -292,7 +292,7 @@ enum ChildResult {
     Pending,
 }
 
-enum ReadyTask {
+pub(in crate::quadtree) enum ReadyTask {
     Bi(BiTask),
     Hash(Task),
 }

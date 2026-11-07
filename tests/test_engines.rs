@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn test_streamlife_low_memory_updates_or_preserves_state_for_retry() {
+    fn test_low_memory_updates_or_preserves_state_for_retry() {
         let pattern = Pattern::random(8, Some(42)).unwrap();
         let expected = |step| {
             let mut reference = HashLifeEngine::new(64, 1);
@@ -140,15 +140,20 @@ mod tests {
         };
         let (expected_one, expected_large) = (expected(0), expected(10));
         for workers in [1, 2, 4, 8, 45] {
-            let mut engine = StreamLifeEngine::new(4, workers);
-            engine.load_pattern(&pattern, Topology::Unbounded).unwrap();
-            let before = engine.current_state().hash();
-            if engine.update(10).is_ok() {
-                assert_eq!(engine.current_state().hash(), expected_large, "workers={workers}");
-            } else {
-                assert_eq!(engine.current_state().hash(), before, "workers={workers} changed the saved pattern");
-                engine.update(0).unwrap();
-                assert_eq!(engine.current_state().hash(), expected_one, "workers={workers} retry differs from HashLife");
+            let engines: [Box<dyn GoLEngine>; 2] = [
+                Box::new(HashLifeEngine::new(4, workers)),
+                Box::new(StreamLifeEngine::new(4, workers)),
+            ];
+            for mut engine in engines {
+                engine.load_pattern(&pattern, Topology::Unbounded).unwrap();
+                let before = engine.current_state().hash();
+                if engine.update(10).is_ok() {
+                    assert_eq!(engine.current_state().hash(), expected_large, "workers={workers}");
+                } else {
+                    assert_eq!(engine.current_state().hash(), before, "workers={workers} changed the saved pattern");
+                    engine.update(0).unwrap();
+                    assert_eq!(engine.current_state().hash(), expected_one, "workers={workers} retry differs from HashLife");
+                }
             }
         }
     }
