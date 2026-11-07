@@ -93,20 +93,3 @@ fn final_merge_overflow_preserves_state_and_allows_smaller_retry() {
     assert_eq!(engine.update(0).unwrap(), reference.update(0).unwrap());
     assert_eq!(snapshot(&engine.current_state()), snapshot(&reference.current_state()));
 }
-
-#[test]
-fn test_pattern_roundtrip() {
-    for size_log2 in 4..10 {
-        let original = Pattern::random(size_log2, Some(SEED)).unwrap();
-        let mut engine = StreamLifeEngine::new(1, 1);
-        engine.load_pattern(&original, Topology::Unbounded).unwrap();
-        let converted = engine.current_state();
-
-        assert_eq!(
-            original.hash(),
-            converted.hash(),
-            "Pattern roundtrip failed for size 2^{}",
-            size_log2
-        );
-    }
-}

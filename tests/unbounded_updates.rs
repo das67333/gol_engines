@@ -30,9 +30,7 @@ fn advance(cells: &Cells) -> Cells {
     }
     neighbors
         .into_iter()
-        .filter_map(|(cell, count)| {
-            (count == 3 || (count == 2 && cells.contains(&cell))).then_some(cell)
-        })
+        .filter_map(|(cell, count)| (count == 3 || (count == 2 && cells.contains(&cell))).then_some(cell))
         .collect()
 }
 
@@ -44,6 +42,10 @@ fn unbounded_updates_preserve_growth_across_the_initial_boundary() {
     )
     .unwrap();
     for pattern in [glider, Pattern::random(5, Some(42)).unwrap()] {
+        let mut expected = vec![cells(&pattern, [0, 0])];
+        for _ in 0..32 {
+            expected.push(advance(expected.last().unwrap()));
+        }
         for workers in [1, 4] {
             for step in [0, 3, 5] {
                 let engines: Vec<Box<dyn GoLEngine>> = vec![
@@ -52,19 +54,15 @@ fn unbounded_updates_preserve_growth_across_the_initial_boundary() {
                 ];
                 for mut engine in engines {
                     engine.load_pattern(&pattern, Topology::Unbounded).unwrap();
-                    let mut expected = cells(&pattern, [0, 0]);
                     let mut shift = [0i64, 0];
-                    for _ in 0..(32 >> step) {
-                        for _ in 0..(1 << step) {
-                            expected = advance(&expected);
-                        }
+                    for generation in ((1 << step)..=32).step_by(1 << step) {
                         let delta = engine.update(step).unwrap();
                         for axis in 0..2 {
                             shift[axis] += i64::try_from(&delta[axis]).unwrap();
                         }
                         assert_eq!(
                             cells(&engine.current_state(), shift),
-                            expected,
+                            expected[generation],
                             "workers={workers}, step={step}"
                         );
                     }
