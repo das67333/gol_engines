@@ -28,7 +28,7 @@ large B3/S23 update across many CPU cores, with a Rust API and CLI. The
 [upstream StreamLife recursion](https://gitlab.com/apgoucher/lifelib/-/blob/05632e382096925c0b1724fd59d2f0784f0213d6/streamlife.h#L301-311)
 evaluates child problems sequentially; GoL Engines schedules independent work across threads sharing
 cached results. The benefit depends on the available parallelism in the pattern. The measurements
-below report GoL Engines performance; a current comparison with lifelib on the same hardware is still needed.
+below report GoL Engines performance.
 
 ## Build and use
 
