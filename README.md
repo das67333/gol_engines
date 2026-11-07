@@ -103,5 +103,7 @@ from the input; S means `2^S` generations per update.
 The short benchmarks report mean engine-update time over two runs with cold caches; G36 reports
 total computation time. Budget controls table sizes and GC frequency; RSS is measured process memory.
 
-Adam P. Goucher [reported a 30-day StreamLife simulation of the 0E0P metacell](https://conwaylife.com/forums/viewtopic.php?p=65618#p65618)
-in 2018.
+The `complete_default.mc` input exactly matches the first frame of the
+[historical 0E0P timeline](https://conwaylife.com/forums/viewtopic.php?p=196996#p196996).
+Goucher [reported 30 days with StreamLife](https://conwaylife.com/forums/viewtopic.php?p=65620#p65620)
+for a full metatick (`2^36` generations) in 2018.
