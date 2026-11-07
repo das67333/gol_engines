@@ -28,14 +28,16 @@ pub struct HashLifeEngine<Meta> {
 }
 
 impl<Meta: Default + Sync> HashLifeEngine<Meta> {
-    fn run_executor(&mut self) -> Option<Idx> {
+    fn run_executor(&mut self, rollback_root: (Idx, u32)) -> Option<Idx> {
         let mut paused = None;
         loop {
             let executor = HashLifeExecutor::new(self);
             if let Some(result) = executor.run(self.threads_cnt, paused.take()) {
                 return Some(result);
             }
-            let work = executor.paused_work();
+            let mut work = executor.paused_work();
+            // Framing need not retain the original root itself; keep it available for rollback.
+            work.roots.push(rollback_root);
             let before = self.mem.len();
             self.mem.mark(&work.roots, true);
             self.mem.sweep(true);
@@ -227,7 +229,7 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
         {
             self.run_gc();
         }
-        let backup = self.current_state();
+        let (root, size_log2) = (self.root, self.size_log2);
         self.generations_per_update_log2 = Some(generations_log2);
 
         let frames_cnt = self.frames_for_update(generations_log2);
@@ -236,11 +238,14 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
             self.add_frame(&mut dx, &mut dy);
         }
 
-        self.root = if let Some(x) = self.run_executor() {
+        self.root = if let Some(x) = self.run_executor((root, size_log2)) {
             x
         } else {
             HashLifeExecutor::new(self).discard_pending();
-            self.load_pattern(&backup, self.topology)?;
+            self.root = root;
+            self.size_log2 = size_log2;
+            self.run_gc();
+            self.generations_per_update_log2 = None;
             return Err(anyhow!(
                 "HashLifeAsync: overfilled NodeStore, try smaller step"
             ));
