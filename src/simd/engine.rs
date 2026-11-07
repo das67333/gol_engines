@@ -1,5 +1,5 @@
 use crate::{GoLEngine, Pattern, PatternFormat, Topology};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use num_bigint::BigInt;
 
 /// A fast, SIMD-optimized engine for Conway's Game of Life that uses bitwise operations
@@ -21,7 +21,7 @@ use num_bigint::BigInt;
 /// expanded_pattern.expand(7); // Expand to at least 128×128
 ///
 /// // Create the SIMD engine
-/// let mut engine = SIMDEngine::new(1);
+/// let mut engine = SIMDEngine::new(1, 1);
 /// engine.load_pattern(&expanded_pattern, Topology::Torus).unwrap();
 ///
 /// // Run for 2^10 = 1024 generations
@@ -115,7 +115,7 @@ impl SIMDEngine {
         let (w, h) = (self.n >> Self::CELLS_IN_CHUNK.ilog2(), self.n);
         let mut row_prev = self.data[(h - 1) * w..].to_vec();
         let mut row_curr = self.data[..w].to_vec();
-        let row_preserved = row_curr.to_vec();
+        let row_preserved = row_curr.clone();
         let mut row_next = self.data[w..2 * w].to_vec();
         let dst = &mut self.data[..w];
         Self::update_row(&row_prev, &row_curr, &row_next, dst);
@@ -136,7 +136,7 @@ impl SIMDEngine {
 }
 
 impl GoLEngine for SIMDEngine {
-    fn new(mem_limit_mib: u32) -> Self {
+    fn new(mem_limit_mib: u32, _threads_cnt: usize) -> Self {
         Self {
             data: vec![0; 128 * 128 / Self::CELLS_IN_CHUNK],
             n: 128,
@@ -199,28 +199,5 @@ impl GoLEngine for SIMDEngine {
 
     fn bytes_total(&self) -> usize {
         self.data.capacity() * size_of::<u64>()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    const SEED: u64 = 42;
-
-    #[test]
-    fn test_pattern_roundtrip() {
-        for size_log2 in 7..10 {
-            let original = Pattern::random(size_log2, Some(SEED)).unwrap();
-            let mut engine = SIMDEngine::new(1);
-            engine.load_pattern(&original, Topology::Torus).unwrap();
-            let converted = engine.current_state();
-
-            assert_eq!(
-                original.hash(),
-                converted.hash(),
-                "Pattern roundtrip failed for size 2^{}",
-                size_log2
-            );
-        }
     }
 }

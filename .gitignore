@@ -1,4 +1,5 @@
 .venv/
-target/
+target*
 perf.data*
 Cargo.lock
+Launch_*

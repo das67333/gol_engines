@@ -1,39 +1,59 @@
 use gol_engines::*;
 use num_bigint::BigInt;
-use std::sync::atomic::*;
+
+const POP_REF: u64 = 93_235_805;
+const REPS: usize = 1;
+
+struct EngineConfig {
+    mem_mib: u32,
+    gens_log2: u32,
+}
+
+const HASHLIFE_CFG: EngineConfig = EngineConfig {
+    mem_mib: 20 * 1024,
+    gens_log2: 12,
+};
+
+const STREAMLIFE_CFG: EngineConfig = EngineConfig {
+    mem_mib: 20 * 1024,
+    gens_log2: 18,
+};
+
+fn run_bench<E: GoLEngine>(name: &str, cfg: &EngineConfig, threads: usize, pattern: &Pattern) {
+    let mut engine = E::new(cfg.mem_mib, threads);
+    engine.load_pattern(pattern, Topology::Unbounded).unwrap();
+    for rep in 1..=REPS {
+        println!(
+            "\n========== {} threads={} mem={}GiB gens_log2={} rep={}/{} ==========",
+            name,
+            threads,
+            cfg.mem_mib / 1024,
+            cfg.gens_log2,
+            rep,
+            REPS
+        );
+        engine.update(cfg.gens_log2).unwrap();
+        let st = engine.current_state();
+        println!(
+            "Population: {}  Hash: 0x{:016x}",
+            st.population(),
+            st.hash()
+        );
+        engine.run_gc();
+    }
+}
 
 fn main() {
-    let timer = std::time::Instant::now();
-    let mut engine = StreamLifeEngineAsync::new(4 << 10);
-    println!("Time spent on initializing engine: {:?}", timer.elapsed());
+    let threads_list = [6];
+
     let pattern = Pattern::from_file("res/very_large_patterns/0e0p-metaglider.mc.gz").unwrap();
+    assert_eq!(pattern.population(), BigInt::from(POP_REF));
 
-    for workers in 8..=8 {
-        // [2, 4, 8, 12, 16, 20, 24, 32, 40, 48] {
-        WORKER_THREADS.store(workers, Ordering::Relaxed);
-        println!("Using {} worker threads", workers);
+    for &threads in &threads_list {
+        run_bench::<HashLifeEngine>("HashLife", &HASHLIFE_CFG, threads, &pattern);
+    }
 
-        let timer = std::time::Instant::now();
-        engine.load_pattern(&pattern, Topology::Unbounded).unwrap();
-        assert_eq!(pattern.population(), BigInt::from(93_235_805));
-        println!("Time spent on loading pattern: {:?}", timer.elapsed());
-
-        let timer = std::time::Instant::now();
-        let gens_log2 = 10;
-        engine.update(gens_log2).unwrap();
-        println!(
-            "Time on updating pattern by 2^{} generations: {:?}",
-            gens_log2,
-            timer.elapsed()
-        );
-
-        let updated = engine.current_state();
-        println!(
-            "TASKS_SPAWN_COUNT: {}",
-            TASKS_SPAWN_COUNT.swap(0, Ordering::Relaxed)
-        );
-        println!("Population: {}", updated.population());
-        println!("Hash: 0x{:016x}", updated.hash());
-        // assert_eq!(updated.hash(), 0x6cf9bfab4d7fdaef);
+    for &threads in &threads_list {
+        run_bench::<StreamLifeEngine>("StreamLife", &STREAMLIFE_CFG, threads, &pattern);
     }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "gol_engines"
-version = "0.2.1"
-edition = "2021"
+version = "0.3.0"
+edition = "2024"
 description = "Tools for Conway's Game of Life"
 repository = "https://github.com/das67333/gol_engines"
 readme = "README.md"
@@ -9,10 +9,14 @@ authors = ["Suleiman Kazimov <solomon67334@gmail.com>"]
 license = "GPL-3.0"
 keywords = ["game-of-life", "simd", "hashlife", "streamlife"]
 categories = ["algorithms", "concurrency", "simulation"]
-include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE", "LICENSES/*.txt"]
 
 [features]
+# Gather and print per-thread runtime statistics.
+# Opt in with `--features statistics`; otherwise the recording/printing code paths are eliminated entirely.
+statistics = []
 cli_deps = ["chrono", "clap", "num-format"]
+# default = ["statistics"]
 
 [[bin]]
 name = "gol_engines_cli"
@@ -27,11 +31,13 @@ name = "bench_dev"
 [dependencies]
 ahash = "0.8"
 anyhow = "1.0"
+crossbeam = "0.8"
 flate2 = "1.1"
+mimalloc = "0.1"
 num-bigint = "0.4"
 rand = "0.9"
 rand_chacha = "0.9"
-tokio = { version = "1.44", features = ["rt-multi-thread", "sync"] }
+smallvec = "1.15"
 
 chrono = { version = "0.4", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
@@ -39,8 +45,24 @@ num-format = { version = "0.4", features = [
     "with-num-bigint",
 ], optional = true }
 
-[dev-dependencies]
-serial_test = "3.2"
-
 [profile.release]
-debug = true
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+criterion = "0.7"
+libc = "0.2"
+
+[[bench]]
+name = "channel_throughput"
+harness = false
+
+[[bench]]
+name = "measure_duration"
+harness = false
+
+[[bench]]
+name = "atomic_operations"
+harness = false

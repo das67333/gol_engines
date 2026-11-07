@@ -1,9 +1,9 @@
 use crate::VERSION;
 use ahash::AHashMap as HashMap;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use flate2::{
-    read::{GzDecoder, GzEncoder},
     Compression,
+    read::{GzDecoder, GzEncoder},
 };
 use num_bigint::BigInt;
 use rand::{Rng, SeedableRng};
@@ -62,7 +62,7 @@ type SizeLog2 = u32;
 ///
 /// If you encounter issues loading patterns that work in Golly and should work here,
 /// the file might not conform to the format specifications detailed at
-/// https://golly.sourceforge.io/Help/formats.html.
+/// <https://golly.sourceforge.io/Help/formats.html>.
 /// Try opening the problematic pattern in a modern version of Golly and saving it again
 /// to ensure it meets the expected format requirements.
 ///
@@ -91,14 +91,34 @@ pub struct Pattern {
     size_log2: SizeLog2,
     /// Storage for the quadtree nodes.
     kiv: KIVMap,
-    /// Caches blank nodes for faster search.
-    blank_nodes: Vec<NodeIdx>,
 }
 
 impl Pattern {
+    /// Creates a new empty pattern. It initializes an 8x8 empty grid.
+    ///
+    /// # Arguments
+    /// * `approx_size_log2` - An optional hint for the approximate size of the
+    ///   pattern. If provided, the internal [`KIVMap`] pre-allocates blank nodes
+    ///   up to that size to speed up future access.
+    #[must_use] 
+    pub fn new(approx_size_log2: Option<SizeLog2>) -> Self {
+        let mut kiv = KIVMap::new();
+        // fill cache of blank nodes
+        if let Some(size_log2) = approx_size_log2 {
+            kiv.find_or_create_blank_node(size_log2);
+        }
+
+        Self {
+            root: kiv.find_or_create_node(PatternNode::Leaf(0)),
+            size_log2: 3,
+            kiv,
+        }
+    }
+
     /// Returns the root node index of the pattern.
     ///
     /// The root node represents the top-level quadtree node covering the entire pattern.
+    #[must_use] 
     pub fn get_root(&self) -> NodeIdx {
         self.root
     }
@@ -108,7 +128,7 @@ impl Pattern {
     /// # Safety
     ///
     /// This function is unsafe because it requires the caller to ensure:
-    /// - `root` is a valid node index that exists in the pattern's KIVMap
+    /// - `root` is a valid node index that exists in the pattern's `KIVMap`
     /// - `size_log2` correctly represents the size of the new root node
     ///
     /// # Arguments
@@ -122,7 +142,7 @@ impl Pattern {
 
     /// Finds an existing node with the given content or creates a new one.
     ///
-    /// This method delegates to the internal KIVMap to find or create a node,
+    /// This method delegates to the internal `KIVMap` to find or create a node,
     /// maintaining the pattern's node deduplication property.
     ///
     /// # Arguments
@@ -140,6 +160,7 @@ impl Pattern {
     ///
     /// The pattern is always square with side length of `2^size_log2`.
     /// For example, a pattern with `size_log2 = 3` is 8x8 cells.
+    #[must_use] 
     pub fn get_size_log2(&self) -> SizeLog2 {
         self.size_log2
     }
@@ -153,6 +174,7 @@ impl Pattern {
     /// # Returns
     ///
     /// A reference to the requested `PatternNode`.
+    #[must_use] 
     pub fn get_node(&self, idx: NodeIdx) -> &PatternNode {
         self.kiv.get_node(idx)
     }
@@ -168,6 +190,7 @@ impl Pattern {
     /// # Returns
     ///
     /// A 64-bit hash value for the pattern.
+    #[must_use] 
     pub fn hash(&self) -> u64 {
         fn inner(idx: NodeIdx, cache: &mut HashMap<NodeIdx, u64>, kiv: &KIVMap) -> u64 {
             if let Some(&val) = cache.get(&idx) {
@@ -176,22 +199,22 @@ impl Pattern {
 
             let combine = |x: u64, y: u64| -> u64 {
                 x ^ y
-                    .wrapping_add(0x9e3779b9)
+                    .wrapping_add(0x9e37_79b9)
                     .wrapping_add(x << 6)
                     .wrapping_add(x >> 2)
             };
 
+            let mut result = 0;
             match kiv.get_node(idx) {
-                PatternNode::Leaf(cells) => *cells,
+                PatternNode::Leaf(cells) => result = *cells,
                 PatternNode::Node { nw, ne, sw, se } => {
-                    let mut result = 0;
                     for x in [*nw, *ne, *sw, *se] {
                         result = combine(result, inner(x, cache, kiv));
                     }
-                    cache.insert(idx, result);
-                    result
                 }
             }
+            cache.insert(idx, result);
+            result
         }
 
         let mut cache = HashMap::new();
@@ -207,6 +230,7 @@ impl Pattern {
     ///
     /// A `BigInt` representing the total number of alive cells, which can
     /// be arbitrarily large for very large patterns.
+    #[must_use] 
     pub fn population(&self) -> BigInt {
         fn inner<'a>(idx: NodeIdx, cache: &'a mut HashMap<NodeIdx, BigInt>, kiv: &'a KIVMap) {
             let result = match kiv.get_node(idx) {
@@ -266,11 +290,7 @@ impl Pattern {
         }
         self.size_log2 = self.size_log2.max(3);
         while self.size_log2 < size_log2 {
-            let blank = Self::find_or_create_blank_node(
-                self.size_log2,
-                &mut self.kiv,
-                &mut self.blank_nodes,
-            );
+            let blank = self.kiv.find_or_create_blank_node(self.size_log2);
 
             self.root = self.kiv.find_or_create_node(PatternNode::Node {
                 nw: self.root,
@@ -311,7 +331,7 @@ impl Pattern {
         .fill(&mut cells[..]);
         if size_log2 < 3 {
             // clear the upper bits
-            for x in cells.iter_mut() {
+            for x in &mut cells {
                 *x &= ((1u32 << n) - 1) as u8;
             }
         }
@@ -352,24 +372,6 @@ impl Pattern {
     /// - `metacells[0].size_log2` does not equal `metacells[1].size_log2`
     /// - metacells are smaller than 8x8
     pub fn metafy(&self, metacells: [&Pattern; 2], level: u32) -> Result<Self> {
-        if metacells[0].size_log2 != metacells[1].size_log2 {
-            return Err(anyhow!(
-                "Metacells must have the same size_log2: {} != {}",
-                metacells[0].size_log2,
-                metacells[1].size_log2
-            ));
-        }
-        if metacells[0].size_log2 < 3 {
-            return Err(anyhow!(
-                "Metacell size_log2 must be at least 3: {}",
-                metacells[0].size_log2
-            ));
-        }
-
-        if level == 0 {
-            return Ok(self.clone());
-        }
-
         fn copy_from_pattern(
             idx: NodeIdx,
             pattern: &Pattern,
@@ -391,14 +393,6 @@ impl Pattern {
             };
             cache.insert(idx, result);
             result
-        }
-
-        let mut kiv = KIVMap::new();
-        let mut cache = HashMap::new();
-        let mut metacell_idx = [0; 2];
-        for (src, dst) in metacells.iter().zip(metacell_idx.iter_mut()) {
-            *dst = copy_from_pattern(src.root, src, &mut kiv, &mut cache);
-            cache.clear();
         }
 
         fn build_pattern_from_metacells(
@@ -469,6 +463,32 @@ impl Pattern {
             result
         }
 
+        if metacells[0].size_log2 != metacells[1].size_log2 {
+            return Err(anyhow!(
+                "Metacells must have the same size_log2: {} != {}",
+                metacells[0].size_log2,
+                metacells[1].size_log2
+            ));
+        }
+        if metacells[0].size_log2 < 3 {
+            return Err(anyhow!(
+                "Metacell size_log2 must be at least 3: {}",
+                metacells[0].size_log2
+            ));
+        }
+
+        if level == 0 {
+            return Ok(self.clone());
+        }
+
+        let mut kiv = KIVMap::new();
+        let mut cache = HashMap::new();
+        let mut metacell_idx = [0; 2];
+        for (src, dst) in metacells.iter().zip(metacell_idx.iter_mut()) {
+            *dst = copy_from_pattern(src.root, src, &mut kiv, &mut cache);
+            cache.clear();
+        }
+
         for _ in 0..level - 1 {
             metacell_idx = [0, 1].map(|i| {
                 let result = build_pattern_from_metacells(
@@ -489,7 +509,6 @@ impl Pattern {
             root,
             size_log2: self.size_log2 + level * metacells[0].size_log2,
             kiv,
-            blank_nodes: vec![],
         })
     }
 
@@ -574,17 +593,13 @@ impl Pattern {
     /// - Format-specific errors occur from `from_format`
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let data = fs::read(path).with_context(|| format!("Failed to read file: {:?}", path))?;
+        let data = fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
 
         if path.extension() == Some("mc".as_ref()) {
             return Self::from_format(PatternFormat::Macrocell, &data);
         }
 
-        if path
-            .to_str()
-            .map(|s| s.ends_with(".mc.gz"))
-            .unwrap_or(false)
-        {
+        if path.to_str().is_some_and(|s| s.ends_with(".mc.gz")) {
             return Self::from_format(PatternFormat::CompressedMacrocell, &data);
         }
 
@@ -623,11 +638,7 @@ impl Pattern {
 
         let format = if path.extension() == Some("mc".as_ref()) {
             PatternFormat::Macrocell
-        } else if path
-            .to_str()
-            .map(|s| s.ends_with(".mc.gz"))
-            .unwrap_or(false)
-        {
+        } else if path.to_str().is_some_and(|s| s.ends_with(".mc.gz")) {
             PatternFormat::CompressedMacrocell
         } else if path.extension() == Some("rle".as_ref()) {
             PatternFormat::RLE
@@ -636,7 +647,7 @@ impl Pattern {
         };
 
         let data = self.to_format(format)?;
-        fs::write(path, data).with_context(|| format!("Failed to write file: {:?}", path))
+        fs::write(path, data).with_context(|| format!("Failed to write file: {}", path.display()))
     }
 
     /// Creates a pattern from packed cell data. See [`PatternFormat::PackedCells`].
@@ -656,7 +667,7 @@ impl Pattern {
         if data.is_empty() {
             return Err(anyhow!("Packed cells are empty"));
         }
-        let size_log2 = data.len().ilog2().min((data.len().ilog2() + 3) / 2);
+        let size_log2 = data.len().ilog2().min(u32::midpoint(data.len().ilog2(), 3));
         let n = 1usize << size_log2;
         if data.len() != (n * n).div_ceil(8).max(n) {
             return Err(anyhow!(
@@ -665,7 +676,7 @@ impl Pattern {
         }
 
         if size_log2 < 3 {
-            for x in data.iter() {
+            for x in data {
                 if *x & !((1u32 << n) - 1) as u8 != 0 {
                     return Err(anyhow!("Found cells out of bounds"));
                 }
@@ -706,7 +717,6 @@ impl Pattern {
             root: nodes_curr[0],
             size_log2,
             kiv,
-            blank_nodes: vec![],
         })
     }
 
@@ -773,7 +783,6 @@ impl Pattern {
     /// - A rule other than B3/S23 is specified
     fn from_macrocell(data: &[u8]) -> Result<Self> {
         let mut kiv = KIVMap::new();
-        let mut blank_nodes = vec![];
         let mut codes_and_sizes = HashMap::<u32, (NodeIdx, SizeLog2)>::new();
         let mut last_code_and_size = None;
 
@@ -827,11 +836,7 @@ impl Pattern {
 
                 let mut resolve = |x: u32| -> Result<NodeIdx> {
                     if x == 0 {
-                        Ok(Self::find_or_create_blank_node(
-                            numbers[0] - 1,
-                            &mut kiv,
-                            &mut blank_nodes,
-                        ))
+                        Ok(kiv.find_or_create_blank_node(numbers[0] - 1))
                     } else {
                         let (code, size_log2) =
                             codes_and_sizes.get(&x).copied().ok_or_else(|| {
@@ -880,7 +885,7 @@ impl Pattern {
                                 "Invalid symbol '{}' in leaf {}",
                                 c as char,
                                 String::from_utf8_lossy(s)
-                            ))
+                            ));
                         }
                     }
                 }
@@ -896,7 +901,6 @@ impl Pattern {
             root,
             size_log2,
             kiv,
-            blank_nodes,
         })
     }
 
@@ -916,7 +920,6 @@ impl Pattern {
             idx: NodeIdx,
             size_log2: SizeLog2,
             codes: &mut HashMap<NodeIdx, usize>,
-            blank_nodes: &mut Vec<NodeIdx>,
             result: &mut Vec<u8>,
         ) -> usize {
             // if already serialized
@@ -924,10 +927,8 @@ impl Pattern {
                 return x;
             }
             // if node is blank
-            if let Some(x) = Pattern::find_blank_node(size_log2, &this.kiv, blank_nodes) {
-                if x == idx {
-                    return 0;
-                }
+            if this.kiv.find_blank_node(size_log2) == Some(idx) {
+                return 0;
             }
 
             match *this.get_node(idx) {
@@ -954,10 +955,10 @@ impl Pattern {
                     let new_line = format!(
                         "{} {} {} {} {}\n",
                         size_log2,
-                        inner(this, nw, size_log2 - 1, codes, blank_nodes, result),
-                        inner(this, ne, size_log2 - 1, codes, blank_nodes, result),
-                        inner(this, sw, size_log2 - 1, codes, blank_nodes, result),
-                        inner(this, se, size_log2 - 1, codes, blank_nodes, result),
+                        inner(this, nw, size_log2 - 1, codes, result),
+                        inner(this, ne, size_log2 - 1, codes, result),
+                        inner(this, sw, size_log2 - 1, codes, result),
+                        inner(this, se, size_log2 - 1, codes, result),
                     );
                     result.extend_from_slice(new_line.as_bytes());
                 }
@@ -966,23 +967,13 @@ impl Pattern {
             codes.len()
         }
 
-        let mut blank_nodes = self.blank_nodes.clone();
-        if let Some(x) = Self::find_blank_node(self.size_log2, &self.kiv, &mut blank_nodes) {
-            if x == self.root {
-                return Err(anyhow!("Cannot serialize blank pattern"));
-            }
+        if self.kiv.find_blank_node(self.size_log2) == Some(self.root) {
+            return Err(anyhow!("Cannot serialize blank pattern"));
         }
 
         let mut codes = HashMap::new();
         let mut result = format!("[M2] (gol_engines {VERSION})\n#R B3/S23\n").into_bytes();
-        inner(
-            self,
-            self.root,
-            self.size_log2,
-            &mut codes,
-            &mut blank_nodes,
-            &mut result,
-        );
+        inner(self, self.root, self.size_log2, &mut codes, &mut result);
 
         Ok(result)
     }
@@ -1077,7 +1068,7 @@ impl Pattern {
         // Parse header
         if let Some(line) = lines.next() {
             // Parse x, y and rule
-            let mut parts = line.split(|&b| b == b',').map(|x| x.trim_ascii());
+            let mut parts = line.split(|&b| b == b',').map(<[u8]>::trim_ascii);
 
             let extract_value = |part: &[u8], expected_key: &[u8]| {
                 let mut items = part.split(|&b| b == b'=');
@@ -1291,103 +1282,6 @@ impl Pattern {
 
         Ok(result)
     }
-
-    /// Finds or creates a blank node (containing all dead cells) of the
-    /// specified size.
-    ///
-    /// This is an internal utility method used to efficiently represent empty
-    /// regions in the quadtree.
-    ///
-    /// # Arguments
-    ///
-    /// * `size_log2` - Log base 2 of the node's side length.
-    /// * `kiv` - The key-index-value map storing the pattern nodes.
-    /// * `blank_nodes` - Cache of previously created blank nodes of different sizes.
-    ///
-    /// # Returns
-    ///
-    /// The index of the found or newly created blank node.
-    fn find_or_create_blank_node(
-        size_log2: SizeLog2,
-        kiv: &mut KIVMap,
-        blank_nodes: &mut Vec<NodeIdx>,
-    ) -> NodeIdx {
-        let i = (size_log2.max(3) - 3) as usize;
-        while blank_nodes.len() <= i {
-            let next = if let Some(&b) = blank_nodes.last() {
-                PatternNode::Node {
-                    nw: b,
-                    ne: b,
-                    sw: b,
-                    se: b,
-                }
-            } else {
-                PatternNode::Leaf(0)
-            };
-            blank_nodes.push(kiv.find_or_create_node(next));
-        }
-        blank_nodes[i]
-    }
-
-    /// Finds a blank node (containing all dead cells) of the specified size.
-    ///
-    /// Similar to `find_or_create_blank_node`, but returns `None` if the node doesn't
-    /// already exist in the provided `kiv`. This allows the function to take a
-    /// const reference to `KIVMap` rather than requiring a mutable reference.
-    ///
-    /// # Arguments
-    ///
-    /// * `size_log2` - Log base 2 of the node's side length.
-    /// * `kiv` - The key-index-value map storing the pattern nodes (immutable).
-    /// * `blank_nodes` - Cache of previously created blank nodes of different sizes.
-    ///
-    /// # Returns
-    ///
-    /// An `Option` containing the index of the found blank node, or `None` if
-    /// the requested blank node doesn't exist in the `kiv`.
-    fn find_blank_node(
-        size_log2: SizeLog2,
-        kiv: &KIVMap,
-        blank_nodes: &mut Vec<NodeIdx>,
-    ) -> Option<NodeIdx> {
-        let i = (size_log2.max(3) - 3) as usize;
-        if let Some(&b) = blank_nodes.get(i) {
-            return Some(b);
-        }
-        let i = (size_log2.max(3) - 3) as usize;
-        while blank_nodes.len() <= i {
-            let next = if let Some(&b) = blank_nodes.last() {
-                PatternNode::Node {
-                    nw: b,
-                    ne: b,
-                    sw: b,
-                    se: b,
-                }
-            } else {
-                PatternNode::Leaf(0)
-            };
-            if let Some(k) = kiv.find_node(next) {
-                blank_nodes.push(k);
-            } else {
-                return None;
-            }
-        }
-        Some(blank_nodes[i])
-    }
-}
-
-impl Default for Pattern {
-    /// Creates a new empty pattern with the following properties:
-    /// - An 8x8 empty grid (size_log2 = 3)
-    fn default() -> Self {
-        let mut kiv = KIVMap::new();
-        Self {
-            root: kiv.find_or_create_node(PatternNode::Leaf(0)),
-            size_log2: 3,
-            kiv: KIVMap::new(),
-            blank_nodes: vec![],
-        }
-    }
 }
 
 /// A node is either a leaf (8x8 cells) or a non-leaf (4x4 nodes).
@@ -1405,7 +1299,7 @@ pub enum PatternNode {
 
 impl PatternNode {
     /// Fast yet effective hash function.
-    /// It is used for indexing nodes in the KIVMap.
+    /// It is used for indexing nodes in the `KIVMap`.
     fn hash(&self) -> u32 {
         let h = match self {
             PatternNode::Leaf(cells) => (cells ^ (cells >> 32)) as u32,
@@ -1426,7 +1320,7 @@ impl PatternNode {
 /// 2. By content: find a node with specific content orcreate a new one if
 ///    it doesn't exist
 ///
-/// KIVMap is an essential component of the Pattern's quadtree implementation,
+/// `KIVMap` is an essential component of the Pattern's quadtree implementation,
 /// providing node deduplication to reduce memory usage in large patterns.
 ///
 /// # Implementation Details
@@ -1440,12 +1334,13 @@ impl PatternNode {
 /// # Panics
 ///
 /// Panics on running out of indexes (when the number of nodes exceeds
-/// the maximum value of NodeIdx).
+/// the maximum value of `NodeIdx`).
 #[derive(Clone)]
 struct KIVMap {
     hashmap_chains: Vec<NodeIdx>,
     storage: Vec<NodeAndNext>,
-    capacity_log2: u32,
+    /// Caches blank nodes for faster search.
+    blank_nodes: Vec<NodeIdx>,
 }
 
 #[derive(Clone, Copy)]
@@ -1467,7 +1362,7 @@ impl KIVMap {
         KIVMap {
             hashmap_chains: vec![0; 1 << Self::INITIAL_CAPACITY_LOG2],
             storage,
-            capacity_log2: Self::INITIAL_CAPACITY_LOG2,
+            blank_nodes: vec![],
         }
     }
 
@@ -1503,17 +1398,19 @@ impl KIVMap {
             node,
             next: self.hashmap_chains[i],
         });
-        let idx = (self.storage.len() - 1).try_into().expect("Index overflow");
+        let idx = (self.storage.len() - 1)
+            .try_into()
+            .expect("KIVMap NodeIdx overflow");
         self.hashmap_chains[i] = idx;
-        if self.storage.len() > self.hashmap_chains.len() && self.capacity_log2 != u32::BITS {
+        if self.storage.len() > self.hashmap_chains.len() {
             self.rehash();
         }
         idx
     }
 
     fn rehash(&mut self) {
-        self.capacity_log2 += 1;
         let new_size = self.hashmap_chains.len() * 2;
+        assert!(new_size <= 1 << 32, "KIVMap NodeIdx overflow");
         let mut new_chains = vec![0; new_size];
         for &chain in &self.hashmap_chains {
             let mut curr = chain as usize;
@@ -1527,6 +1424,78 @@ impl KIVMap {
             }
         }
         self.hashmap_chains = new_chains;
+    }
+
+    /// Finds or creates a blank node (containing all dead cells) of the
+    /// specified size.
+    ///
+    /// This is an internal utility method used to efficiently represent empty
+    /// regions in the quadtree.
+    ///
+    /// # Arguments
+    ///
+    /// * `size_log2` - Log base 2 of the node's side length.
+    /// * `kiv` - The key-index-value map storing the pattern nodes.
+    /// * `blank_nodes` - Cache of previously created blank nodes of different sizes.
+    ///
+    /// # Returns
+    ///
+    /// The index of the found or newly created blank node.
+    fn find_or_create_blank_node(&mut self, size_log2: SizeLog2) -> NodeIdx {
+        let i = (size_log2.max(3) - 3) as usize;
+        while self.blank_nodes.len() <= i {
+            let next = if let Some(&b) = self.blank_nodes.last() {
+                PatternNode::Node {
+                    nw: b,
+                    ne: b,
+                    sw: b,
+                    se: b,
+                }
+            } else {
+                PatternNode::Leaf(0)
+            };
+            let idx = self.find_or_create_node(next);
+            self.blank_nodes.push(idx);
+        }
+        self.blank_nodes[i]
+    }
+
+    /// Finds a blank node (containing all dead cells) of the specified size.
+    ///
+    /// Similar to `find_or_create_blank_node`, but returns `None` if the node doesn't
+    /// already exist in the provided `kiv`. This allows the function to take a
+    /// const reference to `KIVMap` rather than requiring a mutable reference.
+    ///
+    /// # Arguments
+    ///
+    /// * `size_log2` - Log base 2 of the node's side length.
+    /// * `kiv` - The key-index-value map storing the pattern nodes (immutable).
+    /// * `blank_nodes` - Cache of previously created blank nodes of different sizes.
+    ///
+    /// # Returns
+    ///
+    /// An `Option` containing the index of the found blank node, or `None` if
+    /// the requested blank node doesn't exist in the `kiv`.
+    fn find_blank_node(&self, size_log2: SizeLog2) -> Option<NodeIdx> {
+        let i = (size_log2.max(3) - 3) as usize;
+        if let Some(&b) = self.blank_nodes.get(i) {
+            return Some(b);
+        }
+
+        let (n, mut last) = if let Some(&b) = self.blank_nodes.last() {
+            (self.blank_nodes.len(), b)
+        } else {
+            (1, self.find_node(PatternNode::Leaf(0))?)
+        };
+        for _ in n..=i {
+            last = self.find_node(PatternNode::Node {
+                nw: last,
+                ne: last,
+                sw: last,
+                se: last,
+            })?;
+        }
+        Some(last)
     }
 }
 
@@ -1560,299 +1529,4 @@ pub enum PatternFormat {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    const SEED: u64 = 42;
-    // for simple patterns
-    const HUGE_SIZE_LOG2_LIMIT: SizeLog2 = 300;
-    // for conversions from/to packed cells
-    const MEDIUM_SIZE_LOG2_LIMIT: SizeLog2 = 10;
-
-    fn repeat_leaf(leaf: u64, size_log2: SizeLog2) -> Pattern {
-        let mut kiv = KIVMap::new();
-        let cells = if size_log2 >= 3 {
-            leaf
-        } else {
-            let mut x = leaf.to_le_bytes();
-            for i in 0..1 << size_log2 {
-                x[i] &= ((1u32 << (1 << size_log2)) - 1) as u8;
-            }
-            for i in (1 << size_log2)..8 {
-                x[i] = 0;
-            }
-            u64::from_le_bytes(x)
-        };
-        let mut node = kiv.find_or_create_node(PatternNode::Leaf(cells));
-        for _ in 3..size_log2 {
-            node = kiv.find_or_create_node(PatternNode::Node {
-                nw: node,
-                ne: node,
-                sw: node,
-                se: node,
-            });
-        }
-        Pattern {
-            root: node,
-            size_log2,
-            kiv,
-            blank_nodes: vec![],
-        }
-    }
-
-    #[test]
-    fn test_population_blank() {
-        for size_log2 in 0..HUGE_SIZE_LOG2_LIMIT {
-            // all cells are dead
-            let pattern = repeat_leaf(0, size_log2);
-            assert_eq!(pattern.population(), BigInt::ZERO);
-        }
-    }
-
-    #[test]
-    fn test_population_sparse() {
-        for size_log2 in 0..HUGE_SIZE_LOG2_LIMIT {
-            // one alive cell per leaf
-            let pattern = repeat_leaf(1, size_log2);
-            assert_eq!(
-                pattern.population(),
-                BigInt::from(1u64) << (size_log2.max(3) - 3) * 2
-            );
-        }
-    }
-
-    #[test]
-    fn test_population_full() {
-        for size_log2 in 0..HUGE_SIZE_LOG2_LIMIT {
-            // all cells are alive
-            let pattern = repeat_leaf(u64::MAX, size_log2);
-            assert_eq!(pattern.population(), BigInt::from(1u64) << (size_log2 * 2));
-        }
-    }
-
-    #[test]
-    fn test_metafy_glider() {
-        // Create a glider pattern (4x4)
-        let glider = Pattern::from_rle(b"x = 3, y = 3, rule = B3/S23\nbo$2bo$3o!").unwrap();
-
-        // Create metacells where ON is a smaller glider and OFF is empty
-        let off_metacell = repeat_leaf(0, 3); // All dead cells
-        let on_metacell =
-            Pattern::from_packed_cells(&[0b00100000, 0b00010000, 0b01110000, 0, 0, 0, 0, 0])
-                .unwrap();
-
-        // Metafy with level 1
-        let metafied = glider.metafy([&off_metacell, &on_metacell], 1).unwrap();
-
-        // The metafied pattern should have 5 gliders (one for each ON cell in the original glider)
-        assert_eq!(metafied.size_log2, 5);
-        assert_eq!(metafied.population(), BigInt::from(5 * 5)); // 5 gliders with 5 cells each
-    }
-
-    #[test]
-    fn test_metafy_simple() {
-        // Create a simple pattern (2x2)
-        let pattern = Pattern::from_packed_cells(&[0b11, 0b10]).unwrap();
-
-        // Create simple metacells (8x8)
-        let off_metacell = repeat_leaf(1, 3); // 1 alive cell
-        let on_metacell = repeat_leaf(u64::MAX, 3); // All alive cells
-
-        let mut off_population = BigInt::from(0);
-        let mut on_population = BigInt::from(1);
-        let mut level = 0;
-        let size_log2 = |level: u32| 1 + level * 3;
-        while size_log2(level) < HUGE_SIZE_LOG2_LIMIT {
-            let metafied = pattern
-                .metafy([&off_metacell, &on_metacell], level)
-                .unwrap();
-
-            assert_eq!(metafied.size_log2, size_log2(level));
-            assert_eq!(
-                metafied.population(),
-                off_population.clone() + on_population.clone() * 3
-            );
-            (off_population, on_population) = (
-                off_population * 63 + on_population.clone(),
-                on_population * 64,
-            );
-            level += 1;
-        }
-    }
-
-    #[test]
-    fn test_metafy_random() {
-        for pattern_size_log2 in 0..6 {
-            let pattern_total_count = BigInt::from(1) << pattern_size_log2 * 2;
-            let pattern = Pattern::random(pattern_size_log2, Some(SEED)).unwrap();
-            for metacell_size_log2 in 3..6 {
-                let metacell_total_count = BigInt::from(1) << metacell_size_log2 * 2;
-                let off_metacell = Pattern::random(metacell_size_log2, Some(SEED + 1)).unwrap();
-                let on_metacell = Pattern::random(metacell_size_log2, Some(SEED + 2)).unwrap();
-                let metacells = [&off_metacell, &on_metacell];
-
-                let mut populations = [BigInt::from(0), BigInt::from(1)];
-                let mut total_count = BigInt::from(1);
-                for level in 0..10 {
-                    let metafied = pattern.metafy(metacells, level).unwrap();
-
-                    assert_eq!(
-                        metafied.size_log2,
-                        pattern_size_log2 + metacell_size_log2 * level
-                    );
-                    assert_eq!(
-                        metafied.population(),
-                        pattern.population() * &populations[1]
-                            + (&pattern_total_count - pattern.population()) * &populations[0]
-                    );
-                    populations = [
-                        &populations[0] * metacells[1].population()
-                            + (&total_count - &populations[0]) * &metacells[0].population(),
-                        &populations[1] * metacells[1].population()
-                            + (&total_count - &populations[1]) * &metacells[0].population(),
-                    ];
-                    total_count *= &metacell_total_count;
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_expand() {
-        let mut pattern = repeat_leaf(1, 0);
-        for size_log2 in 0..HUGE_SIZE_LOG2_LIMIT {
-            pattern.expand(size_log2);
-            assert_eq!(pattern.size_log2, size_log2);
-            assert_eq!(pattern.population(), BigInt::from(1));
-        }
-    }
-
-    #[test]
-    fn test_packed_cells_roundtrip_blank() {
-        for size_log2 in 0..MEDIUM_SIZE_LOG2_LIMIT {
-            let pattern = repeat_leaf(0, size_log2);
-            let data = pattern.to_packed_cells().unwrap();
-            let deserialized = Pattern::from_packed_cells(&data).unwrap();
-
-            assert_eq!(pattern.size_log2, deserialized.size_log2);
-            assert_eq!(pattern.population(), deserialized.population());
-            assert_eq!(pattern.hash(), deserialized.hash());
-        }
-    }
-
-    #[test]
-    fn test_packed_cells_roundtrip_sparse() {
-        for size_log2 in 0..MEDIUM_SIZE_LOG2_LIMIT {
-            let pattern = repeat_leaf(1, size_log2);
-            let data = pattern.to_packed_cells().unwrap();
-            let deserialized = Pattern::from_packed_cells(&data).unwrap();
-
-            assert_eq!(pattern.size_log2, deserialized.size_log2);
-            assert_eq!(pattern.population(), deserialized.population());
-            assert_eq!(pattern.hash(), deserialized.hash());
-        }
-    }
-
-    #[test]
-    fn test_packed_cells_roundtrip_full() {
-        for size_log2 in 0..MEDIUM_SIZE_LOG2_LIMIT {
-            let pattern = repeat_leaf(u64::MAX, size_log2);
-            let data = pattern.to_packed_cells().unwrap();
-            let deserialized = Pattern::from_packed_cells(&data).unwrap();
-
-            assert_eq!(pattern.size_log2, deserialized.size_log2);
-            assert_eq!(pattern.population(), deserialized.population());
-            assert_eq!(pattern.hash(), deserialized.hash());
-        }
-    }
-
-    #[test]
-    fn test_packed_cells_roundtrip_random() {
-        for size_log2 in 0..MEDIUM_SIZE_LOG2_LIMIT {
-            let pattern = Pattern::random(size_log2, Some(SEED)).unwrap();
-            let data = pattern.to_packed_cells().unwrap();
-            let deserialized = Pattern::from_packed_cells(&data).unwrap();
-
-            assert_eq!(pattern.size_log2, deserialized.size_log2);
-            assert_eq!(pattern.population(), deserialized.population());
-            assert_eq!(pattern.hash(), deserialized.hash());
-        }
-    }
-
-    #[test]
-    fn test_macrocell_roundtrip_sparse() {
-        for size_log2 in 0..HUGE_SIZE_LOG2_LIMIT {
-            let pattern = repeat_leaf(1, size_log2);
-            let data = pattern.to_macrocell().unwrap();
-            let deserialized = Pattern::from_macrocell(&data).unwrap();
-
-            assert_eq!(pattern.size_log2.max(3), deserialized.size_log2);
-            assert_eq!(pattern.population(), deserialized.population());
-            assert_eq!(pattern.hash(), deserialized.hash());
-        }
-    }
-
-    #[test]
-    fn test_macrocell_roundtrip_full() {
-        for size_log2 in 0..HUGE_SIZE_LOG2_LIMIT {
-            let pattern = repeat_leaf(u64::MAX, size_log2);
-            let data = pattern.to_macrocell().unwrap();
-            let deserialized = Pattern::from_macrocell(&data).unwrap();
-
-            assert_eq!(pattern.size_log2.max(3), deserialized.size_log2);
-            assert_eq!(pattern.population(), deserialized.population());
-            assert_eq!(pattern.hash(), deserialized.hash());
-        }
-    }
-
-    #[test]
-    fn test_macrocell_roundtrip_random() {
-        for size_log2 in 0..MEDIUM_SIZE_LOG2_LIMIT {
-            let pattern = Pattern::random(size_log2, Some(SEED)).unwrap();
-            // Be careful: blank patterns are not supported
-            let data = pattern.to_macrocell().unwrap();
-            let deserialized = Pattern::from_macrocell(&data).unwrap();
-
-            assert_eq!(pattern.size_log2.max(3), deserialized.size_log2);
-            assert_eq!(pattern.population(), deserialized.population());
-            assert_eq!(pattern.hash(), deserialized.hash());
-        }
-    }
-
-    #[test]
-    fn test_compressed_macrocell_roundtrip_random() {
-        for size_log2 in 0..MEDIUM_SIZE_LOG2_LIMIT {
-            let pattern = Pattern::random(size_log2, Some(SEED)).unwrap();
-            // Be careful: blank patterns are not supported
-            let data = pattern.to_compressed_macrocell().unwrap();
-            let deserialized = Pattern::from_compressed_macrocell(&data).unwrap();
-
-            assert_eq!(pattern.size_log2.max(3), deserialized.size_log2);
-            assert_eq!(pattern.population(), deserialized.population());
-            assert_eq!(pattern.hash(), deserialized.hash());
-        }
-    }
-
-    #[test]
-    fn test_rle_roundtrip_random() {
-        for size_log2 in 0..MEDIUM_SIZE_LOG2_LIMIT {
-            let pattern = Pattern::random(size_log2, Some(SEED)).unwrap();
-            // Be careful: empty rows/columns at the top/left of the original pattern are trimmed
-            let data = pattern.to_rle().unwrap();
-            let deserialized = Pattern::from_rle(&data).unwrap();
-
-            assert_eq!(pattern.size_log2, deserialized.size_log2);
-            assert_eq!(pattern.population(), deserialized.population());
-            assert_eq!(pattern.hash(), deserialized.hash());
-        }
-    }
-
-    #[test]
-    fn test_conversions_glider() {
-        let packed = Pattern::from_packed_cells(&[0b010, 0b100, 0b111, 0]).unwrap();
-        let rle = Pattern::from_rle(b"x = 3, y = 3, rule = B3/S23\nbo$2bo$3o!").unwrap();
-        let macrocell = Pattern::from_macrocell(b"[M2]\n#R B3/S23\n.*.$..*$***$").unwrap();
-
-        assert_eq!(packed.hash(), rle.hash());
-        assert_eq!(packed.hash(), macrocell.hash());
-    }
-}
+mod tests;
