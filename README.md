@@ -11,7 +11,6 @@ A Rust library and CLI for Conway's Game of Life (B3/S23), with parallel HashLif
 | --- | --- | --- |
 | `HashLifeEngine` | `hashlife` | Memoizes quadtree updates to reuse spatial and temporal repetition. |
 | `StreamLifeEngine` | `streamlife` | Separates non-interacting streams into two universes and caches pairs of HashLife nodes. |
-| `SIMDEngine` | Library only | Updates a bit-packed dense grid without quadtree memoization. |
 
 The tree engines share memoization tables with concurrent chaining, allocate entries in per-thread
 chunks, and distribute work through work-stealing queues. StreamLife parks idle workers and can

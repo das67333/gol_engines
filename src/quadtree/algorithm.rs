@@ -380,79 +380,33 @@ fn compute_lanes(
         return Some(0);
     }
 
-    if size_log2 == LEAF_SIZE_LOG2 + 2 {
-        let tlx = {
-            let nw = mem.get(nw);
-            [nw.nw, nw.ne, nw.sw, nw.se].map(|x| u64::from_le_bytes(mem.get(x).leaf_cells()))
-        };
-        let trx = {
-            let ne = mem.get(ne);
-            [ne.nw, ne.ne, ne.sw, ne.se].map(|x| u64::from_le_bytes(mem.get(x).leaf_cells()))
-        };
-        let blx = {
-            let sw = mem.get(sw);
-            [sw.nw, sw.ne, sw.sw, sw.se].map(|x| u64::from_le_bytes(mem.get(x).leaf_cells()))
-        };
-        let brx = {
-            let se = mem.get(se);
-            [se.nw, se.ne, se.sw, se.se].map(|x| u64::from_le_bytes(mem.get(x).leaf_cells()))
-        };
+    let pptr_tl = mem.get(nw);
+    let pptr_tr = mem.get(ne);
+    let pptr_bl = mem.get(sw);
+    let pptr_br = mem.get(se);
+    let cc = [pptr_tl.se, pptr_tr.sw, pptr_bl.ne, pptr_br.nw];
+    let tc = [pptr_tl.ne, pptr_tr.nw, pptr_tl.se, pptr_tr.sw];
+    let bc = [pptr_bl.ne, pptr_br.nw, pptr_bl.se, pptr_br.sw];
+    let cl = [pptr_tl.sw, pptr_tl.se, pptr_bl.nw, pptr_bl.ne];
+    let cr = [pptr_tr.sw, pptr_tr.se, pptr_br.nw, pptr_br.ne];
 
-        let cc = [tlx[3], trx[2], blx[1], brx[0]];
-        let tc = [tlx[1], trx[0], tlx[3], trx[2]];
-        let bc = [blx[1], brx[0], blx[3], brx[2]];
-        let cl = [tlx[2], tlx[3], blx[0], blx[1]];
-        let cr = [trx[2], trx[3], brx[0], brx[1]];
+    let prepared = |x: &[Idx; 4]| mem.find_or_create_node(x[0], x[1], x[2], x[3]);
 
-        let prepared = |x: &[u64; 4]| {
-            let nw = mem.find_or_create_leaf_from_u64(x[0]);
-            let ne = mem.find_or_create_leaf_from_u64(x[1]);
-            let sw = mem.find_or_create_leaf_from_u64(x[2]);
-            let se = mem.find_or_create_leaf_from_u64(x[3]);
-            mem.find_or_create_node(nw, ne, sw, se)
-        };
-
-        for (i, x) in [(1, &tc), (3, &cl), (4, &cc), (5, &cr), (7, &bc)] {
-            if mem.exceeds_load_factor() {
-                return None;
-            }
-            childlanes[i] = node2lanes(mem, blank_nodes, prepared(x), size_log2 - 1)?;
+    for (i, x) in [(1, &tc), (3, &cl), (4, &cc), (5, &cr), (7, &bc)] {
+        if mem.exceeds_load_factor() {
+            return None;
         }
-        adml &= childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
-    } else {
-        let pptr_tl = mem.get(nw);
-        let pptr_tr = mem.get(ne);
-        let pptr_bl = mem.get(sw);
-        let pptr_br = mem.get(se);
-        let cc = [pptr_tl.se, pptr_tr.sw, pptr_bl.ne, pptr_br.nw];
-        let tc = [pptr_tl.ne, pptr_tr.nw, pptr_tl.se, pptr_tr.sw];
-        let bc = [pptr_bl.ne, pptr_br.nw, pptr_bl.se, pptr_br.sw];
-        let cl = [pptr_tl.sw, pptr_tl.se, pptr_bl.nw, pptr_bl.ne];
-        let cr = [pptr_tr.sw, pptr_tr.se, pptr_br.nw, pptr_br.ne];
-
-        let prepared = |x: &[Idx; 4]| mem.find_or_create_node(x[0], x[1], x[2], x[3]);
-
-        for (i, x) in [(1, &tc), (3, &cl), (4, &cc), (5, &cr), (7, &bc)] {
-            if mem.exceeds_load_factor() {
-                return None;
-            }
-            childlanes[i] = node2lanes(mem, blank_nodes, prepared(x), size_log2 - 1)?;
-        }
-        adml &= childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
+        childlanes[i] = node2lanes(mem, blank_nodes, prepared(x), size_log2 - 1)?;
     }
-    for x in &mut childlanes {
-        *x >>= 32;
-    }
-    let mut lanes = 0;
-
-    let rotr32 = |x, y| (x >> y) | (x << (32 - y));
-    let rotl32 = |x, y| (x << y) | (x >> (32 - y));
+    adml &= childlanes[1] & childlanes[3] & childlanes[4] & childlanes[5] & childlanes[7];
+    let childlanes = childlanes.map(|x| (x >> 32) as u32);
+    let mut lanes = 0u32;
 
     /*
      * Lane numbers are modulo 32, with each lane being either
      * 8 rows, 8 columns, or 8hd (in either diagonal direction)
      */
-    let a: u64 = if size_log2 - LEAF_SIZE_LOG2 - 2 <= 4 {
+    let a: u32 = if size_log2 - LEAF_SIZE_LOG2 - 2 <= 4 {
         1 << (size_log2 - LEAF_SIZE_LOG2 - 2)
     } else {
         0
@@ -461,35 +415,35 @@ fn compute_lanes(
 
     if adml & 0x88 != 0 {
         // Horizontal lanes
-        lanes |= rotl32(childlanes[0] | childlanes[1] | childlanes[2], a);
+        lanes |= (childlanes[0] | childlanes[1] | childlanes[2]).rotate_left(a);
         lanes |= childlanes[3] | childlanes[4] | childlanes[5];
-        lanes |= rotr32(childlanes[6] | childlanes[7] | childlanes[8], a);
+        lanes |= (childlanes[6] | childlanes[7] | childlanes[8]).rotate_right(a);
     }
 
     if adml & 0x44 != 0 {
-        lanes |= rotl32(childlanes[0], a2);
-        lanes |= rotl32(childlanes[3] | childlanes[1], a);
+        lanes |= childlanes[0].rotate_left(a2);
+        lanes |= (childlanes[3] | childlanes[1]).rotate_left(a);
         lanes |= childlanes[6] | childlanes[4] | childlanes[2];
-        lanes |= rotr32(childlanes[7] | childlanes[5], a);
-        lanes |= rotr32(childlanes[8], a2);
+        lanes |= (childlanes[7] | childlanes[5]).rotate_right(a);
+        lanes |= childlanes[8].rotate_right(a2);
     }
 
     if adml & 0x22 != 0 {
         // Vertical lanes
-        lanes |= rotl32(childlanes[0] | childlanes[3] | childlanes[6], a);
+        lanes |= (childlanes[0] | childlanes[3] | childlanes[6]).rotate_left(a);
         lanes |= childlanes[1] | childlanes[4] | childlanes[7];
-        lanes |= rotr32(childlanes[2] | childlanes[5] | childlanes[8], a);
+        lanes |= (childlanes[2] | childlanes[5] | childlanes[8]).rotate_right(a);
     }
 
     if adml & 0x11 != 0 {
-        lanes |= rotl32(childlanes[2], a2);
-        lanes |= rotl32(childlanes[1] | childlanes[5], a);
+        lanes |= childlanes[2].rotate_left(a2);
+        lanes |= (childlanes[1] | childlanes[5]).rotate_left(a);
         lanes |= childlanes[0] | childlanes[4] | childlanes[8];
-        lanes |= rotr32(childlanes[3] | childlanes[7], a);
-        lanes |= rotr32(childlanes[6], a2);
+        lanes |= (childlanes[3] | childlanes[7]).rotate_right(a);
+        lanes |= childlanes[6].rotate_right(a2);
     }
 
-    Some(adml | (lanes << 32))
+    Some(adml | (u64::from(lanes) << 32))
 }
 
 /// Check if two universes are provably non-interacting (solitonic).
