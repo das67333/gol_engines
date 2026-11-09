@@ -89,66 +89,82 @@ fn resume_uses_saved_progress_settings_and_coordinates() {
 
 #[cfg(unix)]
 #[test]
-fn sigint_interrupts_a_large_step_and_keeps_the_saved_state() {
+fn nohup_ignores_hangup_and_sigint_preserves_the_checkpoint() {
     use std::{
         io::{BufRead, BufReader},
+        os::unix::process::CommandExt,
         process::Stdio,
         time::{Duration, Instant},
     };
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path();
-    let pattern = Pattern::random(10, Some(42)).unwrap();
-    pattern.to_file(root.join("input.mc")).unwrap();
-    let mut child = cli(&[
-        "update",
-        "input.mc",
-        "--engine",
-        "streamlife",
-        "--mem-limit-gib",
-        "1",
-        "--workers",
-        "4",
-        "--gens-log2",
-        "30",
-        "--checkpoint-dir",
-        "job",
-        "--output",
-        "output.mc",
-    ])
-    .current_dir(root)
-    .stdout(Stdio::piped())
-    .spawn()
-    .unwrap();
-    let mut output = BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    loop {
-        assert!(
-            output.read_line(&mut line).unwrap() > 0,
-            "CLI exited before starting the update"
-        );
-        if line.contains("Initialized and loaded") {
-            break;
+    for (generations, signal, expected_status) in [("3", libc::SIGHUP, 0), ("30", libc::SIGINT, 130)] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let pattern = Pattern::random(10, Some(42)).unwrap();
+        pattern.to_file(root.join("input.mc")).unwrap();
+        let mut command = cli(&[
+            "update",
+            "input.mc",
+            "--engine",
+            "streamlife",
+            "--mem-limit-gib",
+            "1",
+            "--workers",
+            "4",
+            "--gens-log2",
+            generations,
+            "--checkpoint-dir",
+            "job",
+            "--output",
+            "output.mc",
+        ]);
+        // Match nohup's inherited disposition; the child must still complete after SIGHUP.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
-        line.clear();
-    }
-    std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
+        let mut child = command.current_dir(root).stdout(Stdio::piped()).spawn().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            assert!(
+                output.read_line(&mut line).unwrap() > 0,
+                "CLI exited before starting the update"
+            );
+            if line.contains("Initialized and loaded") {
+                break;
+            }
+            line.clear();
         }
-        if Instant::now() > deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("Cancellation failed to terminate the process");
-        }
+        let reader = std::thread::spawn(move || std::io::copy(&mut output, &mut std::io::sink()).unwrap());
         std::thread::sleep(Duration::from_millis(10));
-    };
-    assert_eq!(status.code(), Some(130));
-    let manifest = read_manifest(&root.join("job"));
-    assert_eq!(manifest["progress"]["generation"], "0");
-    let snapshot = root.join("job").join(manifest["snapshot"].as_str().unwrap());
-    assert_eq!(Pattern::from_file(snapshot).unwrap().hash(), pattern.hash());
-    assert!(!root.join("output.mc").exists());
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("CLI failed to terminate");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        reader.join().unwrap();
+        assert_eq!(status.code(), Some(expected_status));
+        let manifest = read_manifest(&root.join("job"));
+        if expected_status == 0 {
+            assert_eq!(manifest["progress"]["generation"], "8");
+            assert!(root.join("output.mc").exists());
+        } else {
+            assert_eq!(manifest["progress"]["generation"], "0");
+            let snapshot = root.join("job").join(manifest["snapshot"].as_str().unwrap());
+            assert_eq!(Pattern::from_file(snapshot).unwrap().hash(), pattern.hash());
+            assert!(!root.join("output.mc").exists());
+        }
+    }
 }

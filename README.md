@@ -75,7 +75,7 @@ Resume with `gol_engines_cli resume run`; the target generation and settings are
 
 Ctrl+C cancels the unfinished step and rolls back to the last completed state; it does not wait for
 that step to finish. Cleanup can take time. A second Ctrl+C exits immediately, leaving the last
-saved checkpoint available. SIGTERM uses the same graceful cancellation on Unix.
+saved checkpoint available.
 
 Checkpoints contain the pattern, generation, coordinate offset and run settings. They replace the
 previous checkpoint only after the new snapshot is written, and validate its checksum on resume.
