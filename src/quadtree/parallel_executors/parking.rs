@@ -1,9 +1,11 @@
 //! One idle search captain keeps publication off the producer hot path.
-use crossbeam::sync::Parker;
+use crossbeam::{sync::Parker, utils::CachePadded};
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, Ordering},
 };
+
+const PARK_SPINS: usize = 1024;
 
 pub(super) enum Search<T> {
     Work(T),
@@ -21,6 +23,7 @@ pub(super) struct Parking {
     state: Mutex<State>,
     stopped: AtomicBool,
     unparks: Vec<crossbeam::sync::Unparker>,
+    wake_hints: Vec<CachePadded<AtomicBool>>,
 }
 
 impl Parking {
@@ -32,6 +35,9 @@ impl Parking {
                 state: Mutex::new(State::default()),
                 stopped: AtomicBool::new(false),
                 unparks,
+                wake_hints: (0..workers)
+                    .map(|_| CachePadded::new(AtomicBool::new(false)))
+                    .collect(),
             },
             parkers,
         )
@@ -57,9 +63,10 @@ impl Parking {
                 None => state.captain = Some(worker),
                 Some(captain) if captain == worker => {}
                 Some(_) => {
+                    self.wake_hints[worker].store(false, Ordering::Relaxed);
                     state.sleepers.push(worker);
                     drop(state);
-                    parker.park();
+                    self.park(worker, parker);
                     continue;
                 }
             }
@@ -77,8 +84,10 @@ impl Parking {
                         // Transfer responsibility before becoming a producer.
                         // If no sleeper remains, the next idle arrival claims it.
                         state.captain = state.sleepers.pop();
-                        if let Some(captain) = state.captain {
-                            self.unparks[captain].unpark();
+                        let captain = state.captain;
+                        drop(state);
+                        if let Some(captain) = captain {
+                            self.unpark(captain);
                         }
                         return Some(task);
                     }
@@ -92,6 +101,23 @@ impl Parking {
         }
     }
 
+    /// A short spin can consume a prompt handoff without entering the kernel.
+    /// The hint does not grant the role; the mutex still protects that decision.
+    fn park(&self, worker: usize, parker: &Parker) {
+        for _ in 0..PARK_SPINS {
+            if self.wake_hints[worker].load(Ordering::Acquire) {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        parker.park();
+    }
+
+    fn unpark(&self, worker: usize) {
+        self.wake_hints[worker].store(true, Ordering::Release);
+        self.unparks[worker].unpark();
+    }
+
     fn stop(&self) {
         // Only one worker performs the broadcast, including during unwinding.
         if self.stopped.swap(true, Ordering::AcqRel) {
@@ -101,8 +127,8 @@ impl Parking {
         state.captain = None;
         state.sleepers.clear();
         // Wake every worker, including a captain awaiting its reserved wake.
-        for unparker in &self.unparks {
-            unparker.unpark();
+        for worker in 0..self.unparks.len() {
+            self.unpark(worker);
         }
     }
 
