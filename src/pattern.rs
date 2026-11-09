@@ -560,7 +560,6 @@ impl Pattern {
     ///
     /// Returns format-specific errors:
     /// - `PackedCells` or `RLE`: If `size_log2` is too large (would cause overflow)
-    /// - `Macrocell` or `CompressedMacrocell`: If the pattern is blank (contains no alive cells)
     pub fn to_format(&self, format: PatternFormat) -> Result<Vec<u8>> {
         match format {
             PatternFormat::PackedCells => self.to_packed_cells(),
@@ -911,9 +910,7 @@ impl Pattern {
     /// A `Result` containing either the bytes of the macrocell representation
     /// or an error.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the pattern is blank (contains no alive cells).
+    /// Blank patterns are represented by an explicit empty root.
     fn to_macrocell(&self) -> Result<Vec<u8>> {
         fn inner(
             this: &Pattern,
@@ -967,13 +964,17 @@ impl Pattern {
             codes.len()
         }
 
-        if self.kiv.find_blank_node(self.size_log2) == Some(self.root) {
-            return Err(anyhow!("Cannot serialize blank pattern"));
-        }
-
         let mut codes = HashMap::new();
         let mut result = format!("[M2] (gol_engines {VERSION})\n#R B3/S23\n").into_bytes();
-        inner(self, self.root, self.size_log2, &mut codes, &mut result);
+        if self.kiv.find_blank_node(self.size_log2) == Some(self.root) {
+            if self.size_log2 <= 3 {
+                result.extend_from_slice(b".\n");
+            } else {
+                result.extend_from_slice(format!("{} 0 0 0 0\n", self.size_log2).as_bytes());
+            }
+        } else {
+            inner(self, self.root, self.size_log2, &mut codes, &mut result);
+        }
 
         Ok(result)
     }
@@ -1021,7 +1022,6 @@ impl Pattern {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The pattern is blank (contains no alive cells)
     /// - Compression fails
     fn to_compressed_macrocell(&self) -> Result<Vec<u8>> {
         let macrocell_data = self.to_macrocell()?;

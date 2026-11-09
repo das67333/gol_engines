@@ -29,13 +29,14 @@ impl StreamLifeEngine {
             if let Some(result) = executor.run(paused.take()) {
                 return Some(result);
             }
+            if self.base.mem.cancellation.is_cancelled() { return None; }
             let mut work = executor.paused_work();
             work.roots.extend_from_slice(rollback_roots);
             let before = (self.base.mem.len(), self.bicache.len());
             self.collect_preserving_work(&work.roots);
             self.base.blank_nodes.get_mut(self.base.size_log2, &self.base.mem);
             println!("StreamLife resume GC: {:?} -> {:?}", before, (self.base.mem.len(), self.bicache.len()));
-            if self.base.mem.exceeds_load_factor() || self.bicache.exceeds_load_factor() || !work.can_resume() {
+            if self.base.mem.should_stop() || self.bicache.exceeds_load_factor() || !work.can_resume() {
                 return None;
             }
             paused = Some(work);
@@ -155,6 +156,7 @@ impl GoLEngine for StreamLifeEngine {
     }
 
     fn update(&mut self, generations_log2: u32) -> Result<[BigInt; 2]> {
+        if self.base.mem.cancellation.is_cancelled() { return Err(crate::UpdateCancelled.into()); }
         if self
             .base
             .generations_per_update_log2
@@ -222,7 +224,12 @@ impl GoLEngine for StreamLifeEngine {
             roots.extend([(a, size_log2), (b, size_log2)]);
         }
         self.collect_preserving_work(&roots);
+        if self.base.mem.cancellation.is_cancelled() { return Err(crate::UpdateCancelled.into()); }
         Err(anyhow!("StreamLife: overfilled NodeStore or BinodeCache, try smaller step"))
+    }
+
+    fn cancellation_token(&self) -> Option<crate::CancellationToken> {
+        Some(self.base.mem.cancellation.clone())
     }
 
     fn run_gc(&mut self) {

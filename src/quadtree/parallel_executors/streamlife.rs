@@ -236,7 +236,7 @@ impl<'a> StreamLifeExecutor<'a> {
             }
         });
 
-        if self.engine.base.mem.exceeds_load_factor() || bicache.exceeds_load_factor() {
+        if self.engine.base.mem.should_stop() || bicache.exceeds_load_factor() {
             return None;
         }
 
@@ -439,7 +439,7 @@ impl BiExecutorThread<'_> {
     }
 
     fn cancelled(&self) -> bool {
-        self.engine.base.mem.exceeds_load_factor() || self.bicache_ref.exceeds_load_factor()
+        self.engine.base.mem.should_stop() || self.bicache_ref.exceeds_load_factor()
     }
 
     fn pop_local_task(&self) -> Option<ReadyTask> {

@@ -309,7 +309,7 @@ pub(super) fn node2lanes(
     }
     let mut spinner = Spinner::new();
     loop {
-        if mem.exceeds_load_factor() {
+        if mem.should_stop() {
             return None;
         }
         if current == status::NOT_STARTED
@@ -393,7 +393,7 @@ fn compute_lanes(
     let prepared = |x: &[Idx; 4]| mem.find_or_create_node(x[0], x[1], x[2], x[3]);
 
     for (i, x) in [(1, &tc), (3, &cl), (4, &cc), (5, &cr), (7, &bc)] {
-        if mem.exceeds_load_factor() {
+        if mem.should_stop() {
             return None;
         }
         childlanes[i] = node2lanes(mem, blank_nodes, prepared(x), size_log2 - 1)?;
@@ -556,7 +556,7 @@ impl FinalMerge<'_> {
             return Some(idx.1);
         }
         if size_log2 <= LEAF_SIZE_LOG2 {
-            return (!self.mem.exceeds_load_factor())
+            return (!self.mem.should_stop())
                 .then(|| merge_universes(self.mem, self.blank_nodes, idx, size_log2));
         }
         // Live node IDs are nonzero; zero tags mark unused slots. IDs stay valid for this call.
@@ -572,7 +572,7 @@ impl FinalMerge<'_> {
         for i in 0..4 {
             parts[i] = self.merge((a[i], b[i]), size_log2 - 1)?;
         }
-        if self.mem.exceeds_load_factor() {
+        if self.mem.should_stop() {
             return None;
         }
         let result = self

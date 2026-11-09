@@ -35,6 +35,7 @@ impl<Meta: Default + Sync> HashLifeEngine<Meta> {
             if let Some(result) = executor.run(self.threads_cnt, paused.take()) {
                 return Some(result);
             }
+            if self.mem.cancellation.is_cancelled() { return None; }
             let mut work = executor.paused_work();
             // Framing need not retain the original root itself; keep it available for rollback.
             work.roots.push(rollback_root);
@@ -43,7 +44,7 @@ impl<Meta: Default + Sync> HashLifeEngine<Meta> {
             self.mem.sweep(true);
             self.blank_nodes.clear();
             println!("HashLife resume GC: {before} -> {}", self.mem.len());
-            if self.mem.exceeds_load_factor() || !work.can_resume() {
+            if self.mem.should_stop() || !work.can_resume() {
                 return None;
             }
             paused = Some(work);
@@ -223,6 +224,7 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
     }
 
     fn update(&mut self, generations_log2: u32) -> Result<[BigInt; 2]> {
+        if self.mem.cancellation.is_cancelled() { return Err(crate::UpdateCancelled.into()); }
         if self
             .generations_per_update_log2
             .is_some_and(|g| g != generations_log2)
@@ -246,6 +248,7 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
             self.size_log2 = size_log2;
             self.run_gc();
             self.generations_per_update_log2 = None;
+            if self.mem.cancellation.is_cancelled() { return Err(crate::UpdateCancelled.into()); }
             return Err(anyhow!(
                 "HashLifeAsync: overfilled NodeStore, try smaller step"
             ));
@@ -269,6 +272,10 @@ impl<Meta: Default + Sync> GoLEngine for HashLifeEngine<Meta> {
         }
 
         Ok([dx, dy])
+    }
+
+    fn cancellation_token(&self) -> Option<crate::CancellationToken> {
+        Some(self.mem.cancellation.clone())
     }
 
     fn run_gc(&mut self) {
