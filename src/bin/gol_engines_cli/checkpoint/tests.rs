@@ -8,8 +8,7 @@ fn fixture() -> (Settings, Progress, Pattern) {
     }))
     .unwrap();
     let progress = serde_json::from_value(json!({
-        "generation": "0", "target": "64", "offset_x": "-12345678901234567890",
-        "offset_y": "98765432109876543210", "step_log2": 3, "elapsed_seconds": 12.5
+        "generation": "0", "target": "64", "step_log2": 3, "elapsed_seconds": 12.5
     }))
     .unwrap();
     (settings, progress, Pattern::random(6, Some(42)).unwrap())

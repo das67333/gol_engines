@@ -77,7 +77,7 @@ Ctrl+C cancels the unfinished step and rolls back to the last completed state; i
 that step to finish. Cleanup can take time. A second Ctrl+C exits immediately, leaving the last
 saved checkpoint available.
 
-Checkpoints contain the pattern, generation, coordinate offset and run settings. They replace the
+Checkpoints contain the pattern, generation and run settings. They replace the
 previous checkpoint only after the new snapshot is written, and validate its checksum on resume.
 They do not preserve the in-memory computation caches: resuming starts with cold caches. Keep the
 checkpoint directory on persistent storage when using a preemptible VM.
