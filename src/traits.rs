@@ -1,4 +1,4 @@
-use crate::{Pattern, Topology};
+use crate::{CancellationToken, Pattern, Topology};
 use anyhow::Result;
 use num_bigint::BigInt;
 
@@ -75,6 +75,15 @@ pub trait GoLEngine {
     ///
     /// When using [`Topology::Unbounded`], the field size may grow to accommodate expanding patterns.
     fn update(&mut self, generations_log2: u32) -> Result<[BigInt; 2]>;
+
+    /// Return a handle for cancelling updates, when the engine supports cancellation.
+    /// A cancelled update returns [`crate::UpdateCancelled`] and preserves its input state.
+    /// Reset the token after the update returns before updating again. Cancellation can
+    /// race with completion, in which case the update succeeds and its result is committed.
+    /// The default preserves compatibility with engines without cancellation support.
+    fn cancellation_token(&self) -> Option<CancellationToken> {
+        None
+    }
 
     /// Runs garbage collection to free accumulated caches and temporary data.
     ///

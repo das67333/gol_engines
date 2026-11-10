@@ -19,7 +19,7 @@ preserve pending work across garbage collection.
 Both tree engines support unbounded fields and square tori with power-of-two side lengths.
 `Pattern` stores a cell configuration as a compact quadtree. It supports `.rle`, `.mc`, and `.mc.gz`
 files, population and hash calculation, and replacing cells with metacells. Macrocell formats are
-suitable for large recursive patterns; the current macrocell writer requires a nonempty pattern.
+suitable for large recursive patterns.
 
 [lifelib](https://gitlab.com/apgoucher/lifelib) provides the original StreamLife implementation,
 broader cellular-automaton rule support, and Python/C++ APIs. GoL Engines focuses on running a single
@@ -31,7 +31,8 @@ below compare both engines with lifelib and Golly.
 
 ## Build and use
 
-Build the CLI from the repository root with a Rust toolchain and native build tools installed:
+Install the published CLI with `cargo install gol_engines --features cli_deps --bin gol_engines_cli`.
+To build from the repository, use Rust 1.89 or newer and native build tools:
 
 ```sh
 cargo build --release --bin gol_engines_cli --features cli_deps
@@ -64,6 +65,22 @@ target/release/gol_engines_cli metafy \
 
 `metafy --k=N` repeats the replacement `N` times. Use `--help` on any subcommand for its options.
 Optional per-thread runtime statistics can be enabled with `--features cli_deps,statistics` at build time.
+
+## Long simulations
+
+Add `--checkpoint-dir=run` to `update` to save the initial state and each completed step, retaining
+the latest checkpoint.
+Resume with `gol_engines_cli resume run`; the target generation and settings are saved automatically.
+`resume` accepts `--workers` and `--mem-limit-gib` overrides.
+
+Ctrl+C cancels the unfinished step and rolls back to the last completed state; it does not wait for
+that step to finish. Cleanup can take time. A second Ctrl+C exits immediately, leaving the last
+saved checkpoint available.
+
+Checkpoints contain the pattern, generation, coordinate offset and run settings. They replace the
+previous checkpoint only after the new snapshot is written, and validate its checksum on resume.
+They do not preserve the in-memory computation caches: resuming starts with cold caches. Keep the
+checkpoint directory on persistent storage when using a preemptible VM.
 
 ## Choosing parameters
 

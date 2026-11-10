@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 
 /// Shared interface for accessing nodes.
 pub trait NodeAccess<Meta: Default + Sync> {
-    fn exceeds_load_factor(&self) -> bool;
+    fn should_stop(&self) -> bool;
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta>;
     fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx;
     fn find_or_create_leaf_from_u64(&self, value: u64) -> Idx;
@@ -32,13 +32,14 @@ pub type NodeStoreRef<'a, Meta> = ShardedRef<'a, NodeStore<Meta>>;
 /// Stores the nodes of the quadtree.
 pub struct NodeStore<Meta> {
     inner: ConcurrentHashTable<QuadTreeNode<Meta>>,
+    pub(in crate::quadtree) cancellation: crate::CancellationToken,
 }
 
 unsafe impl<Meta: Sync> Sync for NodeStore<Meta> {}
 
 impl<Meta: Default + Sync> NodeAccess<Meta> for NodeStore<Meta> {
-    fn exceeds_load_factor(&self) -> bool {
-        self.exceeds_load_factor()
+    fn should_stop(&self) -> bool {
+        self.should_stop()
     }
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
         self.get(idx)
@@ -58,6 +59,7 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
     pub fn new(cap_log2: u32, entry_capacity: usize, threads_cnt: usize) -> Self {
         Self {
             inner: ConcurrentHashTable::new(cap_log2, entry_capacity, threads_cnt),
+            cancellation: crate::CancellationToken::default(),
         }
     }
 
@@ -203,6 +205,10 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
         self.inner.exceeds_load_factor()
     }
 
+    pub fn should_stop(&self) -> bool {
+        self.exceeds_load_factor() || self.cancellation.is_cancelled()
+    }
+
     /// Parallel mark-and-sweep GC. Marks all nodes reachable from `roots`
     /// using a status bit (`GC_MARK`), then recycles dead entries in parallel.
     /// Cached computation results are invalidated.
@@ -271,15 +277,11 @@ impl<Meta: Default + Sync> NodeStoreRef<'_, Meta> {
         }
         result
     }
-
-    pub fn exceeds_load_factor(&self) -> bool {
-        self.base.exceeds_load_factor()
-    }
 }
 
 impl<Meta: Default + Sync> NodeAccess<Meta> for NodeStoreRef<'_, Meta> {
-    fn exceeds_load_factor(&self) -> bool {
-        self.exceeds_load_factor()
+    fn should_stop(&self) -> bool {
+        self.base.should_stop()
     }
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
         self.get(idx)

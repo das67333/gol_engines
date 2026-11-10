@@ -1,6 +1,7 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
 
+mod cancellation;
 mod pattern;
 mod quadtree;
 mod simd;
@@ -11,6 +12,7 @@ mod traits;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub use cancellation::{CancellationToken, UpdateCancelled};
 pub use num_bigint::BigInt;
 pub use pattern::{Pattern, PatternFormat, PatternNode};
 pub use topology::Topology;

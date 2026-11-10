@@ -204,3 +204,15 @@ fn test_conversions_glider() {
     assert_eq!(packed.hash(), rle.hash());
     assert_eq!(packed.hash(), macrocell.hash());
 }
+
+#[test]
+fn blank_macrocell_roundtrip_preserves_field_size() {
+    for size in [3, 4, 32, 300] {
+        let pattern = repeat_leaf(0, size);
+        for format in [PatternFormat::Macrocell, PatternFormat::CompressedMacrocell] {
+            let restored = Pattern::from_format(format, &pattern.to_format(format).unwrap()).unwrap();
+            assert_eq!(restored.get_size_log2(), size);
+            assert_eq!(restored.population(), BigInt::ZERO);
+        }
+    }
+}

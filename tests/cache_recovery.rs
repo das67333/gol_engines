@@ -51,3 +51,44 @@ fn hashlife_completes_with_a_small_cache() {
         }
     }
 }
+
+#[test]
+fn cancellation_preserves_the_input_and_allows_another_update() {
+    use gol_engines::UpdateCancelled;
+    use std::time::Duration;
+    let pattern = Pattern::random(10, Some(42)).unwrap();
+    let packed = |p: Pattern| p.to_format(PatternFormat::PackedCells).unwrap();
+    for workers in [1, 4] {
+        let engines: [Box<dyn GoLEngine>; 2] = [
+            Box::new(HashLifeEngine::new(128, workers)),
+            Box::new(StreamLifeEngine::new(128, workers)),
+        ];
+        for mut engine in engines {
+            engine.load_pattern(&pattern, Topology::Torus).unwrap();
+            let token = engine.cancellation_token().unwrap();
+            token.cancel();
+            assert!(engine.update(20).unwrap_err().is::<UpdateCancelled>());
+            token.reset();
+            for _ in 0..2 {
+                let before = packed(engine.current_state());
+                let error = std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        std::thread::sleep(Duration::from_millis(10));
+                        token.cancel();
+                    });
+                    engine.update(20)
+                })
+                .unwrap_err();
+                assert!(error.is::<UpdateCancelled>(), "{error:#}");
+                assert_eq!(packed(engine.current_state()), before);
+                token.reset();
+                let mut reference = SIMDEngine::new(128, 1);
+                reference
+                    .load_pattern(&engine.current_state(), Topology::Torus)
+                    .unwrap();
+                assert_eq!(engine.update(3).unwrap(), reference.update(3).unwrap());
+                assert_eq!(packed(engine.current_state()), packed(reference.current_state()));
+            }
+        }
+    }
+}

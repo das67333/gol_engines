@@ -9,7 +9,7 @@ mod recovery;
 use super::{
     super::{
         hashlife::HashLifeEngine,
-        hashtable::{Idx, NodeStore, NodeStoreRef},
+        hashtable::{Idx, NodeAccess, NodeStore, NodeStoreRef},
         node::QuadTreeNode,
         sharded_statistics::{ExecutionStatistics, set_current_execution_stats, Ticks, record_task_duration, take_current_execution_stats, MetricKind},
         status,
@@ -94,7 +94,7 @@ impl<'a, Meta: Default + Sync> HashLifeExecutor<'a, Meta> {
             }
         });
 
-        if self.mem.exceeds_load_factor() {
+        if self.mem.should_stop() {
             return None;
         }
 
@@ -124,7 +124,7 @@ impl<Meta: Default + Sync> ExecutorThread<'_, Meta> {
             &self.queue,
             self.stealers,
             || is_finished(&self.root_node.status),
-            || self.mem.exceeds_load_factor(),
+            || self.mem.should_stop(),
         );
         set_current_execution_stats();
 
