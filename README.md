@@ -138,7 +138,9 @@ and remains faster in absolute time. Pi and Mersenne have limited parallelism an
 with more workers. Golly is fastest on Mersenne in this comparison.
 
 Full 0E0P metatick benchmarks (`2^36` generations) used StreamLife on a Spot `c3d-standard-90` VM
-with 360 GiB RAM in the same region, 45 workers, and steps of `2^29` generations:
+with 360 GiB RAM in the same region, at about
+[US$0.53/hour](https://cloud.google.com/spot-vms/pricing) for CPU and memory.
+Runs used 45 workers and steps of `2^29` generations:
 
 | Pattern | Budget, GiB | Total time | Peak RSS, GiB |
 | --- | ---: | ---: | ---: |
