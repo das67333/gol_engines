@@ -148,6 +148,7 @@ Runs used 45 workers and steps of `2^29` generations:
 | [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | 288 | **3 h 59 min 35 s** | 306.84 |
 
 Budget controls table sizes and GC frequency; RSS is measured process memory.
+`mimalloc` can round allocations up, and transparent huge pages (THP) can make the padding resident.
 The `complete_default.mc` input exactly matches the first frame of the
 [historical 0E0P timeline](https://conwaylife.com/forums/viewtopic.php?p=196996#p196996).
 Goucher [reported 30 days with StreamLife](https://conwaylife.com/forums/viewtopic.php?p=65620#p65620)
