@@ -14,7 +14,7 @@ fn read_manifest(directory: &Path) -> Value {
 }
 
 #[test]
-fn resume_uses_saved_progress_settings_and_coordinates() {
+fn resume_uses_saved_progress_and_settings() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let pattern = Pattern::from_format(PatternFormat::RLE, b"x = 32, y = 32, rule = B3/S23\nbo$2bo$3o!").unwrap();
@@ -43,6 +43,9 @@ fn resume_uses_saved_progress_settings_and_coordinates() {
         // A valid mid-run manifest: eight generations completed out of 32.
         let mut manifest = read_manifest(&job);
         manifest["progress"]["target"] = Value::String("32".into());
+        // Manifests written before offsets were removed remain readable.
+        manifest["progress"]["offset_x"] = Value::String("-12345678901234567890".into());
+        manifest["progress"]["offset_y"] = Value::String("98765432109876543210".into());
         fs::write(job.join("job.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
         let result = cli(&["resume", job.to_str().unwrap(), "--workers", "2"])
             .current_dir(root.parent().unwrap())
@@ -81,7 +84,7 @@ fn resume_uses_saved_progress_settings_and_coordinates() {
         );
         let resumed = read_manifest(&job);
         let straight = read_manifest(&reference);
-        for field in ["generation", "target", "offset_x", "offset_y"] {
+        for field in ["generation", "target"] {
             assert_eq!(resumed["progress"][field], straight["progress"][field], "{field}");
         }
     }

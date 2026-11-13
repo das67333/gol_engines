@@ -594,19 +594,7 @@ impl Pattern {
         let path = path.as_ref();
         let data = fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
 
-        if path.extension() == Some("mc".as_ref()) {
-            return Self::from_format(PatternFormat::Macrocell, &data);
-        }
-
-        if path.to_str().is_some_and(|s| s.ends_with(".mc.gz")) {
-            return Self::from_format(PatternFormat::CompressedMacrocell, &data);
-        }
-
-        if path.extension() == Some("rle".as_ref()) {
-            return Self::from_format(PatternFormat::RLE, &data);
-        }
-
-        Err(anyhow!("Cannot infer format from file path: {:?}", path))
+        Self::from_format(PatternFormat::from_path(path)?, &data)
     }
 
     /// Saves the pattern to a file.
@@ -635,15 +623,7 @@ impl Pattern {
     pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
 
-        let format = if path.extension() == Some("mc".as_ref()) {
-            PatternFormat::Macrocell
-        } else if path.to_str().is_some_and(|s| s.ends_with(".mc.gz")) {
-            PatternFormat::CompressedMacrocell
-        } else if path.extension() == Some("rle".as_ref()) {
-            PatternFormat::RLE
-        } else {
-            return Err(anyhow!("Cannot infer format from file path: {:?}", path));
-        };
+        let format = PatternFormat::from_path(path)?;
 
         let data = self.to_format(format)?;
         fs::write(path, data).with_context(|| format!("Failed to write file: {}", path.display()))
@@ -1526,6 +1506,22 @@ pub enum PatternFormat {
     /// This implementation supports the extended RLE format with header and comments,
     /// but only for two-state patterns with B3/S23 rules.
     RLE,
+}
+
+impl PatternFormat {
+    /// Infers a file format from a .mc, .mc.gz, or .rle path.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if path.extension() == Some("mc".as_ref()) {
+            Ok(Self::Macrocell)
+        } else if path.to_str().is_some_and(|s| s.ends_with(".mc.gz")) {
+            Ok(Self::CompressedMacrocell)
+        } else if path.extension() == Some("rle".as_ref()) {
+            Ok(Self::RLE)
+        } else {
+            Err(anyhow!("Cannot infer format from file path: {:?}", path))
+        }
+    }
 }
 
 #[cfg(test)]
