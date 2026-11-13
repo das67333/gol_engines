@@ -101,12 +101,12 @@ The CLI may reduce the step for either engine if an update does not fit in memor
 
 ## Performance
 
-Benchmarks used a Google Cloud Spot (preemptible) `c3d-highcpu-90` VM in `australia-southeast1`:
+Scaling benchmarks used a Google Cloud Spot (preemptible) `c3d-highcpu-90` VM in `australia-southeast1`:
 45 physical AMD EPYC 9B14 cores, 90 vCPUs, and 180 GiB RAM, at about
 [US$0.40/hour](https://cloud.google.com/spot-vms/pricing) for CPU and memory.
 Core counts below refer to physical cores, using one hardware thread per core.
 
-The tables compare GoL Engines 0.3.1 release builds with
+The scaling tables compare GoL Engines 0.3.1 release builds with
 [lifelib 2.5.9](https://gitlab.com/apgoucher/lifelib/-/tree/05632e382096925c0b1724fd59d2f0784f0213d6)
 and [Golly 5.0](https://golly.sourceforge.io/).
 Times are seconds for one update by `2^G` generations from the input, excluding file loading.
@@ -137,11 +137,19 @@ On the metaglider at G11, HashLife speeds up 29.3× from 1 to 32 cores; StreamLi
 and remains faster in absolute time. Pi and Mersenne have limited parallelism and can slow down
 with more workers. Golly is fastest on Mersenne in this comparison.
 
-For a complete 0E0P metatick, StreamLife advances
-[`complete_default.mc`](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc)
-by `2^36` generations in **7 h 13 min**, with 45 workers, step `2^29`, a 160 GiB budget,
-and 157.23 GiB peak RSS. Budget controls table sizes and GC frequency; RSS is measured process memory.
-The input exactly matches the first frame of the
+Full 0E0P metatick benchmarks (`2^36` generations) used StreamLife on a Spot `c3d-standard-90` VM
+with 360 GiB RAM in the same region, at about
+[US$0.53/hour](https://cloud.google.com/spot-vms/pricing) for CPU and memory.
+Runs used 45 workers and steps of `2^29` generations:
+
+| Pattern | Budget, GiB | Total time | Peak RSS, GiB |
+| --- | ---: | ---: | ---: |
+| [`complete_default.mc`](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc) | 288 | **3 h 25 min 24 s** | 303.65 |
+| [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | 288 | **3 h 59 min 35 s** | 306.84 |
+
+Budget controls table sizes and GC frequency; RSS is measured process memory.
+`mimalloc` can round allocations up, and transparent huge pages (THP) can make the padding resident.
+The `complete_default.mc` input exactly matches the first frame of the
 [historical 0E0P timeline](https://conwaylife.com/forums/viewtopic.php?p=196996#p196996).
 Goucher [reported 30 days with StreamLife](https://conwaylife.com/forums/viewtopic.php?p=65620#p65620)
 for a full metatick in 2018.
