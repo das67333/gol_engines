@@ -45,6 +45,14 @@ target/release/gol_engines_cli update res/golly-ticker.rle \
     --mem-limit-gib=1 --gens-log2=12 --output=ticker-g12.mc
 ```
 
+```text
+Initialized and loaded in 0.0 secs; generation 0/4096
+Time spent on hashlife executor: 37.756833ms
+Nodes count: 234802 / 16777216
+2026-11-15T23:02:52.164  Generation 4096/4096; S12; step 0.04s; elapsed 0.0s
+Saved /private/tmp/gol_engines/ticker-g12.mc at generation 4096
+```
+
 Use `--engine=streamlife` for StreamLife and `--workers=N` to select the number of worker threads.
 The defaults are HashLife, one worker, and an unbounded field; `--topology=torus` connects opposite
 field edges. Choose the memory budget and worker count for the workload and machine.
@@ -55,12 +63,36 @@ Inspect a pattern's population, hash, and quadtree statistics:
 target/release/gol_engines_cli stats res/very_large_patterns/pi.mc.gz
 ```
 
+```text
+Hash: 0xd9c1db4109c7b2ab
+Population: 1_189_325
+Distribution of node sizes (side lengths of the squares):
+total -> 19699
+2^3   -> 15%
+2^4   -> 34%
+2^5   -> 24%
+2^6   ->  9%
+2^7   ->  5%
+2^8   ->  2%
+2^9   ->  2%
+2^10  ->  2%
+2^11  ->  1%
+2^12  ->  1%
+Computed stats in 0.0 secs
+```
+
 Replace a glider's dead and live cells with the corresponding OTCA metapixels:
 
 ```sh
 target/release/gol_engines_cli metafy \
     res/glider.rle res/otca_0.mc.gz res/otca_1.mc.gz \
     --output=otca-metaglider.mc.gz --population
+```
+
+```text
+Loaded patterns in 0.0 secs
+Metafied pattern in 0.0 secs
+Population: 593_927
 ```
 
 `metafy --k=N` repeats the replacement `N` times. Use `--help` on any subcommand for its options.
