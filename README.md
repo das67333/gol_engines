@@ -50,7 +50,7 @@ Initialized and loaded in 0.0 secs; generation 0/4096
 Time spent on hashlife executor: 37.756833ms
 Nodes count: 234802 / 16777216
 2026-11-15T23:02:52.164  Generation 4096/4096; S12; step 0.04s; elapsed 0.0s
-Saved ticker-g12.mc at generation 4096
+Saved /private/tmp/gol_engines/ticker-g12.mc at generation 4096
 ```
 
 Use `--engine=streamlife` for StreamLife and `--workers=N` to select the number of worker threads.
