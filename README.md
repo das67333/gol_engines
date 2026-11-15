@@ -45,14 +45,12 @@ target/release/gol_engines_cli update res/golly-ticker.rle \
     --mem-limit-gib=1 --gens-log2=12 --output=ticker-g12.mc
 ```
 
-Example output (timings, timestamps and absolute paths vary):
-
 ```text
 Initialized and loaded in 0.0 secs; generation 0/4096
 Time spent on hashlife executor: 37.756833ms
 Nodes count: 234802 / 16777216
-<timestamp>  Generation 4096/4096; S12; step 0.04s; elapsed 0.0s
-Saved /path/to/gol_engines/ticker-g12.mc at generation 4096
+2026-11-15T23:02:52.164  Generation 4096/4096; S12; step 0.04s; elapsed 0.0s
+Saved /private/var/folders/jl/y8jfmgd960s7cdtdrr_b4bwr0000gn/T/gol-readme-check-eo3h_w0z/repo/ticker-g12.mc at generation 4096
 ```
 
 Use `--engine=streamlife` for StreamLife and `--workers=N` to select the number of worker threads.
@@ -101,8 +99,6 @@ Population: 593_927
 Optional per-thread runtime statistics can be enabled with `--features cli_deps,statistics` at build time.
 
 ## Long simulations
-
-Checkpointing and `resume` require CLI version 0.3.2 or newer.
 
 Add `--checkpoint-dir=run` to `update` to save the initial state and each completed step, retaining
 the latest checkpoint.
