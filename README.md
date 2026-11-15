@@ -144,7 +144,7 @@ Runs used 45 workers and steps of `2^29` generations:
 
 | Pattern | Budget, GiB | Total time | Peak RSS, GiB |
 | --- | ---: | ---: | ---: |
-| [`complete_default.mc`](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc) | 160 | 5 h 44 min 37 s | 173.87 |
+| [`complete_default.mc`](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc) | 160 | **5 h 44 min 37 s** | 173.87 |
 | [`complete_default.mc`](https://gitlab.com/apgoucher/slmake/-/blob/57f0f47f1dc7832ce0f5cbb1773fea45f1491b3c/metacell/complete_default.mc) | 288 | **3 h 25 min 24 s** | 303.65 |
 | [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | 288 | **3 h 59 min 35 s** | 306.84 |
 
