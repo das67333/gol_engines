@@ -83,10 +83,6 @@ pub(super) struct Progress {
     generation: BigInt,
     #[serde(with = "decimal")]
     target: BigInt,
-    #[serde(with = "decimal")]
-    offset_x: BigInt,
-    #[serde(with = "decimal")]
-    offset_y: BigInt,
     step_log2: u32,
     elapsed_seconds: f64,
 }
@@ -104,8 +100,6 @@ impl Progress {
         Self {
             generation: BigInt::ZERO,
             target: BigInt::from(1) << gens_log2,
-            offset_x: BigInt::ZERO,
-            offset_y: BigInt::ZERO,
             step_log2,
             elapsed_seconds: 0.0,
         }
@@ -204,20 +198,15 @@ fn run(
     let mut can_retry = false;
     while let Some(mut step) = progress.next_step() {
         let started = Instant::now();
-        let offsets = match advance(&mut step, &mut can_retry, |s| engine.update(s)) {
-            Ok(offsets) => offsets,
-            Err(error) => {
-                eprintln!(
-                    "Stopped at generation {}/{}; the unfinished step was discarded",
-                    progress.generation, progress.target
-                );
-                return Err(error);
-            }
-        };
+        if let Err(error) = advance(&mut step, &mut can_retry, |s| engine.update(s)) {
+            eprintln!(
+                "Stopped at generation {}/{}; the unfinished step was discarded",
+                progress.generation, progress.target
+            );
+            return Err(error);
+        }
         progress.generation += BigInt::from(1) << step;
         progress.step_log2 = step;
-        progress.offset_x += &offsets[0];
-        progress.offset_y += &offsets[1];
         progress.elapsed_seconds = elapsed_before + timer.elapsed().as_secs_f64();
         if let Some(store) = &mut checkpoints {
             store
@@ -256,15 +245,7 @@ fn run(
 }
 
 fn save_output(path: &Path, pattern: &Pattern) -> Result<()> {
-    let format = if path.extension().is_some_and(|e| e == "mc") {
-        PatternFormat::Macrocell
-    } else if path.to_str().is_some_and(|s| s.ends_with(".mc.gz")) {
-        PatternFormat::CompressedMacrocell
-    } else if path.extension().is_some_and(|e| e == "rle") {
-        PatternFormat::RLE
-    } else {
-        anyhow::bail!("Cannot infer format from file path: {}", path.display());
-    };
+    let format = PatternFormat::from_path(path)?;
     atomic_write(path, &pattern.to_format(format)?)
 }
 
@@ -272,12 +253,12 @@ fn advance(
     step_log2: &mut u32,
     can_retry: &mut bool,
     mut update: impl FnMut(u32) -> Result<[BigInt; 2]>,
-) -> Result<[BigInt; 2]> {
+) -> Result<()> {
     loop {
         match update(*step_log2) {
-            Ok(offsets) => {
+            Ok(_) => {
                 *can_retry = true;
-                return Ok(offsets);
+                return Ok(());
             }
             Err(error) if error.is::<UpdateCancelled>() => return Err(error),
             Err(error) => {
