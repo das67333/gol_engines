@@ -145,8 +145,6 @@ Times are seconds for one update by `2^G` generations from the input, excluding 
 Golly and lifelib use one core. Columns 1–32 show GoL Engines at that many physical cores.
 Within each row, all implementations used the same memory budget, chosen so each algorithm had
 room for all the nodes it created during the update.
-Doubling the generation count required GC in GoL Engines except for Caterloopillar and the new
-0E0P design. Caterloopillar also fit at G120 with 16 GiB.
 
 **HashLife**
 
@@ -175,7 +173,6 @@ and StreamLife 19.9× at G27. For the same G14 update on 32 cores with 40 GiB, S
 and HashLife took 22.78 s.
 
 For New 0E0P design, update time and memory use stayed nearly constant from G29 through G100.
-At G100, HashLife was faster on 1–16 cores and similar to StreamLife on 32 cores.
 GoL Engines HashLife also completed G100 on 32 cores without
 GC at a 36 GiB budget (34.56 GiB peak RSS); the table uses 48 GiB so Golly fits too.
 
