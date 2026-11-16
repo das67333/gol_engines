@@ -146,8 +146,7 @@ Golly and lifelib use one core. Columns 1–32 show GoL Engines at that many phy
 Within each row, all implementations used the same memory budget, chosen so each algorithm had
 room for all the nodes it created during the update.
 Doubling the generation count required GC in GoL Engines except for Caterloopillar and the new
-0E0P design. Caterloopillar also fit at G120 with 16 GiB; the new design's time and memory
-stayed nearly constant from G29 through G100.
+0E0P design. Caterloopillar also fit at G120 with 16 GiB.
 
 **HashLife**
 
@@ -173,8 +172,11 @@ stayed nearly constant from G29 through G100.
 
 On the original 0E0P metaglider, moving from 1 to 32 cores sped up HashLife 31.1× at G14
 and StreamLife 19.9× at G27. For the same G14 update on 32 cores with 40 GiB, StreamLife took 1.16 s
-and HashLife took 22.78 s. On the new 0E0P design at G100, HashLife was faster on 1–16 cores
-and similar to StreamLife on 32 cores. GoL Engines HashLife also completed G100 on 32 cores without
+and HashLife took 22.78 s.
+
+For New 0E0P design, update time and memory use stayed nearly constant from G29 through G100.
+At G100, HashLife was faster on 1–16 cores and similar to StreamLife on 32 cores.
+GoL Engines HashLife also completed G100 on 32 cores without
 GC at a 36 GiB budget (34.56 GiB peak RSS); the table uses 48 GiB so Golly fits too.
 
 Full 0E0P metatick benchmarks (`2^36` generations) used StreamLife on a Spot `c3d-standard-90` VM
