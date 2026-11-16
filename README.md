@@ -145,15 +145,16 @@ Times are seconds for one update by `2^G` generations from the input, excluding 
 Golly and lifelib use one core. Columns 1–32 show GoL Engines at that many physical cores.
 Within each row, all implementations used the same memory budget, chosen so each algorithm had
 room for all the nodes it created during the update.
-Doubling the generation count required GC in GoL Engines for every row except Caterloopillar,
-which also fit at G120 with 16 GiB.
+Doubling the generation count required GC in GoL Engines except for Caterloopillar and Hippo.69's
+0E0P construction. Caterloopillar also fit at G120 with 16 GiB; the construction's time and memory
+stayed nearly constant from G29 through G100.
 
 **HashLife**
 
 | Pattern | G | Budget, GiB | Golly | lifelib | 1 | 2 | 4 | 8 | 16 | 32 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | 14 | 40 | 701.22 | 1398.42 | 708.43 | 332.45 | 175.01 | 86.21 | 44.36 | 22.78 |
-| [0E0P construction (Hippo.69)](res/very_large_patterns/0e0pcells6.mc.gz) | 27 | 20 | 263.23 | 379.63 | 155.18 | 81.18 | 46.59 | 34.48 | 36.48 | 38.14 |
+| [0E0P construction (Hippo.69)](res/very_large_patterns/0e0pcells6.mc.gz) | 100 | 48 | 772.88 | 707.73 | 437.57 | 222.77 | 123.32 | 82.61 | 77.46 | 78.81 |
 | [Pi calculator](res/very_large_patterns/pi.mc.gz) | 37 | 16 | 54.87 | 122.29 | 53.46 | 51.45 | 51.38 | 51.79 | 60.41 | 65.15 |
 | [Demonoid](res/very_large_patterns/0hd-demonoid-p438852.mc.gz) | 21 | 16 | 96.40 | 277.99 | 112.23 | 55.49 | 27.57 | 13.97 | 8.26 | 4.79 |
 | [Caterloopillar](res/very_large_patterns/caterloopillar-c17.mc.gz) | 100 | 16 | 6.74 | 8.33 | 4.01 | 2.08 | 1.10 | 0.62 | 0.45 | 0.33 |
@@ -164,7 +165,7 @@ which also fit at G120 with 16 GiB.
 | Pattern | G | Budget, GiB | lifelib | 1 | 2 | 4 | 8 | 16 | 32 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | 27 | 48 | 1319.78 | 658.43 | 337.02 | 174.00 | 92.25 | 53.70 | 33.16 |
-| [0E0P construction (Hippo.69)](res/very_large_patterns/0e0pcells6.mc.gz) | 27 | 24 | 647.39 | 370.97 | 191.26 | 101.72 | 59.17 | 56.10 | 51.56 |
+| [0E0P construction (Hippo.69)](res/very_large_patterns/0e0pcells6.mc.gz) | 100 | 56 | 1048.85 | 733.37 | 376.69 | 195.53 | 110.74 | 90.82 | 79.36 |
 | [Pi calculator](res/very_large_patterns/pi.mc.gz) | 37 | 16 | 256.28 | 151.51 | 100.30 | 93.17 | 99.39 | 160.56 | 174.14 |
 | [Demonoid](res/very_large_patterns/0hd-demonoid-p438852.mc.gz) | 30 | 16 | 350.57 | 201.33 | 101.51 | 57.42 | 36.19 | 51.81 | 54.07 |
 | [Caterloopillar](res/very_large_patterns/caterloopillar-c17.mc.gz) | 100 | 16 | 19.19 | 11.40 | 5.82 | 2.98 | 1.60 | 1.09 | 0.83 |
@@ -172,7 +173,9 @@ which also fit at G120 with 16 GiB.
 
 On the original 0E0P metaglider, moving from 1 to 32 cores sped up HashLife 31.1× at G14
 and StreamLife 19.9× at G27. For the same G14 update on 32 cores with 40 GiB, StreamLife took 1.16 s
-and HashLife took 22.78 s. On Hippo.69’s 0E0P construction at G27, HashLife was faster at every measured core count.
+and HashLife took 22.78 s. On Hippo.69's construction at G100, HashLife was faster on 1–16 cores
+and similar to StreamLife on 32 cores. GoL Engines HashLife also completed G100 on 32 cores without
+GC at a 36 GiB budget (34.56 GiB peak RSS); the table uses 48 GiB so Golly fits too.
 
 Full 0E0P metatick benchmarks (`2^36` generations) used StreamLife on a Spot `c3d-standard-90` VM
 with 360 GiB RAM in the same region, at about
