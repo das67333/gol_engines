@@ -138,36 +138,41 @@ Scaling benchmarks used a Google Cloud Spot (preemptible) `c3d-highcpu-90` VM in
 [US$0.40/hour](https://cloud.google.com/spot-vms/pricing) for CPU and memory.
 Core counts below refer to physical cores, using one hardware thread per core.
 
-The scaling tables compare GoL Engines 0.3.1 release builds with
+The scaling tables compare GoL Engines 0.3.2 release builds with
 [lifelib 2.5.9](https://gitlab.com/apgoucher/lifelib/-/tree/05632e382096925c0b1724fd59d2f0784f0213d6)
 and [Golly 5.0](https://golly.sourceforge.io/).
 Times are seconds for one update by `2^G` generations from the input, excluding file loading.
-Golly and lifelib use one core; columns 1–32 show GoL Engines at that many cores.
-Each implementation uses the same memory budget for a given pattern.
+Golly and lifelib use one core. Columns 1–32 show GoL Engines at that many physical cores.
+Within each row, all implementations used the same memory budget, chosen so each algorithm had
+room for all the nodes it created during the update.
+Doubling the generation count required GC in GoL Engines for every row except Caterloopillar,
+which also fit at G120 with 16 GiB.
 
 **HashLife**
 
 | Pattern | G | Budget, GiB | Golly | lifelib | 1 | 2 | 4 | 8 | 16 | 32 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | 11 | 64 | 81.33 | 156.17 | 78.54 | 38.06 | 18.65 | 9.53 | 4.89 | 2.68 |
-| [Pi calculator](res/very_large_patterns/pi.mc.gz) | 31 | 16 | 4.38 | 3.82 | 2.54 | 2.10 | 2.00 | 2.00 | 2.42 | 2.69 |
-| [Demonoid](res/very_large_patterns/0hd-demonoid-p438852.mc.gz) | 20 | 16 | 47.47 | 130.91 | 61.07 | 29.39 | 14.79 | 7.41 | 3.95 | 2.53 |
-| [Caterloopillar](res/very_large_patterns/caterloopillar-c17.mc.gz) | 36 | 16 | 6.65 | 8.23 | 4.38 | 2.24 | 1.15 | 0.62 | 0.39 | 0.27 |
-| [Mersenne 44497](res/very_large_patterns/mersenne-44497.mc.gz) | 28 | 16 | 1.07 | 2.56 | 1.18 | 1.24 | 1.27 | 1.23 | 1.61 | 1.75 |
+| [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | 14 | 40 | 701.22 | 1398.42 | 708.43 | 332.45 | 175.01 | 86.21 | 44.36 | 22.78 |
+| [0E0P construction (Hippo.69)](res/very_large_patterns/0e0pcells6.mc.gz) | 27 | 20 | 263.23 | 379.63 | 155.18 | 81.18 | 46.59 | 34.48 | 36.48 | 38.14 |
+| [Pi calculator](res/very_large_patterns/pi.mc.gz) | 37 | 16 | 54.87 | 122.29 | 53.46 | 51.45 | 51.38 | 51.79 | 60.41 | 65.15 |
+| [Demonoid](res/very_large_patterns/0hd-demonoid-p438852.mc.gz) | 21 | 16 | 96.40 | 277.99 | 112.23 | 55.49 | 27.57 | 13.97 | 8.26 | 4.79 |
+| [Caterloopillar](res/very_large_patterns/caterloopillar-c17.mc.gz) | 100 | 16 | 6.74 | 8.33 | 4.01 | 2.08 | 1.10 | 0.62 | 0.45 | 0.33 |
+| [Mersenne 44497](res/very_large_patterns/mersenne-44497.mc.gz) | 34 | 16 | 54.98 | 134.02 | 59.99 | 60.23 | 60.72 | 61.69 | 69.83 | 73.35 |
 
 **StreamLife**
 
 | Pattern | G | Budget, GiB | lifelib | 1 | 2 | 4 | 8 | 16 | 32 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | 11 | 64 | 32.90 | 17.64 | 9.08 | 4.45 | 2.60 | 1.56 | 0.96 |
-| [Pi calculator](res/very_large_patterns/pi.mc.gz) | 31 | 16 | 7.92 | 5.72 | 3.47 | 3.43 | 3.23 | 4.58 | 5.34 |
-| [Demonoid](res/very_large_patterns/0hd-demonoid-p438852.mc.gz) | 20 | 16 | 8.48 | 5.96 | 3.05 | 1.64 | 1.05 | 1.46 | 1.52 |
-| [Caterloopillar](res/very_large_patterns/caterloopillar-c17.mc.gz) | 36 | 16 | 18.98 | 11.56 | 5.83 | 2.97 | 1.51 | 0.99 | 0.61 |
-| [Mersenne 44497](res/very_large_patterns/mersenne-44497.mc.gz) | 28 | 16 | 5.53 | 3.43 | 2.49 | 3.11 | 3.14 | 4.45 | 4.82 |
+| [0E0P metaglider](res/very_large_patterns/0e0p-metaglider.mc.gz) | 27 | 48 | 1319.78 | 658.43 | 337.02 | 174.00 | 92.25 | 53.70 | 33.16 |
+| [0E0P construction (Hippo.69)](res/very_large_patterns/0e0pcells6.mc.gz) | 27 | 24 | 647.39 | 370.97 | 191.26 | 101.72 | 59.17 | 56.10 | 51.56 |
+| [Pi calculator](res/very_large_patterns/pi.mc.gz) | 37 | 16 | 256.28 | 151.51 | 100.30 | 93.17 | 99.39 | 160.56 | 174.14 |
+| [Demonoid](res/very_large_patterns/0hd-demonoid-p438852.mc.gz) | 30 | 16 | 350.57 | 201.33 | 101.51 | 57.42 | 36.19 | 51.81 | 54.07 |
+| [Caterloopillar](res/very_large_patterns/caterloopillar-c17.mc.gz) | 100 | 16 | 19.19 | 11.40 | 5.82 | 2.98 | 1.60 | 1.09 | 0.83 |
+| [Mersenne 44497](res/very_large_patterns/mersenne-44497.mc.gz) | 34 | 16 | 277.30 | 174.86 | 125.02 | 122.62 | 132.63 | 206.65 | 220.86 |
 
-On the metaglider at G11, HashLife speeds up 29.3× from 1 to 32 cores; StreamLife speeds up 18.3×
-and remains faster in absolute time. Pi and Mersenne have limited parallelism and can slow down
-with more workers. Golly is fastest on Mersenne in this comparison.
+On the original 0E0P metaglider, moving from 1 to 32 cores sped up HashLife 31.1× at G14
+and StreamLife 19.9× at G27. For the same G14 update on 32 cores with 40 GiB, StreamLife took 1.16 s
+and HashLife took 22.78 s. On Hippo.69’s 0E0P construction at G27, HashLife was faster at every measured core count.
 
 Full 0E0P metatick benchmarks (`2^36` generations) used StreamLife on a Spot `c3d-standard-90` VM
 with 360 GiB RAM in the same region, at about
