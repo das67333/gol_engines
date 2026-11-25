@@ -83,9 +83,13 @@ fn sweep_bucket<E: HashtableSlot, F: Fn(&E) -> bool>(
     free: &mut FreeBatches,
     is_dead: &F,
 ) -> usize {
+    let orig_head = table.buckets[bucket].load(Ordering::Relaxed);
+    if orig_head == NULL_IDX {
+        return 0;
+    }
     let mut live = 0usize;
     let mut new_head = NULL_IDX;
-    let mut cur = table.buckets[bucket].load(Ordering::Relaxed);
+    let mut cur = orig_head;
     while cur != NULL_IDX {
         let entry = table.get(cur);
         let next = entry.next().load(Ordering::Relaxed);
@@ -98,7 +102,9 @@ fn sweep_bucket<E: HashtableSlot, F: Fn(&E) -> bool>(
         }
         cur = next;
     }
-    table.buckets[bucket].store(new_head, Ordering::Relaxed);
+    if new_head != orig_head {
+        table.buckets[bucket].store(new_head, Ordering::Relaxed);
+    }
     live
 }
 
