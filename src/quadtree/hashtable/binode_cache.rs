@@ -1,7 +1,6 @@
 use super::base::{CacheField, ConcurrentHashTable, HashtableSlot, Idx, NULL_IDX};
 use super::node_store::{ShardedRef, NodeStore};
 use super::super::{parallel_executors::GcSweepExecutor, status};
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 pub struct CacheEntry {
@@ -51,21 +50,21 @@ impl CacheEntry {
 /// Caches results of `StreamLife`'s `update_binode` operation.
 pub struct BinodeCache {
     inner: ConcurrentHashTable<CacheEntry>,
-    hasher: ahash::AHasher,
 }
 
 impl BinodeCache {
     pub fn new(cap_log2: u32, entry_capacity: usize, threads_cnt: usize) -> Self {
         Self {
             inner: ConcurrentHashTable::new(cap_log2, entry_capacity, threads_cnt),
-            hasher: ahash::AHasher::default(),
         }
     }
 
+    #[inline]
     fn hash(&self, key: (Idx, Idx)) -> usize {
-        let mut hasher = self.hasher.clone();
-        key.hash(&mut hasher);
-        hasher.finish() as usize
+        let mut h = (u64::from(key.0) << 32) | u64::from(key.1);
+        h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (h ^ (h >> 31)) as usize
     }
 
     pub fn find(&self, key: (Idx, Idx)) -> Option<Idx> {
