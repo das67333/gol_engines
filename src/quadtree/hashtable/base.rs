@@ -74,10 +74,12 @@ pub(crate) const RECYCLE_BATCH_SIZE: usize = CHUNK_SIZE as usize / 64;
 /// leaf allocation each; the reserve also covers the current pseudochild.
 const MAX_ALLOCS_PER_TASK: usize = 64;
 
+#[inline]
 pub(super) fn chunk_id(idx: Idx) -> u32 {
     idx >> CHUNK_LOG2
 }
 
+#[inline]
 pub(super) fn offset_in_chunk(idx: Idx) -> u32 {
     idx & OFFSET_MASK
 }
@@ -173,9 +175,10 @@ impl<E> Chunk<E> {
     /// Get a raw pointer to a slot inside this chunk. Caller must have
     /// observed (e.g. via Acquire load through bucket head) that the
     /// chunk has been claimed.
+    #[inline]
     pub(super) fn slot(&self, offset: u32) -> *mut UnsafeCell<E> {
         let base = self.storage.load(Ordering::Acquire);
-        assert!(!base.is_null(), "lookup of Idx in unclaimed chunk");
+        debug_assert!(!base.is_null(), "lookup of Idx in unclaimed chunk");
         unsafe { base.add(offset as usize) }
     }
 
@@ -356,6 +359,7 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
         let _ = hash;
     }
 
+    #[inline]
     pub(crate) fn get(&self, idx: Idx) -> &E {
         // TODO: assert_ne!(idx, NULL_IDX, "get(NULL_IDX)");
         let cid = chunk_id(idx);
