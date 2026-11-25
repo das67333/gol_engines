@@ -57,6 +57,117 @@ fn update_row(row_prev: u16, row_curr: u16, row_next: u16) -> u16 {
 /// This is the base case of Hashlife recursion. Combines 4 leaf nodes (8x8 each)
 /// into a 16x16 grid, simulates forward, and extracts the center 8x8 result.
 /// `nw`, `ne`, `sw`, `se` must be leaves.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "avx512vl")]
+unsafe fn update_leaves_avx512vl(
+    nw: [u8; 8],
+    ne: [u8; 8],
+    sw: [u8; 8],
+    se: [u8; 8],
+    steps: u64,
+) -> u64 {
+    use std::arch::x86_64::*;
+    let mut rows = [0u16; 16];
+    for i in 0..8 {
+        rows[i] = u16::from_le_bytes([nw[i], ne[i]]);
+        rows[i + 8] = u16::from_le_bytes([sw[i], se[i]]);
+    }
+    unsafe {
+        let zero = _mm256_setzero_si256();
+        let mut grid = _mm256_loadu_si256(rows.as_ptr().cast());
+        for _ in 0..steps {
+            let prev_src = _mm256_permute2x128_si256(zero, grid, 0x21);
+            let b = _mm256_alignr_epi8(grid, prev_src, 14);
+            let next_src = _mm256_permute2x128_si256(grid, zero, 0x21);
+            let f = _mm256_alignr_epi8(next_src, grid, 2);
+            let i = grid;
+
+            let a = _mm256_slli_epi16(b, 1);
+            let c = _mm256_srli_epi16(b, 1);
+            let h = _mm256_slli_epi16(i, 1);
+            let d = _mm256_srli_epi16(i, 1);
+            let g = _mm256_slli_epi16(f, 1);
+            let e = _mm256_srli_epi16(f, 1);
+
+            let s0 = _mm256_ternarylogic_epi64(a, b, c, 0x96);
+            let c0 = _mm256_ternarylogic_epi64(a, b, c, 0xE8);
+            let s1 = _mm256_ternarylogic_epi64(g, f, e, 0x96);
+            let c1 = _mm256_ternarylogic_epi64(g, f, e, 0xE8);
+            let s2 = _mm256_xor_si256(h, d);
+            let c2 = _mm256_and_si256(h, d);
+            let bit0 = _mm256_ternarylogic_epi64(s0, s1, s2, 0x96);
+            let c3 = _mm256_ternarylogic_epi64(s0, s1, s2, 0xE8);
+            let u = _mm256_ternarylogic_epi64(c0, c1, c2, 0x96);
+            let v = _mm256_ternarylogic_epi64(c0, c1, c2, 0xE8);
+            let one_carry = _mm256_ternarylogic_epi64(v, u, c3, 0x06);
+            grid = _mm256_ternarylogic_epi64(i, bit0, one_carry, 0xA8);
+        }
+        _mm256_storeu_si256(rows.as_mut_ptr().cast(), grid);
+    }
+    let arr: [u16; 8] = rows[4..12].try_into().unwrap();
+    u64::from_le_bytes(arr.map(|x| (x >> 4) as u8))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn update_leaves_avx2(
+    nw: [u8; 8],
+    ne: [u8; 8],
+    sw: [u8; 8],
+    se: [u8; 8],
+    steps: u64,
+) -> u64 {
+    use std::arch::x86_64::*;
+    let mut rows = [0u16; 16];
+    for i in 0..8 {
+        rows[i] = u16::from_le_bytes([nw[i], ne[i]]);
+        rows[i + 8] = u16::from_le_bytes([sw[i], se[i]]);
+    }
+    unsafe {
+        let zero = _mm256_setzero_si256();
+        let mut grid = _mm256_loadu_si256(rows.as_ptr().cast());
+        for _ in 0..steps {
+            let prev_src = _mm256_permute2x128_si256(zero, grid, 0x21);
+            let b = _mm256_alignr_epi8(grid, prev_src, 14);
+            let next_src = _mm256_permute2x128_si256(grid, zero, 0x21);
+            let f = _mm256_alignr_epi8(next_src, grid, 2);
+            let i = grid;
+
+            let a = _mm256_slli_epi16(b, 1);
+            let c = _mm256_srli_epi16(b, 1);
+            let h = _mm256_slli_epi16(i, 1);
+            let d = _mm256_srli_epi16(i, 1);
+            let g = _mm256_slli_epi16(f, 1);
+            let e = _mm256_srli_epi16(f, 1);
+
+            let ab_xor = _mm256_xor_si256(a, b);
+            let s0 = _mm256_xor_si256(ab_xor, c);
+            let c0 = _mm256_or_si256(_mm256_and_si256(a, b), _mm256_and_si256(c, ab_xor));
+
+            let gf_xor = _mm256_xor_si256(g, f);
+            let s1 = _mm256_xor_si256(gf_xor, e);
+            let c1 = _mm256_or_si256(_mm256_and_si256(g, f), _mm256_and_si256(e, gf_xor));
+
+            let s2 = _mm256_xor_si256(h, d);
+            let c2 = _mm256_and_si256(h, d);
+
+            let s01_xor = _mm256_xor_si256(s0, s1);
+            let bit0 = _mm256_xor_si256(s01_xor, s2);
+            let c3 = _mm256_or_si256(_mm256_and_si256(s0, s1), _mm256_and_si256(s2, s01_xor));
+
+            let c01_xor = _mm256_xor_si256(c0, c1);
+            let u = _mm256_xor_si256(c01_xor, c2);
+            let v = _mm256_or_si256(_mm256_and_si256(c0, c1), _mm256_and_si256(c2, c01_xor));
+
+            let one_carry = _mm256_andnot_si256(v, _mm256_xor_si256(u, c3));
+            grid = _mm256_and_si256(_mm256_or_si256(i, bit0), one_carry);
+        }
+        _mm256_storeu_si256(rows.as_mut_ptr().cast(), grid);
+    }
+    let arr: [u16; 8] = rows[4..12].try_into().unwrap();
+    u64::from_le_bytes(arr.map(|x| (x >> 4) as u8))
+}
+
 pub(super) fn update_leaves<Meta: Default + Sync>(
     mem: &impl NodeAccess<Meta>,
     nw: Idx,
@@ -66,6 +177,22 @@ pub(super) fn update_leaves<Meta: Default + Sync>(
     steps: u64,
 ) -> Idx {
     let [nw, ne, sw, se] = [nw, ne, sw, se].map(|x| mem.get(x).leaf_cells());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            return mem.find_or_create_leaf_from_u64(unsafe {
+                update_leaves_avx512vl(nw, ne, sw, se, steps)
+            });
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return mem.find_or_create_leaf_from_u64(unsafe {
+                update_leaves_avx2(nw, ne, sw, se, steps)
+            });
+        }
+    }
 
     let mut src = [0; 16];
     for i in 0..8 {
