@@ -324,9 +324,10 @@ where
                 data.mask9_waiting = 0b1_1111_1111;
             }
 
-            // Bias `waiting_cnt` so concurrent notifiers cannot drive it
-            // to zero while we are still scanning.
-            waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            // Lazily bias `waiting_cnt` only if at least one child is not yet
+            // FINISHED, and batch all per-child increments into the final sub.
+            let mut biased = false;
+            let mut registered = 0u16;
             for (i, x) in data.arr.iter_mut().enumerate() {
                 if data.mask9_waiting & (1 << i) == 0 {
                     continue;
@@ -335,30 +336,41 @@ where
                 if task.size_log2 == LEAF_SIZE_LOG2 + 2 {
                     try_complete_base_case(mem, d, generations_log2);
                 }
+                if is_finished(&d.status) {
+                    data.mask9_waiting &= !(1 << i);
+                    *x = d.cache.get_value();
+                    continue;
+                }
+                if !biased {
+                    waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+                    biased = true;
+                }
                 match handle_dependency(d, dep) {
                     DependencyHandlingResult::Ready => {
                         data.mask9_waiting &= !(1 << i);
                         *x = d.cache.get_value();
                     }
                     DependencyHandlingResult::StartedByThisThread => {
-                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        registered += 1;
                         enqueue(Task::new(*x, task.size_log2 - 1));
                     }
                     DependencyHandlingResult::StartedByOtherThread => {
-                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        registered += 1;
                     }
                 }
             }
-            let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
-
-            if data.mask9_waiting != 0 {
-                if prev == WAITING_BIAS {
-                    // Every dependency we registered already notified
-                    // before our `fetch_sub`; re-queue ourselves so the
-                    // mask gets re-scanned with their now-`Ready` status.
-                    enqueue(Task::new(task.idx, task.size_log2));
+            if biased {
+                let sub = WAITING_BIAS - registered;
+                let prev = waiting_cnt.fetch_sub(sub, Ordering::AcqRel);
+                if data.mask9_waiting != 0 {
+                    if prev == sub {
+                        // Every dependency we registered already notified
+                        // before our `fetch_sub`; re-queue ourselves so the
+                        // mask gets re-scanned with their now-`Ready` status.
+                        enqueue(Task::new(task.idx, task.size_log2));
+                    }
+                    return None;
                 }
-                return None;
             }
         } else {
             data.arr = algorithm::nine_children_disjoint(mem, nw, ne, sw, se, task.size_log2 - 1);
@@ -369,7 +381,8 @@ where
         data.mask4_waiting = 0b1111;
     }
 
-    waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+    let mut biased = false;
+    let mut registered = 0u16;
     for (i, x) in data.arr.iter_mut().take(4).enumerate() {
         if data.mask4_waiting & (1 << i) == 0 {
             continue;
@@ -378,27 +391,38 @@ where
         if task.size_log2 == LEAF_SIZE_LOG2 + 2 {
             try_complete_base_case(mem, d, generations_log2);
         }
+        if is_finished(&d.status) {
+            data.mask4_waiting &= !(1 << i);
+            *x = d.cache.get_value();
+            continue;
+        }
+        if !biased {
+            waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            biased = true;
+        }
         match handle_dependency(d, dep) {
             DependencyHandlingResult::Ready => {
                 data.mask4_waiting &= !(1 << i);
                 *x = d.cache.get_value();
             }
             DependencyHandlingResult::StartedByThisThread => {
-                waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                registered += 1;
                 enqueue(Task::new(*x, task.size_log2 - 1));
             }
             DependencyHandlingResult::StartedByOtherThread => {
-                waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                registered += 1;
             }
         }
     }
-    let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
-
-    if data.mask4_waiting != 0 {
-        if prev == WAITING_BIAS {
-            enqueue(Task::new(task.idx, task.size_log2));
+    if biased {
+        let sub = WAITING_BIAS - registered;
+        let prev = waiting_cnt.fetch_sub(sub, Ordering::AcqRel);
+        if data.mask4_waiting != 0 {
+            if prev == sub {
+                enqueue(Task::new(task.idx, task.size_log2));
+            }
+            return None;
         }
-        return None;
     }
 
     Some(mem.find_or_create_node(data.arr[0], data.arr[1], data.arr[2], data.arr[3]))
