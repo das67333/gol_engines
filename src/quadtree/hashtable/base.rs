@@ -344,6 +344,18 @@ impl<E: HashtableSlot> ConcurrentHashTable<E> {
     ///
     /// # Panics (debug)
     /// If `idx == NULL_IDX` or its chunk is not yet claimed.
+    #[inline]
+    pub(super) fn prefetch_bucket(&self, hash: usize) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let bucket = hash & (self.buckets.len() - 1);
+            let ptr = self.buckets.as_ptr().add(bucket).cast::<i8>();
+            std::arch::x86_64::_mm_prefetch(ptr, std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = hash;
+    }
+
     pub(crate) fn get(&self, idx: Idx) -> &E {
         // TODO: assert_ne!(idx, NULL_IDX, "get(NULL_IDX)");
         let cid = chunk_id(idx);

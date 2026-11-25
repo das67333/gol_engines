@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 pub trait NodeAccess<Meta: Default + Sync> {
     fn should_stop(&self) -> bool;
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta>;
+    fn prefetch_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx);
     fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx;
     fn find_or_create_leaf_from_u64(&self, value: u64) -> Idx;
     fn find_or_create_leaf_from_parts(&self, nw: u16, ne: u16, sw: u16, se: u16) -> Idx;
@@ -43,6 +44,9 @@ impl<Meta: Default + Sync> NodeAccess<Meta> for NodeStore<Meta> {
     }
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
         self.get(idx)
+    }
+    fn prefetch_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) {
+        self.prefetch_node(nw, ne, sw, se)
     }
     fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx {
         self.find_or_create_node(nw, ne, sw, se)
@@ -135,6 +139,11 @@ impl<Meta: Default + Sync> NodeStore<Meta> {
                 (*slot).se = 0;
             },
         )
+    }
+
+    #[inline]
+    pub fn prefetch_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) {
+        self.inner.prefetch_bucket(compute_hash(nw, ne, sw, se));
     }
 
     /// Find a node with the given children. If not found, it is created.
@@ -268,6 +277,11 @@ impl<Meta: Default + Sync> NodeStoreRef<'_, Meta> {
         result
     }
 
+    #[inline]
+    pub fn prefetch_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) {
+        self.base.prefetch_node(nw, ne, sw, se);
+    }
+
     pub fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx {
         let (result, inserted) =
             self.base
@@ -285,6 +299,9 @@ impl<Meta: Default + Sync> NodeAccess<Meta> for NodeStoreRef<'_, Meta> {
     }
     fn get(&self, idx: Idx) -> &QuadTreeNode<Meta> {
         self.get(idx)
+    }
+    fn prefetch_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) {
+        self.prefetch_node(nw, ne, sw, se)
     }
     fn find_or_create_node(&self, nw: Idx, ne: Idx, sw: Idx, se: Idx) -> Idx {
         self.find_or_create_node(nw, ne, sw, se)

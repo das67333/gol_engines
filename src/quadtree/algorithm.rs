@@ -112,6 +112,11 @@ pub(super) fn nine_children_overlapping<Meta: Default + Sync>(
     se: Idx,
 ) -> [Idx; 9] {
     let [nw_, ne_, sw_, se_] = [nw, ne, sw, se].map(|x| mem.get(x));
+    mem.prefetch_node(nw_.ne, ne_.nw, nw_.se, ne_.sw);
+    mem.prefetch_node(nw_.sw, nw_.se, sw_.nw, sw_.ne);
+    mem.prefetch_node(nw_.se, ne_.sw, sw_.ne, se_.nw);
+    mem.prefetch_node(ne_.sw, ne_.se, se_.nw, se_.ne);
+    mem.prefetch_node(sw_.ne, se_.nw, sw_.se, se_.sw);
     [
         nw,
         mem.find_or_create_node(nw_.ne, ne_.nw, nw_.se, ne_.sw),
@@ -209,6 +214,10 @@ pub(super) fn four_children_overlapping<Meta: Default + Sync>(
     mem: &impl NodeAccess<Meta>,
     arr: &[Idx; 9],
 ) -> [Idx; 4] {
+    mem.prefetch_node(arr[0], arr[1], arr[3], arr[4]);
+    mem.prefetch_node(arr[1], arr[2], arr[4], arr[5]);
+    mem.prefetch_node(arr[3], arr[4], arr[6], arr[7]);
+    mem.prefetch_node(arr[4], arr[5], arr[7], arr[8]);
     [
         mem.find_or_create_node(arr[0], arr[1], arr[3], arr[4]),
         mem.find_or_create_node(arr[1], arr[2], arr[4], arr[5]),
