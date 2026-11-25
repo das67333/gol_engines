@@ -653,35 +653,48 @@ impl BiExecutorThread<'_> {
         };
 
         if data.hash_mask != 0 {
-            waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            let mut biased = false;
+            let mut registered = 0u16;
             for (b, target) in targets.iter().enumerate() {
                 if data.hash_mask & (1 << b) == 0 {
                     continue;
                 }
                 let target_node = self.node_ref.get(*target);
+                if is_finished(&target_node.status) {
+                    data.hash_mask &= !(1 << b);
+                    data.hash_results[b] = target_node.cache.get_value();
+                    continue;
+                }
+                if !biased {
+                    waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+                    biased = true;
+                }
                 match handle_dependency(target_node, dep) {
                     DependencyHandlingResult::Ready => {
                         data.hash_mask &= !(1 << b);
                         data.hash_results[b] = target_node.cache.get_value();
                     }
                     DependencyHandlingResult::StartedByThisThread => {
-                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        registered += 1;
                         self.hash_queue.push(Task::new(*target, size_log2));
                     }
                     DependencyHandlingResult::StartedByOtherThread => {
-                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        registered += 1;
                     }
                 }
             }
-            let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
-            if data.hash_mask != 0 {
-                if prev == WAITING_BIAS {
-                    self.bi_queue.push(BiTask {
-                        entry_idx: parent_entry_idx,
-                        size_log2,
-                    });
+            if biased {
+                let sub = WAITING_BIAS - registered;
+                let prev = waiting_cnt.fetch_sub(sub, Ordering::AcqRel);
+                if data.hash_mask != 0 {
+                    if prev == sub {
+                        self.bi_queue.push(BiTask {
+                            entry_idx: parent_entry_idx,
+                            size_log2,
+                        });
+                    }
+                    return None;
                 }
-                return None;
             }
         }
 
@@ -726,31 +739,38 @@ impl BiExecutorThread<'_> {
         };
 
         if data.hash_mask != 0 {
-            waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
             // Only bit 0 is used for Phase Base.
             let target_node = self.node_ref.get(merged);
-            match handle_dependency(target_node, dep) {
-                DependencyHandlingResult::Ready => {
-                    data.hash_mask &= !0b1;
-                    data.hash_results[0] = target_node.cache.get_value();
+            if is_finished(&target_node.status) {
+                data.hash_mask &= !0b1;
+                data.hash_results[0] = target_node.cache.get_value();
+            } else {
+                waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+                let mut registered = 0u16;
+                match handle_dependency(target_node, dep) {
+                    DependencyHandlingResult::Ready => {
+                        data.hash_mask &= !0b1;
+                        data.hash_results[0] = target_node.cache.get_value();
+                    }
+                    DependencyHandlingResult::StartedByThisThread => {
+                        registered = 1;
+                        self.hash_queue.push(Task::new(merged, size_log2));
+                    }
+                    DependencyHandlingResult::StartedByOtherThread => {
+                        registered = 1;
+                    }
                 }
-                DependencyHandlingResult::StartedByThisThread => {
-                    waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                    self.hash_queue.push(Task::new(merged, size_log2));
+                let sub = WAITING_BIAS - registered;
+                let prev = waiting_cnt.fetch_sub(sub, Ordering::AcqRel);
+                if data.hash_mask != 0 {
+                    if prev == sub {
+                        self.bi_queue.push(BiTask {
+                            entry_idx: parent_entry_idx,
+                            size_log2,
+                        });
+                    }
+                    return None;
                 }
-                DependencyHandlingResult::StartedByOtherThread => {
-                    waiting_cnt.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
-            if data.hash_mask != 0 {
-                if prev == WAITING_BIAS {
-                    self.bi_queue.push(BiTask {
-                        entry_idx: parent_entry_idx,
-                        size_log2,
-                    });
-                }
-                return None;
             }
         }
 
@@ -773,7 +793,14 @@ impl BiExecutorThread<'_> {
 
     // Independent universes already share HashLife's memoized results. Avoid a
     // second cache entry and intermediary task just to wait for those results.
-    fn request_child(&self, key: (Idx, Idx), parent: BiTask, waiting_cnt: &AtomicU16) -> Option<ChildResult> {
+    fn request_child(
+        &self,
+        key: (Idx, Idx),
+        parent: BiTask,
+        waiting_cnt: &AtomicU16,
+        biased: &mut bool,
+        registered: &mut u16,
+    ) -> Option<ChildResult> {
         let size_log2 = parent.size_log2 - 1;
         if algorithm::is_solitonic(&self.node_ref, &self.engine.base.blank_nodes, key, size_log2)? {
             let dep = Dependent::Binode { entry_idx: parent.entry_idx, size_log2: parent.size_log2 };
@@ -781,15 +808,23 @@ impl BiExecutorThread<'_> {
             let mut ready = true;
             for (i, idx) in [key.0, key.1].into_iter().enumerate() {
                 let node = self.node_ref.get(idx);
+                if is_finished(&node.status) {
+                    results[i] = node.cache.get_value();
+                    continue;
+                }
+                if !*biased {
+                    waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+                    *biased = true;
+                }
                 match handle_dependency(node, dep) {
                     DependencyHandlingResult::Ready => results[i] = node.cache.get_value(),
                     DependencyHandlingResult::StartedByThisThread => {
-                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        *registered += 1;
                         self.hash_queue.push(Task::new(idx, size_log2));
                         ready = false;
                     }
                     DependencyHandlingResult::StartedByOtherThread => {
-                        waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                        *registered += 1;
                         ready = false;
                     }
                 }
@@ -801,17 +836,25 @@ impl BiExecutorThread<'_> {
             };
         }
         let child_idx = self.bicache_ref.entry(key);
+        let child_entry = self.bicache_ref.get(child_idx);
+        if is_finished(child_entry.status()) {
+            return Some(ChildResult::Ready(child_entry.payload().get_value()));
+        }
+        if !*biased {
+            waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            *biased = true;
+        }
         match handle_bi_dependency(&self.engine.bicache, child_idx, parent.entry_idx, parent.size_log2) {
             BiDependencyResult::Ready => {
-                Some(ChildResult::Ready(self.bicache_ref.get(child_idx).payload().get_value()))
+                Some(ChildResult::Ready(child_entry.payload().get_value()))
             }
             BiDependencyResult::StartedByThisThread => {
-                waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                *registered += 1;
                 self.bi_queue.push(BiTask { entry_idx: child_idx, size_log2 });
                 Some(ChildResult::Pending)
             }
             BiDependencyResult::StartedByOtherThread => {
-                waiting_cnt.fetch_add(1, Ordering::Relaxed);
+                *registered += 1;
                 Some(ChildResult::Pending)
             }
         }
@@ -828,14 +871,15 @@ impl BiExecutorThread<'_> {
 
         // Stage 1: Wait for 9 overlapping children (if both_stages).
         if data.mask4_waiting == 0 && data.mask9_waiting != 0 {
-            waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+            let mut biased = false;
+            let mut registered = 0u16;
             for i in 0..9 {
                 if data.mask9_waiting & (1 << i) == 0 {
                     continue;
                 }
                 let child_key = (data.arr0[i], data.arr1[i]);
                 let parent = BiTask { entry_idx: parent_entry_idx, size_log2 };
-                match self.request_child(child_key, parent, waiting_cnt)? {
+                match self.request_child(child_key, parent, waiting_cnt, &mut biased, &mut registered)? {
                     ChildResult::Ready((a, b)) => {
                         data.mask9_waiting &= !(1 << i);
                         data.arr0[i] = a;
@@ -844,15 +888,18 @@ impl BiExecutorThread<'_> {
                     ChildResult::Pending => {}
                 }
             }
-            let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
-            if data.mask9_waiting != 0 {
-                if prev == WAITING_BIAS {
-                    self.bi_queue.push(BiTask {
-                        entry_idx: parent_entry_idx,
-                        size_log2,
-                    });
+            if biased {
+                let sub = WAITING_BIAS - registered;
+                let prev = waiting_cnt.fetch_sub(sub, Ordering::AcqRel);
+                if data.mask9_waiting != 0 {
+                    if prev == sub {
+                        self.bi_queue.push(BiTask {
+                            entry_idx: parent_entry_idx,
+                            size_log2,
+                        });
+                    }
+                    return None;
                 }
-                return None;
             }
         }
 
@@ -867,14 +914,15 @@ impl BiExecutorThread<'_> {
         }
 
         // Stage 2: Wait for 4 final children.
-        waiting_cnt.fetch_add(WAITING_BIAS, Ordering::Relaxed);
+        let mut biased = false;
+        let mut registered = 0u16;
         for i in 0..4 {
             if data.mask4_waiting & (1 << i) == 0 {
                 continue;
             }
             let child_key = (data.arr0[i], data.arr1[i]);
             let parent = BiTask { entry_idx: parent_entry_idx, size_log2 };
-            match self.request_child(child_key, parent, waiting_cnt)? {
+            match self.request_child(child_key, parent, waiting_cnt, &mut biased, &mut registered)? {
                 ChildResult::Ready((a, b)) => {
                     data.mask4_waiting &= !(1 << i);
                     data.arr0[i] = a;
@@ -883,15 +931,18 @@ impl BiExecutorThread<'_> {
                 ChildResult::Pending => {}
             }
         }
-        let prev = waiting_cnt.fetch_sub(WAITING_BIAS, Ordering::AcqRel);
-        if data.mask4_waiting != 0 {
-            if prev == WAITING_BIAS {
-                self.bi_queue.push(BiTask {
-                    entry_idx: parent_entry_idx,
-                    size_log2,
-                });
+        if biased {
+            let sub = WAITING_BIAS - registered;
+            let prev = waiting_cnt.fetch_sub(sub, Ordering::AcqRel);
+            if data.mask4_waiting != 0 {
+                if prev == sub {
+                    self.bi_queue.push(BiTask {
+                        entry_idx: parent_entry_idx,
+                        size_log2,
+                    });
+                }
+                return None;
             }
-            return None;
         }
 
         Some((
